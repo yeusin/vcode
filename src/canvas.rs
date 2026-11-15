@@ -491,20 +491,24 @@ fn render_canvas(
         let sy = g.rect.y * scale + viewport.y + 8.0;
         let max_pill_w = (g.rect.width * scale - 20.0).max(80.0);
 
-        let (prefix, accent, bg) = match g.node.kind {
-            GroupKind::Directory => ("DIR", "#38bdf8", "rgba(15, 23, 42, 0.92)"),
-            GroupKind::Module => ("FILE", "#818cf8", "rgba(30, 41, 59, 0.94)"),
-            GroupKind::Class => ("CLASS", "#c084fc", "rgba(46, 16, 101, 0.92)"),
+        let (accent, bg) = match g.node.kind {
+            GroupKind::Directory => ("#38bdf8", "rgba(15, 23, 42, 0.92)"),
+            GroupKind::Module => ("#818cf8", "rgba(30, 41, 59, 0.94)"),
+            GroupKind::Class => ("#c084fc", "rgba(46, 16, 101, 0.92)"),
         };
 
         ctx.set_font("600 11.5px 'Inter', system-ui, sans-serif");
-        let label = format!("{prefix}  {}", g.node.name);
-        let clipped_label = truncate_to_width(&ctx, &label, (max_pill_w - 76.0).max(40.0));
+        let icon_pad = 19.0;
+        let clipped_label = truncate_to_width(
+            &ctx,
+            &g.node.name,
+            (max_pill_w - 76.0 - icon_pad).max(40.0),
+        );
         let text_w = ctx
             .measure_text(&clipped_label)
             .map(|m| m.width())
-            .unwrap_or(80.0);
-        let pill_w = (text_w + 18.0).min(max_pill_w);
+            .unwrap_or(60.0);
+        let pill_w = (text_w + 18.0 + icon_pad).min(max_pill_w);
         let pill_h = 24.0;
 
         round_rect(&ctx, sx, sy, pill_w, pill_h, 6.0);
@@ -514,8 +518,10 @@ fn render_canvas(
         ctx.set_stroke_style_str(accent);
         ctx.stroke();
 
+        draw_group_icon(&ctx, &g.node.kind, sx + 8.0, sy + 6.0, 12.0, accent);
+
         ctx.set_fill_style_str("#f1f5f9");
-        let _ = ctx.fill_text(&clipped_label, sx + 9.0, sy + 16.0);
+        let _ = ctx.fill_text(&clipped_label, sx + 9.0 + icon_pad, sy + 16.0);
 
         // Icon buttons next to title pill (Import toggle, Call toggle, and Open Editor for modules)
         let mut bx = sx + pill_w + 6.0;
@@ -527,7 +533,7 @@ fn render_canvas(
             bx,
             sy + 1.0,
             btn_size,
-            "I",
+            ButtonIcon::Import,
             !imp_hidden,
             "#38bdf8",
         );
@@ -546,7 +552,7 @@ fn render_canvas(
             bx,
             sy + 1.0,
             btn_size,
-            "C",
+            ButtonIcon::Call,
             !call_hidden,
             "#fbbf24",
         );
@@ -561,7 +567,15 @@ fn render_canvas(
 
         if g.node.kind == GroupKind::Module {
             if let Some(fp) = &g.node.file_path {
-                draw_icon_button(&ctx, bx, sy + 1.0, btn_size, "↗", true, "#94a3b8");
+                draw_icon_button(
+                    &ctx,
+                    bx,
+                    sy + 1.0,
+                    btn_size,
+                    ButtonIcon::OpenEditor,
+                    true,
+                    "#94a3b8",
+                );
                 action_hits.push(ActionHit {
                     x: bx,
                     y: sy + 1.0,
@@ -600,12 +614,76 @@ fn render_canvas(
     ctx.restore();
 }
 
+#[derive(Clone, Copy)]
+enum ButtonIcon {
+    Import,
+    Call,
+    OpenEditor,
+}
+
+fn draw_group_icon(
+    ctx: &CanvasRenderingContext2d,
+    kind: &GroupKind,
+    x: f64,
+    y: f64,
+    s: f64,
+    color: &str,
+) {
+    ctx.save();
+    ctx.set_stroke_style_str(color);
+    ctx.set_line_width(1.35);
+    ctx.set_line_join("round");
+    ctx.set_line_cap("round");
+    ctx.begin_path();
+    match kind {
+        GroupKind::Directory => {
+            ctx.move_to(x + s * 0.08, y + s * 0.25);
+            ctx.line_to(x + s * 0.42, y + s * 0.25);
+            ctx.line_to(x + s * 0.54, y + s * 0.38);
+            ctx.line_to(x + s * 0.92, y + s * 0.38);
+            ctx.line_to(x + s * 0.92, y + s * 0.85);
+            ctx.line_to(x + s * 0.08, y + s * 0.85);
+            ctx.close_path();
+        }
+        GroupKind::Module => {
+            ctx.move_to(x + s * 0.18, y + s * 0.10);
+            ctx.line_to(x + s * 0.62, y + s * 0.10);
+            ctx.line_to(x + s * 0.84, y + s * 0.32);
+            ctx.line_to(x + s * 0.84, y + s * 0.90);
+            ctx.line_to(x + s * 0.18, y + s * 0.90);
+            ctx.close_path();
+            ctx.move_to(x + s * 0.62, y + s * 0.10);
+            ctx.line_to(x + s * 0.62, y + s * 0.32);
+            ctx.line_to(x + s * 0.84, y + s * 0.32);
+        }
+        GroupKind::Class => {
+            let cx = x + s * 0.5;
+            let cy = y + s * 0.5;
+            let r = s * 0.42;
+            ctx.move_to(cx, cy - r);
+            ctx.line_to(cx + r * 0.87, cy - r * 0.5);
+            ctx.line_to(cx + r * 0.87, cy + r * 0.5);
+            ctx.line_to(cx, cy + r);
+            ctx.line_to(cx - r * 0.87, cy + r * 0.5);
+            ctx.line_to(cx - r * 0.87, cy - r * 0.5);
+            ctx.close_path();
+            ctx.move_to(cx - r * 0.87, cy - r * 0.5);
+            ctx.line_to(cx, cy);
+            ctx.line_to(cx + r * 0.87, cy - r * 0.5);
+            ctx.move_to(cx, cy);
+            ctx.line_to(cx, cy + r);
+        }
+    }
+    ctx.stroke();
+    ctx.restore();
+}
+
 fn draw_icon_button(
     ctx: &CanvasRenderingContext2d,
     x: f64,
     y: f64,
     size: f64,
-    glyph: &str,
+    icon: ButtonIcon,
     active: bool,
     accent: &str,
 ) {
@@ -624,10 +702,65 @@ fn draw_icon_button(
     });
     ctx.stroke();
 
-    ctx.set_font("700 11px 'Inter', system-ui, sans-serif");
-    ctx.set_fill_style_str(if active { accent } else { "#64748b" });
-    let gw = ctx.measure_text(glyph).map(|m| m.width()).unwrap_or(8.0);
-    let _ = ctx.fill_text(glyph, x + (size - gw) / 2.0, y + 15.0);
+    let color = if active { accent } else { "#64748b" };
+    let ix = x + 5.0;
+    let iy = y + 5.0;
+    let s = size - 10.0;
+
+    ctx.save();
+    ctx.set_stroke_style_str(color);
+    ctx.set_line_width(1.4);
+    ctx.set_line_cap("round");
+    ctx.set_line_join("round");
+    ctx.begin_path();
+    match icon {
+        ButtonIcon::Import => {
+            // Git-branch style import icon
+            ctx.move_to(ix + s * 0.25, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.25, iy + s * 0.72);
+            ctx.move_to(ix + s * 0.75, iy + s * 0.35);
+            let _ = ctx.quadratic_curve_to(
+                ix + s * 0.75,
+                iy + s * 0.72,
+                ix + s * 0.35,
+                iy + s * 0.72,
+            );
+            ctx.stroke();
+            ctx.begin_path();
+            let _ = ctx.arc(ix + s * 0.25, iy + s * 0.80, 1.6, 0.0, PI * 2.0);
+            ctx.stroke();
+            ctx.begin_path();
+            let _ = ctx.arc(ix + s * 0.75, iy + s * 0.22, 1.6, 0.0, PI * 2.0);
+        }
+        ButtonIcon::Call => {
+            // Arrow-curve call flow icon
+            ctx.move_to(ix + s * 0.15, iy + s * 0.75);
+            let _ = ctx.quadratic_curve_to(
+                ix + s * 0.15,
+                iy + s * 0.25,
+                ix + s * 0.82,
+                iy + s * 0.25,
+            );
+            ctx.move_to(ix + s * 0.60, iy + s * 0.06);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.25);
+            ctx.line_to(ix + s * 0.60, iy + s * 0.44);
+        }
+        ButtonIcon::OpenEditor => {
+            // External link box + arrow
+            ctx.move_to(ix + s * 0.45, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.15, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.15, iy + s * 0.85);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.85);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.55);
+            ctx.move_to(ix + s * 0.45, iy + s * 0.55);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.15);
+            ctx.move_to(ix + s * 0.60, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.85, iy + s * 0.40);
+        }
+    }
+    ctx.stroke();
+    ctx.restore();
 }
 
 fn hit_test_world(
