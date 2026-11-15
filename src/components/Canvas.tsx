@@ -393,17 +393,8 @@ export const Canvas: React.FC<CanvasProps> = ({
 
       const impOff = hiddenImportGroupsRef.current.has(g.id);
       const callOff = hiddenCallGroupsRef.current.has(g.id);
-      const offSuffix =
-        impOff && callOff
-          ? " · no graphs"
-          : impOff
-          ? " · no imports"
-          : callOff
-          ? " · no calls"
-          : "";
 
-      const baseLabel = isMod ? `${g.name} (${g.functionCount})` : g.name;
-      const label = `${baseLabel}${offSuffix}`;
+      const label = isMod ? `${g.name} (${g.functionCount})` : g.name;
       const textW = ctx.measureText(label).width;
       const pillW = Math.min(Math.max(sw - 8, 64), textW + 18);
       const pillH = fontSize + 10;
@@ -415,14 +406,11 @@ export const Canvas: React.FC<CanvasProps> = ({
         ? "rgba(17, 24, 39, 0.92)"
         : "rgba(30, 27, 54, 0.92)";
       ctx.fill();
-      ctx.strokeStyle =
-        impOff || callOff
-          ? "rgba(248, 113, 113, 0.7)"
-          : isDir
-          ? "rgba(56, 189, 248, 0.45)"
-          : isMod
-          ? "rgba(99, 102, 241, 0.45)"
-          : "rgba(167, 139, 250, 0.45)";
+      ctx.strokeStyle = isDir
+        ? "rgba(56, 189, 248, 0.45)"
+        : isMod
+        ? "rgba(99, 102, 241, 0.45)"
+        : "rgba(167, 139, 250, 0.45)";
       ctx.lineWidth = 1;
       ctx.stroke();
 
