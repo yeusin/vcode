@@ -436,6 +436,8 @@ export const App: React.FC = () => {
                 hiddenEdgeIds={hiddenEdgeIds}
                 hiddenImportGroupIds={hiddenImportGroupIds}
                 hiddenCallGroupIds={hiddenCallGroupIds}
+                onToggleGroupImport={toggleGroupImport}
+                onToggleGroupCall={toggleGroupCall}
                 onFocusRect={fitRect}
                 onOpenFileInEditor={handleOpenFileInEditor}
               />

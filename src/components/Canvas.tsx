@@ -33,9 +33,16 @@ interface CanvasProps {
   hiddenEdgeIds: Set<string>;
   hiddenImportGroupIds: Set<string>;
   hiddenCallGroupIds: Set<string>;
+  onToggleGroupImport: (groupId: string) => void;
+  onToggleGroupCall: (groupId: string) => void;
   onFocusRect: (rect: Rect, minScale?: number) => void;
   onOpenFileInEditor: (relFilePath: string) => void;
 }
+
+type CanvasAction =
+  | { type: "editor"; filePath: string }
+  | { type: "toggle-import"; groupId: string }
+  | { type: "toggle-call"; groupId: string };
 
 function rectsIntersect(a: Rect, b: Rect): boolean {
   return !(
@@ -133,6 +140,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   hiddenEdgeIds,
   hiddenImportGroupIds,
   hiddenCallGroupIds,
+  onToggleGroupImport,
+  onToggleGroupCall,
   onFocusRect,
   onOpenFileInEditor,
 }) => {
@@ -149,8 +158,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   const rafRef = useRef<number | null>(null);
   const commitTimerRef = useRef<number | null>(null);
   const hoveredIdRef = useRef<string | null>(null);
-  const hoveredEditorBtnRef = useRef<string | null>(null);
-  const editorBtnRectsRef = useRef<Array<{ rect: Rect; filePath: string }>>([]);
+  const hoveredActionKeyRef = useRef<string | null>(null);
+  const actionBtnRectsRef = useRef<Array<{ rect: Rect; key: string; action: CanvasAction }>>([]);
   const selectedIdRef = useRef<string | null>(selectedId);
   const showImportRef = useRef(showImportEdges);
   const showCallRef = useRef(showCallEdges);
@@ -367,7 +376,7 @@ export const Canvas: React.FC<CanvasProps> = ({
     // - meso:  Directory + Module + Class + Function titles
     // - micro: Directory + Module + Class titles + Function code cards (in-card headers & code)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    editorBtnRectsRef.current = [];
+    actionBtnRectsRef.current = [];
 
     for (const g of visibleGroups) {
       if (lod === "macro" && g.kind !== "directory") continue;
@@ -420,13 +429,107 @@ export const Canvas: React.FC<CanvasProps> = ({
       ctx.fillStyle = isDir ? "#38bdf8" : isMod ? "#c7d2fe" : "#ddd6fe";
       ctx.fillText(label, sx + 12, sy + 4 + fontSize + 2, pillW - 14);
 
-      if (isMod && g.filePath) {
-        const btnX = sx + 4 + pillW + 6;
-        const btnY = sy + 4;
-        const btnSize = pillH;
-        const isBtnHovered = hoveredEditorBtnRef.current === g.filePath;
+      const btnSize = pillH;
+      let nextBtnX = sx + 4 + pillW + 5;
+      const btnY = sy + 4;
 
-        roundRectPath(ctx, btnX, btnY, btnSize, btnSize, 6);
+      // 1) Import graph toggle button
+      {
+        const key = `imp:${g.id}`;
+        const isHov = hoveredActionKeyRef.current === key;
+        roundRectPath(ctx, nextBtnX, btnY, btnSize, btnSize, 6);
+        ctx.fillStyle = impOff
+          ? "rgba(248, 113, 113, 0.18)"
+          : isHov
+          ? "rgba(56, 189, 248, 0.22)"
+          : "rgba(17, 24, 39, 0.9)";
+        ctx.fill();
+        ctx.strokeStyle = impOff
+          ? "#f87171"
+          : isHov
+          ? "#38bdf8"
+          : "rgba(56, 189, 248, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Branch / import icon
+        const cx = nextBtnX + btnSize / 2;
+        const cy = btnY + btnSize / 2;
+        ctx.strokeStyle = impOff ? "#f87171" : "#38bdf8";
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(cx - 3, cy - 5);
+        ctx.lineTo(cx - 3, cy + 5);
+        ctx.moveTo(cx - 3, cy + 1);
+        ctx.quadraticCurveTo(cx + 3, cy + 1, cx + 3, cy - 3);
+        ctx.stroke();
+        if (impOff) {
+          ctx.beginPath();
+          ctx.moveTo(nextBtnX + 4, btnY + btnSize - 4);
+          ctx.lineTo(nextBtnX + btnSize - 4, btnY + 4);
+          ctx.stroke();
+        }
+
+        actionBtnRectsRef.current.push({
+          rect: { x: nextBtnX, y: btnY, width: btnSize, height: btnSize },
+          key,
+          action: { type: "toggle-import", groupId: g.id },
+        });
+        nextBtnX += btnSize + 4;
+      }
+
+      // 2) Call graph toggle button
+      {
+        const key = `call:${g.id}`;
+        const isHov = hoveredActionKeyRef.current === key;
+        roundRectPath(ctx, nextBtnX, btnY, btnSize, btnSize, 6);
+        ctx.fillStyle = callOff
+          ? "rgba(248, 113, 113, 0.18)"
+          : isHov
+          ? "rgba(245, 158, 11, 0.22)"
+          : "rgba(17, 24, 39, 0.9)";
+        ctx.fill();
+        ctx.strokeStyle = callOff
+          ? "#f87171"
+          : isHov
+          ? "#f59e0b"
+          : "rgba(245, 158, 11, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Call-flow arrow icon
+        const cx = nextBtnX + btnSize / 2;
+        const cy = btnY + btnSize / 2;
+        ctx.strokeStyle = callOff ? "#f87171" : "#f59e0b";
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(cx - 5, cy);
+        ctx.lineTo(cx + 4, cy);
+        ctx.moveTo(cx + 1, cy - 3.5);
+        ctx.lineTo(cx + 4.5, cy);
+        ctx.lineTo(cx + 1, cy + 3.5);
+        ctx.stroke();
+        if (callOff) {
+          ctx.beginPath();
+          ctx.moveTo(nextBtnX + 4, btnY + btnSize - 4);
+          ctx.lineTo(nextBtnX + btnSize - 4, btnY + 4);
+          ctx.stroke();
+        }
+
+        actionBtnRectsRef.current.push({
+          rect: { x: nextBtnX, y: btnY, width: btnSize, height: btnSize },
+          key,
+          action: { type: "toggle-call", groupId: g.id },
+        });
+        nextBtnX += btnSize + 4;
+      }
+
+      // 3) Open in editor button (for module/file diagrams)
+      if (isMod && g.filePath) {
+        const key = `ed:${g.filePath}`;
+        const isBtnHovered = hoveredActionKeyRef.current === key;
+
+        roundRectPath(ctx, nextBtnX, btnY, btnSize, btnSize, 6);
         ctx.fillStyle = isBtnHovered ? "rgba(56, 189, 248, 0.22)" : "rgba(17, 24, 39, 0.92)";
         ctx.fill();
         ctx.strokeStyle = isBtnHovered ? "#38bdf8" : "rgba(99, 102, 241, 0.45)";
@@ -435,19 +538,17 @@ export const Canvas: React.FC<CanvasProps> = ({
 
         // Draw external-link / open-in-editor icon
         const pad = 6;
-        const ix = btnX + pad;
+        const ix = nextBtnX + pad;
         const iy = btnY + pad;
         const isz = btnSize - pad * 2;
         ctx.strokeStyle = isBtnHovered ? "#38bdf8" : "#c7d2fe";
         ctx.lineWidth = 1.4;
         ctx.beginPath();
-        // Box with open top-right corner
         ctx.moveTo(ix + isz * 0.45, iy);
         ctx.lineTo(ix, iy);
         ctx.lineTo(ix, iy + isz);
         ctx.lineTo(ix + isz, iy + isz);
         ctx.lineTo(ix + isz, iy + isz * 0.55);
-        // Arrow pointing top-right
         ctx.moveTo(ix + isz * 0.45, iy + isz * 0.55);
         ctx.lineTo(ix + isz, iy);
         ctx.moveTo(ix + isz * 0.6, iy);
@@ -455,9 +556,10 @@ export const Canvas: React.FC<CanvasProps> = ({
         ctx.lineTo(ix + isz, iy + isz * 0.4);
         ctx.stroke();
 
-        editorBtnRectsRef.current.push({
-          rect: { x: btnX, y: btnY, width: btnSize, height: btnSize },
-          filePath: g.filePath,
+        actionBtnRectsRef.current.push({
+          rect: { x: nextBtnX, y: btnY, width: btnSize, height: btnSize },
+          key,
+          action: { type: "editor", filePath: g.filePath },
         });
       }
     }
@@ -614,20 +716,23 @@ export const Canvas: React.FC<CanvasProps> = ({
     };
   }, []);
 
-  const hitTestEditorBtn = useCallback((clientX: number, clientY: number): string | null => {
-    const el = containerRef.current;
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    const sx = clientX - rect.left;
-    const sy = clientY - rect.top;
-    for (let i = editorBtnRectsRef.current.length - 1; i >= 0; i--) {
-      const item = editorBtnRectsRef.current[i];
-      if (pointInRect(sx, sy, item.rect)) {
-        return item.filePath;
+  const hitTestActionBtn = useCallback(
+    (clientX: number, clientY: number): { key: string; action: CanvasAction } | null => {
+      const el = containerRef.current;
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      const sx = clientX - rect.left;
+      const sy = clientY - rect.top;
+      for (let i = actionBtnRectsRef.current.length - 1; i >= 0; i--) {
+        const item = actionBtnRectsRef.current[i];
+        if (pointInRect(sx, sy, item.rect)) {
+          return { key: item.key, action: item.action };
+        }
       }
-    }
-    return null;
-  }, []);
+      return null;
+    },
+    []
+  );
 
   const hitTest = useCallback(
     (clientX: number, clientY: number): { kind: "fn"; node: PositionedFunction } | { kind: "group"; node: PositionedGroup } | null => {
@@ -709,15 +814,16 @@ export const Canvas: React.FC<CanvasProps> = ({
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current.active) return;
-      const btnFile = hitTestEditorBtn(e.clientX, e.clientY);
-      if (hoveredEditorBtnRef.current !== btnFile) {
-        hoveredEditorBtnRef.current = btnFile;
+      const btnHit = hitTestActionBtn(e.clientX, e.clientY);
+      const nextKey = btnHit ? btnHit.key : null;
+      if (hoveredActionKeyRef.current !== nextKey) {
+        hoveredActionKeyRef.current = nextKey;
         if (containerRef.current) {
-          containerRef.current.style.cursor = btnFile ? "pointer" : "";
+          containerRef.current.style.cursor = nextKey ? "pointer" : "";
         }
         scheduleDraw();
       }
-      if (btnFile) {
+      if (btnHit) {
         if (hoveredIdRef.current !== null) {
           hoveredIdRef.current = null;
           scheduleDraw();
@@ -731,7 +837,7 @@ export const Canvas: React.FC<CanvasProps> = ({
         scheduleDraw();
       }
     },
-    [hitTest, hitTestEditorBtn, scheduleDraw]
+    [hitTest, hitTestActionBtn, scheduleDraw]
   );
 
   useEffect(() => {
@@ -773,15 +879,21 @@ export const Canvas: React.FC<CanvasProps> = ({
   const handleClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current.moved) return;
-      const btnFile = hitTestEditorBtn(e.clientX, e.clientY);
-      if (btnFile) {
-        onOpenFileInEditor(btnFile);
+      const btnHit = hitTestActionBtn(e.clientX, e.clientY);
+      if (btnHit) {
+        if (btnHit.action.type === "editor") {
+          onOpenFileInEditor(btnHit.action.filePath);
+        } else if (btnHit.action.type === "toggle-import") {
+          onToggleGroupImport(btnHit.action.groupId);
+        } else {
+          onToggleGroupCall(btnHit.action.groupId);
+        }
         return;
       }
       const hit = hitTest(e.clientX, e.clientY);
       onSelect(hit ? hit.node.id : null);
     },
-    [hitTest, hitTestEditorBtn, onSelect, onOpenFileInEditor]
+    [hitTest, hitTestActionBtn, onSelect, onOpenFileInEditor, onToggleGroupImport, onToggleGroupCall]
   );
 
   const handleDoubleClick = useCallback(
