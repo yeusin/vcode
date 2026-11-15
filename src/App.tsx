@@ -277,12 +277,13 @@ export const App: React.FC = () => {
     });
   };
 
-  const launchEditor = useCallback(async (cmd: string, absFilePath: string) => {
+  const launchEditor = useCallback(async (cmd: string, absFilePath: string, rootPath: string) => {
     setErrorMsg(null);
     try {
       await invoke("open_in_editor", {
         editorCommand: cmd,
         filePath: absFilePath,
+        projectPath: rootPath,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -304,7 +305,7 @@ export const App: React.FC = () => {
         setSettingsOpen(true);
         return;
       }
-      void launchEditor(editorCommand, absPath);
+      void launchEditor(editorCommand, absPath, graph.rootPath);
     },
     [graph.rootPath, editorCommand, launchEditor]
   );
@@ -328,7 +329,7 @@ export const App: React.FC = () => {
     if (trimmed && pendingEditorFile) {
       const fileToOpen = pendingEditorFile;
       setPendingEditorFile(null);
-      void launchEditor(trimmed, fileToOpen);
+      void launchEditor(trimmed, fileToOpen, graph.rootPath);
     } else {
       setPendingEditorFile(null);
     }

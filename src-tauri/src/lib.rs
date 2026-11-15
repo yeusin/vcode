@@ -149,11 +149,21 @@ fn build_editor_invocation(editor_command: &str, file_path: &str) -> Result<(Str
 }
 
 #[tauri::command]
-fn open_in_editor(editor_command: String, file_path: String) -> Result<(), String> {
+fn open_in_editor(
+    editor_command: String,
+    file_path: String,
+    project_path: Option<String>,
+) -> Result<(), String> {
     let (program, args) = build_editor_invocation(&editor_command, &file_path)?;
-    Command::new(&program)
-        .args(&args)
-        .spawn()
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    if let Some(dir) = project_path {
+        let p = Path::new(&dir);
+        if p.is_dir() {
+            cmd.current_dir(p);
+        }
+    }
+    cmd.spawn()
         .map(|_| ())
         .map_err(|e| format!("Failed to launch '{program}': {e}"))
 }
