@@ -177,6 +177,8 @@ fn render_canvas(
     edge_vis: &EdgeVisibility,
     group_ancestors: &HashMap<String, Vec<String>>,
     fn_parent: &HashMap<String, String>,
+    group_meta: &HashMap<String, String>,
+    fn_counts: &HashMap<String, (usize, usize)>,
     action_hits: &mut Vec<ActionHit>,
 ) {
     action_hits.clear();
@@ -415,21 +417,27 @@ fn render_canvas(
             ctx.set_fill_style_str("rgba(30, 41, 59, 0.85)");
             ctx.fill_rect(hx + 1.0, hy + 1.0, hw - 2.0, 34.0);
 
+            // Line & caller/callee metadata badge
+            let (c_in, c_out) = fn_counts.get(&fn_item.node.id).copied().unwrap_or((0, 0));
+            let line_badge = format!(
+                "{}L · L{}-{} · {c_in} in · {c_out} out",
+                fn_item.line_count, fn_item.node.start_line, fn_item.node.end_line
+            );
+            ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
+            let badge_w = ctx
+                .measure_text(&line_badge)
+                .map(|m| m.width())
+                .unwrap_or(110.0);
+
             ctx.set_font("600 12.5px 'JetBrains Mono', ui-monospace, monospace");
             ctx.set_fill_style_str(if fn_item.node.is_async { "#c084fc" } else { "#38bdf8" });
             let prefix = if fn_item.node.is_async { "async " } else { "" };
             let title = format!("{prefix}{}", fn_item.node.name);
-            let clipped_title = truncate_to_width(&ctx, &title, hw - 90.0);
+            let clipped_title = truncate_to_width(&ctx, &title, (hw - badge_w - 28.0).max(60.0));
             let _ = ctx.fill_text(&clipped_title, hx + 12.0, hy + 21.0);
 
-            // Line badge
-            ctx.set_font("500 11px 'Inter', system-ui, sans-serif");
-            ctx.set_fill_style_str("#64748b");
-            let line_badge = format!("L{}-{}", fn_item.node.start_line, fn_item.node.end_line);
-            let badge_w = ctx
-                .measure_text(&line_badge)
-                .map(|m| m.width())
-                .unwrap_or(42.0);
+            ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
+            ctx.set_fill_style_str("#94a3b8");
             let _ = ctx.fill_text(&line_badge, hx + hw - badge_w - 10.0, hy + 21.0);
 
             // Signature
@@ -499,16 +507,34 @@ fn render_canvas(
 
         ctx.set_font("600 11.5px 'Inter', system-ui, sans-serif");
         let icon_pad = 19.0;
-        let clipped_label = truncate_to_width(
-            &ctx,
-            &g.node.name,
-            (max_pill_w - 76.0 - icon_pad).max(40.0),
-        );
-        let text_w = ctx
-            .measure_text(&clipped_label)
+        let meta = group_meta.get(&g.node.id).map(String::as_str).unwrap_or("");
+        let avail_text_w = (max_pill_w - 76.0 - icon_pad).max(40.0);
+        let clipped_name = truncate_to_width(&ctx, &g.node.name, avail_text_w);
+        let name_w = ctx
+            .measure_text(&clipped_name)
             .map(|m| m.width())
             .unwrap_or(60.0);
-        let pill_w = (text_w + 18.0 + icon_pad).min(max_pill_w);
+
+        let meta_str = if meta.is_empty() {
+            String::new()
+        } else {
+            format!(" · {meta}")
+        };
+        ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
+        let clipped_meta = if !meta_str.is_empty() && avail_text_w - name_w > 34.0 {
+            truncate_to_width(&ctx, &meta_str, avail_text_w - name_w)
+        } else {
+            String::new()
+        };
+        let meta_w = if clipped_meta.is_empty() {
+            0.0
+        } else {
+            ctx.measure_text(&clipped_meta)
+                .map(|m| m.width())
+                .unwrap_or(0.0)
+        };
+
+        let pill_w = (name_w + meta_w + 18.0 + icon_pad).min(max_pill_w);
         let pill_h = 24.0;
 
         round_rect(&ctx, sx, sy, pill_w, pill_h, 6.0);
@@ -520,8 +546,14 @@ fn render_canvas(
 
         draw_group_icon(&ctx, &g.node.kind, sx + 8.0, sy + 6.0, 12.0, accent);
 
+        ctx.set_font("600 11.5px 'Inter', system-ui, sans-serif");
         ctx.set_fill_style_str("#f1f5f9");
-        let _ = ctx.fill_text(&clipped_label, sx + 9.0 + icon_pad, sy + 16.0);
+        let _ = ctx.fill_text(&clipped_name, sx + 9.0 + icon_pad, sy + 16.0);
+        if !clipped_meta.is_empty() {
+            ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
+            ctx.set_fill_style_str("#94a3b8");
+            let _ = ctx.fill_text(&clipped_meta, sx + 9.0 + icon_pad + name_w, sy + 16.0);
+        }
 
         // Icon buttons next to title pill (Import toggle, Call toggle, and Open Editor for modules)
         let mut bx = sx + pill_w + 6.0;
@@ -594,10 +626,15 @@ fn render_canvas(
             if !rects_intersect(&fn_item.rect, world_left, world_top, world_w, world_h) {
                 continue;
             }
+            let (c_in, c_out) = fn_counts.get(&fn_item.node.id).copied().unwrap_or((0, 0));
             let sx = fn_item.rect.x * scale + viewport.x + 6.0;
             let sy = fn_item.rect.y * scale + viewport.y + 6.0;
             let max_w = (fn_item.rect.width * scale - 12.0).max(50.0);
-            let label = truncate_to_width(&ctx, &fn_item.node.name, max_w - 14.0);
+            let full_label = format!(
+                "{} · {}L · {c_in} in · {c_out} out",
+                fn_item.node.name, fn_item.line_count
+            );
+            let label = truncate_to_width(&ctx, &full_label, max_w - 14.0);
             let tw = ctx.measure_text(&label).map(|m| m.width()).unwrap_or(50.0);
             let pw = (tw + 14.0).min(max_w);
             round_rect(&ctx, sx, sy, pw, 20.0, 5.0);
@@ -910,6 +947,94 @@ pub fn CanvasView(
         cb.forget();
     });
 
+    let group_meta = Memo::new(move |_| {
+        let l = layout.get();
+        let mut dir_children: HashMap<&str, usize> = HashMap::new();
+        let mut file_children: HashMap<&str, usize> = HashMap::new();
+        let mut class_children: HashMap<&str, usize> = HashMap::new();
+        for g in &l.groups {
+            if let Some(pid) = g.node.parent_id.as_deref() {
+                match g.node.kind {
+                    GroupKind::Directory => *dir_children.entry(pid).or_insert(0) += 1,
+                    GroupKind::Module => *file_children.entry(pid).or_insert(0) += 1,
+                    GroupKind::Class => *class_children.entry(pid).or_insert(0) += 1,
+                }
+            }
+        }
+        let mut imp_in: HashMap<&str, usize> = HashMap::new();
+        let mut imp_out: HashMap<&str, usize> = HashMap::new();
+        for e in &l.edges {
+            if e.edge.kind == EdgeKind::Import {
+                *imp_out.entry(e.edge.source_id.as_str()).or_insert(0) += 1;
+                *imp_in.entry(e.edge.target_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut out = HashMap::new();
+        for g in &l.groups {
+            let gid = g.node.id.as_str();
+            let text = match g.node.kind {
+                GroupKind::Directory => {
+                    let d = dir_children.get(gid).copied().unwrap_or(0);
+                    let f = file_children.get(gid).copied().unwrap_or(0);
+                    let d_lbl = if d == 1 { "dir" } else { "dirs" };
+                    let f_lbl = if f == 1 { "file" } else { "files" };
+                    format!("{d} {d_lbl} · {f} {f_lbl}")
+                }
+                GroupKind::Module => {
+                    let c = class_children.get(gid).copied().unwrap_or(0);
+                    let fns = g.function_count;
+                    let ii = imp_in.get(gid).copied().unwrap_or(0);
+                    let io = imp_out.get(gid).copied().unwrap_or(0);
+                    let mut parts = vec![format!("{}L", g.node.line_count)];
+                    if c > 0 {
+                        parts.push(format!("{c} cls"));
+                    }
+                    parts.push(format!("{fns} {}", if fns == 1 { "fn" } else { "fns" }));
+                    if ii > 0 || io > 0 {
+                        parts.push(format!("{io} imp · {ii} dep"));
+                    }
+                    parts.join(" · ")
+                }
+                GroupKind::Class => {
+                    let fns = g.function_count;
+                    let mut parts = Vec::new();
+                    if g.node.line_count > 0 {
+                        parts.push(format!("{}L", g.node.line_count));
+                    }
+                    parts.push(format!("{fns} {}", if fns == 1 { "fn" } else { "fns" }));
+                    parts.join(" · ")
+                }
+            };
+            out.insert(g.node.id.clone(), text);
+        }
+        out
+    });
+
+    let fn_counts = Memo::new(move |_| {
+        let l = layout.get();
+        let mut in_map: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut out_map: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for e in &l.edges {
+            out_map
+                .entry(e.edge.source_id.as_str())
+                .or_default()
+                .insert(e.edge.target_id.as_str());
+            in_map
+                .entry(e.edge.target_id.as_str())
+                .or_default()
+                .insert(e.edge.source_id.as_str());
+        }
+        l.functions
+            .iter()
+            .map(|f| {
+                let fid = f.node.id.as_str();
+                let c_in = in_map.get(fid).map_or(0, HashSet::len);
+                let c_out = out_map.get(fid).map_or(0, HashSet::len);
+                (f.node.id.clone(), (c_in, c_out))
+            })
+            .collect::<HashMap<String, (usize, usize)>>()
+    });
+
     // Render on reactive state changes
     let hits_for_render = action_hits.clone();
     Effect::new(move |_| {
@@ -924,6 +1049,8 @@ pub fn CanvasView(
         let ev = edge_vis.get();
         let anc = group_ancestors.get();
         let fp = fn_parent.get();
+        let gm = group_meta.get();
+        let fc = fn_counts.get();
 
         let mut hits = hits_for_render.borrow_mut();
         render_canvas(
@@ -935,6 +1062,8 @@ pub fn CanvasView(
             &ev,
             &anc,
             &fp,
+            &gm,
+            &fc,
             &mut hits,
         );
     });
