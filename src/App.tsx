@@ -261,6 +261,13 @@ export const App: React.FC = () => {
     editorCommand,
   ]);
 
+  useEffect(() => {
+    const last = loadRecentProjects()[0];
+    if (last) {
+      void openProjectPath(last.path);
+    }
+  }, [openProjectPath]);
+
   const handleOpenProject = async () => {
     setErrorMsg(null);
     try {
