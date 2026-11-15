@@ -159,8 +159,6 @@ export const App: React.FC = () => {
         recentProjects={recentProjects}
         onOpenRecent={openProjectPath}
         loading={loading}
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
         showImportEdges={showImportEdges}
         onToggleImportEdges={() => setShowImportEdges((v) => !v)}
         showCallEdges={showCallEdges}
@@ -184,6 +182,7 @@ export const App: React.FC = () => {
           <Sidebar
             graph={graph}
             searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
             selectedId={selectedId}
             onSelectGroup={handleSelectGroup}
             onSelectFunction={handleSelectFunction}

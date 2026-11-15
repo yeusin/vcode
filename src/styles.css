@@ -182,6 +182,14 @@ body,
   color: var(--accent-cyan);
 }
 
+.sidebar-search {
+  padding: 0 10px 8px;
+}
+
+.sidebar-search .search-box {
+  width: 100%;
+}
+
 .search-box {
   position: relative;
   display: flex;

@@ -1,10 +1,11 @@
 import React, { useMemo } from "react";
-import { AlertTriangle, Box, Code2, FileCode2, Folder, FolderTree } from "lucide-react";
+import { AlertTriangle, Box, Code2, FileCode2, Folder, FolderTree, Search } from "lucide-react";
 import type { FunctionNode, GroupNode, ProjectGraph } from "../types/graph";
 
 interface SidebarProps {
   graph: ProjectGraph;
   searchQuery: string;
+  onSearchChange: (q: string) => void;
   selectedId: string | null;
   onSelectGroup: (group: GroupNode) => void;
   onSelectFunction: (fn: FunctionNode) => void;
@@ -13,6 +14,7 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({
   graph,
   searchQuery,
+  onSearchChange,
   selectedId,
   onSelectGroup,
   onSelectFunction,
@@ -124,6 +126,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       <div className="sidebar-section-title">Project Structure</div>
+      <div className="sidebar-search">
+        <div className="search-box">
+          <Search size={14} className="search-icon" />
+          <input
+            type="text"
+            placeholder="Filter files, classes, functions..."
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+          />
+          {searchQuery && (
+            <button className="search-clear" onClick={() => onSearchChange("")}>
+              ×
+            </button>
+          )}
+        </div>
+      </div>
       <div className="sidebar-tree">
         {query && filteredGroups.length === 0 && filteredFunctions.length === 0 ? (
           <div className="sidebar-empty">No matches for "{searchQuery}"</div>

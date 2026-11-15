@@ -5,7 +5,6 @@ import {
   History,
   Maximize2,
   PanelLeft,
-  Search,
   Workflow,
   ZoomIn,
   ZoomOut,
@@ -26,8 +25,6 @@ interface ToolbarProps {
   recentProjects: RecentProject[];
   onOpenRecent: (path: string) => void;
   loading: boolean;
-  searchQuery: string;
-  onSearchChange: (q: string) => void;
   showImportEdges: boolean;
   onToggleImportEdges: () => void;
   showCallEdges: boolean;
@@ -54,8 +51,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   recentProjects,
   onOpenRecent,
   loading,
-  searchQuery,
-  onSearchChange,
   showImportEdges,
   onToggleImportEdges,
   showCallEdges,
@@ -106,23 +101,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             })}
           </div>
         )}
-      </div>
-
-      <div className="toolbar-center">
-        <div className="search-box">
-          <Search size={14} className="search-icon" />
-          <input
-            type="text"
-            placeholder="Filter groups, classes, functions..."
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-          />
-          {searchQuery && (
-            <button className="search-clear" onClick={() => onSearchChange("")}>
-              ×
-            </button>
-          )}
-        </div>
       </div>
 
       <div className="toolbar-right">
