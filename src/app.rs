@@ -671,7 +671,7 @@ pub fn App() -> impl IntoView {
                                                 </span>
                                                 <span class="tree-label">{entry.label}</span>
                                             </button>
-                                            {if is_group {
+                                            {if is_group && matches!(kind_class, "directory" | "module") {
                                                 view! {
                                                     <span class="tree-edge-toggles">
                                                         <button

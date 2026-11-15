@@ -508,7 +508,15 @@ fn render_canvas(
         ctx.set_font("600 11.5px 'Inter', system-ui, sans-serif");
         let icon_pad = 19.0;
         let meta = group_meta.get(&g.node.id).map(String::as_str).unwrap_or("");
-        let avail_text_w = (max_pill_w - 76.0 - icon_pad).max(40.0);
+        let show_edge_btns = matches!(g.node.kind, GroupKind::Directory | GroupKind::Module);
+        let btn_reserve = if g.node.kind == GroupKind::Module {
+            82.0
+        } else if g.node.kind == GroupKind::Directory {
+            56.0
+        } else {
+            8.0
+        };
+        let avail_text_w = (max_pill_w - btn_reserve - icon_pad).max(40.0);
         let clipped_name = truncate_to_width(&ctx, &g.node.name, avail_text_w);
         let name_w = ctx
             .measure_text(&clipped_name)
@@ -555,66 +563,68 @@ fn render_canvas(
             let _ = ctx.fill_text(&clipped_meta, sx + 9.0 + icon_pad + name_w, sy + 16.0);
         }
 
-        // Icon buttons next to title pill (Import toggle, Call toggle, and Open Editor for modules)
-        let mut bx = sx + pill_w + 6.0;
-        let btn_size = 22.0;
+        // Icon buttons next to title pill (Import/Call toggles only for dir and file levels)
+        if show_edge_btns {
+            let mut bx = sx + pill_w + 6.0;
+            let btn_size = 22.0;
 
-        let imp_hidden = edge_vis.hidden_import_group_ids.contains(&g.node.id);
-        draw_icon_button(
-            &ctx,
-            bx,
-            sy + 1.0,
-            btn_size,
-            ButtonIcon::Import,
-            !imp_hidden,
-            "#38bdf8",
-        );
-        action_hits.push(ActionHit {
-            x: bx,
-            y: sy + 1.0,
-            w: btn_size,
-            h: btn_size,
-            kind: ActionKind::ToggleImport(g.node.id.clone()),
-        });
-        bx += btn_size + 4.0;
+            let imp_hidden = edge_vis.hidden_import_group_ids.contains(&g.node.id);
+            draw_icon_button(
+                &ctx,
+                bx,
+                sy + 1.0,
+                btn_size,
+                ButtonIcon::Import,
+                !imp_hidden,
+                "#38bdf8",
+            );
+            action_hits.push(ActionHit {
+                x: bx,
+                y: sy + 1.0,
+                w: btn_size,
+                h: btn_size,
+                kind: ActionKind::ToggleImport(g.node.id.clone()),
+            });
+            bx += btn_size + 4.0;
 
-        let call_hidden = edge_vis.hidden_call_group_ids.contains(&g.node.id);
-        draw_icon_button(
-            &ctx,
-            bx,
-            sy + 1.0,
-            btn_size,
-            ButtonIcon::Call,
-            !call_hidden,
-            "#fbbf24",
-        );
-        action_hits.push(ActionHit {
-            x: bx,
-            y: sy + 1.0,
-            w: btn_size,
-            h: btn_size,
-            kind: ActionKind::ToggleCall(g.node.id.clone()),
-        });
-        bx += btn_size + 4.0;
+            let call_hidden = edge_vis.hidden_call_group_ids.contains(&g.node.id);
+            draw_icon_button(
+                &ctx,
+                bx,
+                sy + 1.0,
+                btn_size,
+                ButtonIcon::Call,
+                !call_hidden,
+                "#fbbf24",
+            );
+            action_hits.push(ActionHit {
+                x: bx,
+                y: sy + 1.0,
+                w: btn_size,
+                h: btn_size,
+                kind: ActionKind::ToggleCall(g.node.id.clone()),
+            });
+            bx += btn_size + 4.0;
 
-        if g.node.kind == GroupKind::Module {
-            if let Some(fp) = &g.node.file_path {
-                draw_icon_button(
-                    &ctx,
-                    bx,
-                    sy + 1.0,
-                    btn_size,
-                    ButtonIcon::OpenEditor,
-                    true,
-                    "#94a3b8",
-                );
-                action_hits.push(ActionHit {
-                    x: bx,
-                    y: sy + 1.0,
-                    w: btn_size,
-                    h: btn_size,
-                    kind: ActionKind::OpenEditor(fp.clone()),
-                });
+            if g.node.kind == GroupKind::Module {
+                if let Some(fp) = &g.node.file_path {
+                    draw_icon_button(
+                        &ctx,
+                        bx,
+                        sy + 1.0,
+                        btn_size,
+                        ButtonIcon::OpenEditor,
+                        true,
+                        "#94a3b8",
+                    );
+                    action_hits.push(ActionHit {
+                        x: bx,
+                        y: sy + 1.0,
+                        w: btn_size,
+                        h: btn_size,
+                        kind: ActionKind::OpenEditor(fp.clone()),
+                    });
+                }
             }
         }
     }
