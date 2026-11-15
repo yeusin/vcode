@@ -5,6 +5,7 @@ import {
   History,
   Maximize2,
   PanelLeft,
+  Settings,
   Workflow,
   ZoomIn,
   ZoomOut,
@@ -34,6 +35,7 @@ interface ToolbarProps {
   onZoomIn: () => void;
   onZoomOut: () => void;
   onFitAll: () => void;
+  onOpenSettings: () => void;
 }
 
 const LOD_LABELS: Record<LodLevel, string> = {
@@ -60,6 +62,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onZoomIn,
   onZoomOut,
   onFitAll,
+  onOpenSettings,
 }) => {
   return (
     <header className="toolbar">
@@ -139,6 +142,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             <Maximize2 size={14} />
           </button>
         </div>
+
+        <button className="icon-btn" onClick={onOpenSettings} title="Settings (Editor Command)">
+          <Settings size={15} />
+        </button>
       </div>
     </header>
   );

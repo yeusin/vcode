@@ -9,7 +9,16 @@ import { computeLayout } from "./layout/layoutEngine";
 import type { FunctionNode, GroupNode, ProjectGraph, Rect } from "./types/graph";
 
 const RECENT_STORAGE_KEY = "vcode.recentProjects";
+const EDITOR_STORAGE_KEY = "vcode.editorCommand";
 const MAX_RECENT_PROJECTS = 5;
+
+function loadEditorCommand(): string {
+  try {
+    return localStorage.getItem(EDITOR_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 function loadRecentProjects(): RecentProject[] {
   try {
@@ -38,6 +47,10 @@ export const App: React.FC = () => {
   const [showCallEdges, setShowCallEdges] = useState(true);
   const [hiddenImportGroupIds, setHiddenImportGroupIds] = useState<Set<string>>(() => new Set());
   const [hiddenCallGroupIds, setHiddenCallGroupIds] = useState<Set<string>>(() => new Set());
+  const [editorCommand, setEditorCommand] = useState<string>(loadEditorCommand);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [editorDraft, setEditorDraft] = useState("");
+  const [pendingEditorFile, setPendingEditorFile] = useState<string | null>(null);
   const [viewport, setViewport] = useState<Viewport>({ tx: 40, ty: 40, scale: 0.45 });
 
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -203,6 +216,63 @@ export const App: React.FC = () => {
     });
   };
 
+  const launchEditor = useCallback(async (cmd: string, absFilePath: string) => {
+    setErrorMsg(null);
+    try {
+      await invoke("open_in_editor", {
+        editorCommand: cmd,
+        filePath: absFilePath,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setErrorMsg(msg);
+    }
+  }, []);
+
+  const handleOpenFileInEditor = useCallback(
+    (relFilePath: string) => {
+      if (graph.rootPath.startsWith("sample://")) {
+        setErrorMsg("Open a local project folder first to open files in your editor.");
+        return;
+      }
+      const sep = graph.rootPath.endsWith("/") || graph.rootPath.endsWith("\\") ? "" : "/";
+      const absPath = `${graph.rootPath}${sep}${relFilePath}`;
+      if (!editorCommand.trim()) {
+        setPendingEditorFile(absPath);
+        setEditorDraft("");
+        setSettingsOpen(true);
+        return;
+      }
+      void launchEditor(editorCommand, absPath);
+    },
+    [graph.rootPath, editorCommand, launchEditor]
+  );
+
+  const handleOpenSettings = () => {
+    setPendingEditorFile(null);
+    setEditorDraft(editorCommand);
+    setSettingsOpen(true);
+  };
+
+  const handleSaveSettings = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = editorDraft.trim();
+    setEditorCommand(trimmed);
+    try {
+      localStorage.setItem(EDITOR_STORAGE_KEY, trimmed);
+    } catch {
+      // ignore storage errors
+    }
+    setSettingsOpen(false);
+    if (trimmed && pendingEditorFile) {
+      const fileToOpen = pendingEditorFile;
+      setPendingEditorFile(null);
+      void launchEditor(trimmed, fileToOpen);
+    } else {
+      setPendingEditorFile(null);
+    }
+  };
+
   return (
     <div className="app-shell">
       <Toolbar
@@ -223,6 +293,7 @@ export const App: React.FC = () => {
         onZoomIn={() => zoomBy(1.25)}
         onZoomOut={() => zoomBy(0.8)}
         onFitAll={fitAll}
+        onOpenSettings={handleOpenSettings}
       />
 
       {errorMsg && (
@@ -261,12 +332,79 @@ export const App: React.FC = () => {
             hiddenImportGroupIds={hiddenImportGroupIds}
             hiddenCallGroupIds={hiddenCallGroupIds}
             onFocusRect={fitRect}
+            onOpenFileInEditor={handleOpenFileInEditor}
           />
           <div className="canvas-hint">
             Scroll to zoom (overview → structure → readable code) · Drag to pan · Double-click any diagram to focus
           </div>
         </main>
       </div>
+
+      {settingsOpen && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            setSettingsOpen(false);
+            setPendingEditorFile(null);
+          }}
+        >
+          <form
+            className="modal-card"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={handleSaveSettings}
+          >
+            <div className="modal-header">
+              <h3>Settings</h3>
+            </div>
+            <div className="modal-body">
+              <label className="modal-label" htmlFor="editor-cmd-input">
+                {pendingEditorFile
+                  ? "Set an editor command to open this file:"
+                  : "Editor command"}
+              </label>
+              <input
+                id="editor-cmd-input"
+                className="modal-input"
+                type="text"
+                autoFocus
+                placeholder="e.g. code, cursor, zed, subl, code --goto {file}"
+                value={editorDraft}
+                onChange={(e) => setEditorDraft(e.target.value)}
+              />
+              <div className="modal-presets">
+                {["code", "cursor", "zed", "subl"].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    className="preset-chip"
+                    onClick={() => setEditorDraft(preset)}
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+              <div className="modal-help">
+                Uses <code>{"{file}"}</code> placeholder if provided, otherwise appends the file path.
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setPendingEditorFile(null);
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={!editorDraft.trim()}>
+                {pendingEditorFile ? "Save & Open File" : "Save"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

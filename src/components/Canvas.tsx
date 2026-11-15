@@ -34,6 +34,7 @@ interface CanvasProps {
   hiddenImportGroupIds: Set<string>;
   hiddenCallGroupIds: Set<string>;
   onFocusRect: (rect: Rect, minScale?: number) => void;
+  onOpenFileInEditor: (relFilePath: string) => void;
 }
 
 function rectsIntersect(a: Rect, b: Rect): boolean {
@@ -133,6 +134,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   hiddenImportGroupIds,
   hiddenCallGroupIds,
   onFocusRect,
+  onOpenFileInEditor,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -147,6 +149,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   const rafRef = useRef<number | null>(null);
   const commitTimerRef = useRef<number | null>(null);
   const hoveredIdRef = useRef<string | null>(null);
+  const hoveredEditorBtnRef = useRef<string | null>(null);
+  const editorBtnRectsRef = useRef<Array<{ rect: Rect; filePath: string }>>([]);
   const selectedIdRef = useRef<string | null>(selectedId);
   const showImportRef = useRef(showImportEdges);
   const showCallRef = useRef(showCallEdges);
@@ -363,6 +367,7 @@ export const Canvas: React.FC<CanvasProps> = ({
     // - meso:  Directory + Module + Class + Function titles
     // - micro: Directory + Module + Class titles + Function code cards (in-card headers & code)
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    editorBtnRectsRef.current = [];
 
     for (const g of visibleGroups) {
       if (lod === "macro" && g.kind !== "directory") continue;
@@ -414,6 +419,47 @@ export const Canvas: React.FC<CanvasProps> = ({
 
       ctx.fillStyle = isDir ? "#38bdf8" : isMod ? "#c7d2fe" : "#ddd6fe";
       ctx.fillText(label, sx + 12, sy + 4 + fontSize + 2, pillW - 14);
+
+      if (isMod && g.filePath) {
+        const btnX = sx + 4 + pillW + 6;
+        const btnY = sy + 4;
+        const btnSize = pillH;
+        const isBtnHovered = hoveredEditorBtnRef.current === g.filePath;
+
+        roundRectPath(ctx, btnX, btnY, btnSize, btnSize, 6);
+        ctx.fillStyle = isBtnHovered ? "rgba(56, 189, 248, 0.22)" : "rgba(17, 24, 39, 0.92)";
+        ctx.fill();
+        ctx.strokeStyle = isBtnHovered ? "#38bdf8" : "rgba(99, 102, 241, 0.45)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Draw external-link / open-in-editor icon
+        const pad = 6;
+        const ix = btnX + pad;
+        const iy = btnY + pad;
+        const isz = btnSize - pad * 2;
+        ctx.strokeStyle = isBtnHovered ? "#38bdf8" : "#c7d2fe";
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        // Box with open top-right corner
+        ctx.moveTo(ix + isz * 0.45, iy);
+        ctx.lineTo(ix, iy);
+        ctx.lineTo(ix, iy + isz);
+        ctx.lineTo(ix + isz, iy + isz);
+        ctx.lineTo(ix + isz, iy + isz * 0.55);
+        // Arrow pointing top-right
+        ctx.moveTo(ix + isz * 0.45, iy + isz * 0.55);
+        ctx.lineTo(ix + isz, iy);
+        ctx.moveTo(ix + isz * 0.6, iy);
+        ctx.lineTo(ix + isz, iy);
+        ctx.lineTo(ix + isz, iy + isz * 0.4);
+        ctx.stroke();
+
+        editorBtnRectsRef.current.push({
+          rect: { x: btnX, y: btnY, width: btnSize, height: btnSize },
+          filePath: g.filePath,
+        });
+      }
     }
 
     if (lod === "meso") {
@@ -568,6 +614,21 @@ export const Canvas: React.FC<CanvasProps> = ({
     };
   }, []);
 
+  const hitTestEditorBtn = useCallback((clientX: number, clientY: number): string | null => {
+    const el = containerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    for (let i = editorBtnRectsRef.current.length - 1; i >= 0; i--) {
+      const item = editorBtnRectsRef.current[i];
+      if (pointInRect(sx, sy, item.rect)) {
+        return item.filePath;
+      }
+    }
+    return null;
+  }, []);
+
   const hitTest = useCallback(
     (clientX: number, clientY: number): { kind: "fn"; node: PositionedFunction } | { kind: "group"; node: PositionedGroup } | null => {
       const el = containerRef.current;
@@ -648,6 +709,21 @@ export const Canvas: React.FC<CanvasProps> = ({
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current.active) return;
+      const btnFile = hitTestEditorBtn(e.clientX, e.clientY);
+      if (hoveredEditorBtnRef.current !== btnFile) {
+        hoveredEditorBtnRef.current = btnFile;
+        if (containerRef.current) {
+          containerRef.current.style.cursor = btnFile ? "pointer" : "";
+        }
+        scheduleDraw();
+      }
+      if (btnFile) {
+        if (hoveredIdRef.current !== null) {
+          hoveredIdRef.current = null;
+          scheduleDraw();
+        }
+        return;
+      }
       const hit = hitTest(e.clientX, e.clientY);
       const nextHover = hit ? hit.node.id : null;
       if (hoveredIdRef.current !== nextHover) {
@@ -655,7 +731,7 @@ export const Canvas: React.FC<CanvasProps> = ({
         scheduleDraw();
       }
     },
-    [hitTest, scheduleDraw]
+    [hitTest, hitTestEditorBtn, scheduleDraw]
   );
 
   useEffect(() => {
@@ -697,10 +773,15 @@ export const Canvas: React.FC<CanvasProps> = ({
   const handleClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       if (dragRef.current.moved) return;
+      const btnFile = hitTestEditorBtn(e.clientX, e.clientY);
+      if (btnFile) {
+        onOpenFileInEditor(btnFile);
+        return;
+      }
       const hit = hitTest(e.clientX, e.clientY);
       onSelect(hit ? hit.node.id : null);
     },
-    [hitTest, onSelect]
+    [hitTest, hitTestEditorBtn, onSelect, onOpenFileInEditor]
   );
 
   const handleDoubleClick = useCallback(
