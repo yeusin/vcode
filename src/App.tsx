@@ -54,12 +54,12 @@ export const App: React.FC = () => {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Select Python Project Folder",
+        title: "Select Project Folder",
       });
       if (!selected || Array.isArray(selected)) return;
 
       setLoading(true);
-      const analyzed = await invoke<ProjectGraph>("analyze_python_project", {
+      const analyzed = await invoke<ProjectGraph>("analyze_project", {
         projectPath: selected,
       });
       setGraph(analyzed);

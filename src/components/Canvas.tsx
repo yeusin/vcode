@@ -6,7 +6,7 @@ import type {
   PositionedGroup,
   Rect,
 } from "../types/graph";
-import { highlightPython, TOKEN_COLORS, tokenizePythonLine, type CodeToken } from "../utils/pythonHighlight";
+import { highlightPython, TOKEN_COLORS, tokenizeCodeLine, type CodeToken } from "../utils/pythonHighlight";
 
 export interface Viewport {
   tx: number;
@@ -158,7 +158,7 @@ export const Canvas: React.FC<CanvasProps> = ({
     for (const fn of layout.functions) {
       map.set(
         fn.id,
-        fn.code.split("\n").map((line) => tokenizePythonLine(line))
+        fn.code.split("\n").map((line) => tokenizeCodeLine(line, fn.filePath))
       );
     }
     return map;
@@ -674,7 +674,7 @@ export const Canvas: React.FC<CanvasProps> = ({
             {selectedFnOverlay.code.split("\n").map((line, idx) => (
               <div key={idx} className="code-line">
                 <span className="line-num">{selectedFnOverlay.startLine + idx}</span>
-                <span className="line-text">{highlightPython(line)}</span>
+                <span className="line-text">{highlightPython(line, selectedFnOverlay.filePath)}</span>
               </div>
             ))}
           </pre>

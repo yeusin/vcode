@@ -75,7 +75,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </div>
         <button className="btn btn-primary" onClick={onOpenProject} disabled={loading}>
           <FolderOpen size={15} />
-          <span>{loading ? "Analyzing..." : "Open Python Project"}</span>
+          <span>{loading ? "Analyzing..." : "Open Project"}</span>
         </button>
         <button className="btn btn-ghost" onClick={onLoadSample} disabled={loading} title="Load built-in sample project">
           <Sparkles size={14} />
