@@ -164,6 +164,24 @@ export const Canvas: React.FC<CanvasProps> = ({
     return map;
   }, [layout.functions]);
 
+  const callStatsById = useMemo(() => {
+    const map = new Map<string, { callers: number; callees: number }>();
+    for (const fn of layout.functions) {
+      map.set(fn.id, { callers: 0, callees: 0 });
+    }
+    for (const edge of layout.edges) {
+      if (edge.kind !== "call") continue;
+      const src = map.get(edge.sourceId) ?? { callers: 0, callees: 0 };
+      src.callees += 1;
+      map.set(edge.sourceId, src);
+
+      const dst = map.get(edge.targetId) ?? { callers: 0, callees: 0 };
+      dst.callers += 1;
+      map.set(edge.targetId, dst);
+    }
+    return map;
+  }, [layout.functions, layout.edges]);
+
   const drawScene = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -395,7 +413,38 @@ export const Canvas: React.FC<CanvasProps> = ({
         ctx.fillText(label, sx + 9, sy + 16.5, pillW - 12);
       }
     }
-  }, [layout, tokenizedByFn]);
+
+    // 4. Hover badge: display only how many callers and callees for the hovered diagram
+    if (hoveredIdRef.current) {
+      const hovId = hoveredIdRef.current;
+      const stats = callStatsById.get(hovId);
+      const rect = layout.nodeRects[hovId];
+      if (stats && rect) {
+        const sx = rect.x * scale + tx;
+        const sy = rect.y * scale + ty;
+        const callerText = `${stats.callers} ${stats.callers === 1 ? "caller" : "callers"}`;
+        const calleeText = `${stats.callees} ${stats.callees === 1 ? "callee" : "callees"}`;
+        const text = `${callerText} · ${calleeText}`;
+
+        ctx.font = `600 11.5px ${FONT_SANS}`;
+        const textW = ctx.measureText(text).width;
+        const pillW = textW + 18;
+        const pillH = 24;
+        const px = Math.max(8, Math.min(vw - pillW - 8, sx));
+        const py = Math.max(8, sy - pillH - 6);
+
+        roundRectPath(ctx, px, py, pillW, pillH, 6);
+        ctx.fillStyle = "rgba(11, 15, 23, 0.96)";
+        ctx.fill();
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+
+        ctx.fillStyle = "#fde68a";
+        ctx.fillText(text, px + 9, py + 16);
+      }
+    }
+  }, [layout, tokenizedByFn, callStatsById]);
 
   const scheduleDraw = useCallback(() => {
     if (rafRef.current !== null) return;
