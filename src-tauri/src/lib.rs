@@ -359,28 +359,6 @@ async fn fetch_pr_review(
     review::fetch_pr_review(&project_path, &pr_url_or_number, token).await
 }
 
-#[tauri::command]
-async fn post_pr_comment(
-    project_path: String,
-    pr_url_or_number: String,
-    token: String,
-    head_sha: String,
-    file_path: String,
-    line: usize,
-    body: String,
-) -> Result<(), String> {
-    review::post_pr_comment(
-        &project_path,
-        &pr_url_or_number,
-        &token,
-        &head_sha,
-        &file_path,
-        line,
-        &body,
-    )
-    .await
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -400,8 +378,7 @@ pub fn run() {
             add_review_comment,
             toggle_resolve_comment,
             delete_review_comment,
-            fetch_pr_review,
-            post_pr_comment
+            fetch_pr_review
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

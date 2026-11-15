@@ -209,18 +209,6 @@ struct FetchPrArgs<'a> {
     token: Option<&'a str>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PostPrCommentArgs<'a> {
-    project_path: &'a str,
-    pr_url_or_number: &'a str,
-    token: &'a str,
-    head_sha: &'a str,
-    file_path: &'a str,
-    line: usize,
-    body: &'a str,
-}
-
 pub async fn get_git_diff(
     project_path: &str,
     base_ref: Option<&str>,
@@ -302,30 +290,6 @@ pub async fn fetch_pr_review(
             project_path,
             pr_url_or_number,
             token,
-        },
-    )
-    .await
-}
-
-pub async fn post_pr_comment(
-    project_path: &str,
-    pr_url_or_number: &str,
-    token: &str,
-    head_sha: &str,
-    file_path: &str,
-    line: usize,
-    body: &str,
-) -> Result<(), String> {
-    invoke(
-        "post_pr_comment",
-        &PostPrCommentArgs {
-            project_path,
-            pr_url_or_number,
-            token,
-            head_sha,
-            file_path,
-            line,
-            body,
         },
     )
     .await

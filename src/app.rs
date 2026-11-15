@@ -1173,43 +1173,6 @@ pub fn App() -> impl IntoView {
                                     >
                                         "Add Comment"
                                     </button>
-                                    <Show when=move || diff_summary.get().and_then(|d| d.pr).is_some()>
-                                        <button
-                                            class="btn btn-ghost"
-                                            on:click=move |_| {
-                                                let proj = graph.get_untracked().root_path;
-                                                let body = comment_body_input.get_untracked();
-                                                let pr_val = pr_input.get_untracked();
-                                                let tok = git_token.get_untracked();
-                                                let Some(pr_info) = diff_summary.get_untracked().and_then(|d| d.pr) else {
-                                                    return;
-                                                };
-                                                if body.trim().is_empty() {
-                                                    return;
-                                                }
-                                                let sel = selected_id.get_untracked();
-                                                let g = graph.get_untracked();
-                                                let file_path = sel.as_deref().and_then(|sid| {
-                                                    g.functions.iter().find(|f| f.id == sid).map(|f| f.file_path.clone())
-                                                        .or_else(|| g.groups.iter().find(|grp| grp.id == sid).and_then(|grp| grp.file_path.clone()))
-                                                }).or_else(|| diff_summary.get_untracked().and_then(|d| d.files.first().map(|f| f.file_path.clone())))
-                                                .unwrap_or_default();
-                                                let rel_path = file_path.strip_prefix(&format!("{proj}/")).unwrap_or(&file_path).to_string();
-                                                let line = comment_line_input.get_untracked();
-                                                spawn_local(async move {
-                                                    match tauri_bridge::post_pr_comment(&proj, &pr_val, &tok, &pr_info.head_sha, &rel_path, line, &body).await {
-                                                        Ok(()) => {
-                                                            let _ = tauri_bridge::add_review_comment(&proj, &rel_path, line, sel.as_deref(), "you", &body).await.map(|l| review_comments.set(l));
-                                                            comment_body_input.set(String::new());
-                                                        }
-                                                        Err(e) => review_error.set(Some(e)),
-                                                    }
-                                                });
-                                            }
-                                        >
-                                            "Post to PR"
-                                        </button>
-                                    </Show>
                                 </div>
                             </div>
 

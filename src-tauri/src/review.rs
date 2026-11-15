@@ -525,39 +525,42 @@ fn resolve_token(target: &ParsedPrTarget, explicit: Option<String>) -> Option<St
     }
 }
 
-fn fetch_pr_via_git_ssh(
+fn fetch_pr_via_cli(
     root: &Path,
-    ref_spec: &str,
     provider: &str,
     number: u64,
     url: String,
 ) -> Result<GitDiffSummary, String> {
-    run_git(root, &["fetch", "origin", ref_spec])?;
-    let head_sha = run_git(root, &["rev-parse", "FETCH_HEAD"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let base = if run_git(root, &["rev-parse", "--verify", "origin/main"]).is_ok() {
-        "origin/main"
-    } else if run_git(root, &["rev-parse", "--verify", "origin/master"]).is_ok() {
-        "origin/master"
+    let out = if provider == "github" {
+        Command::new("gh")
+            .current_dir(root)
+            .args(["pr", "diff", &number.to_string()])
+            .output()
+            .map_err(|e| format!("Failed to run gh: {e}"))?
     } else {
-        "HEAD"
+        Command::new("glab")
+            .current_dir(root)
+            .args(["mr", "diff", &number.to_string()])
+            .output()
+            .map_err(|e| format!("Failed to run glab: {e}"))?
     };
-    let range = format!("{base}...FETCH_HEAD");
-    let diff_out = run_git(root, &["diff", "--unified=3", "--no-color", &range])?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let diff_out = String::from_utf8_lossy(&out.stdout).into_owned();
     let files = parse_unified_diff(root, &diff_out);
     Ok(GitDiffSummary {
         branch: format!("pr-{number}"),
-        base_ref: base.to_string(),
+        base_ref: "base".to_string(),
         files,
         pr: Some(PrInfo {
             provider: provider.to_string(),
             number,
-            title: format!("PR #{number} (via Git SSH)"),
+            title: format!("PR #{number}"),
             url,
-            base_branch: base.to_string(),
+            base_branch: "base".to_string(),
             head_branch: format!("pr-{number}"),
-            head_sha,
+            head_sha: String::new(),
         }),
     })
 }
@@ -597,11 +600,9 @@ pub async fn fetch_pr_review(
                     .await
                     .map_err(|e| format!("Invalid GitHub JSON: {e}"))?,
                 Err(api_err) => {
-                    // Fallback to git fetch over the repo's SSH/origin remote
                     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{number}");
-                    let ref_spec = format!("pull/{number}/head");
-                    if let Ok(ssh_diff) = fetch_pr_via_git_ssh(root, &ref_spec, "github", number, pr_url) {
-                        return Ok((ssh_diff, Vec::new()));
+                    if let Ok(cli_diff) = fetch_pr_via_cli(root, "github", number, pr_url) {
+                        return Ok((cli_diff, Vec::new()));
                     }
                     return Err(api_err);
                 }
@@ -724,9 +725,8 @@ pub async fn fetch_pr_review(
                     .map_err(|e| format!("Invalid GitLab JSON: {e}"))?,
                 Err(api_err) => {
                     let mr_url = format!("https://{host}/{proj}/-/merge_requests/{iid}");
-                    let ref_spec = format!("merge-requests/{iid}/head");
-                    if let Ok(ssh_diff) = fetch_pr_via_git_ssh(root, &ref_spec, "gitlab", iid, mr_url) {
-                        return Ok((ssh_diff, Vec::new()));
+                    if let Ok(cli_diff) = fetch_pr_via_cli(root, "gitlab", iid, mr_url) {
+                        return Ok((cli_diff, Vec::new()));
                     }
                     return Err(api_err);
                 }
@@ -796,74 +796,6 @@ pub async fn fetch_pr_review(
                 },
                 Vec::new(),
             ))
-        }
-    }
-}
-
-pub async fn post_pr_comment(
-    project_path: &str,
-    pr_url_or_number: &str,
-    token: &str,
-    head_sha: &str,
-    file_path: &str,
-    line: usize,
-    body: &str,
-) -> Result<(), String> {
-    let root = Path::new(project_path);
-    let target = resolve_pr_target(root, pr_url_or_number)?;
-    let tok = resolve_token(&target, Some(token.to_string())).ok_or_else(|| {
-        "No token found. Authenticate with `gh auth login` / `glab auth login` or enter a token.".to_string()
-    })?;
-    let client = reqwest::Client::builder()
-        .user_agent("vcode-reviewer/0.1")
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    match target {
-        ParsedPrTarget::GitHub {
-            owner,
-            repo,
-            number,
-        } => {
-            let api = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments");
-            let payload = serde_json::json!({
-                "body": body,
-                "commit_id": head_sha,
-                "path": file_path,
-                "line": line,
-                "side": "RIGHT",
-            });
-            client
-                .post(&api)
-                .bearer_auth(tok)
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to post GitHub comment: {e}"))?
-                .error_for_status()
-                .map_err(|e| format!("GitHub post comment error: {e}"))?;
-            Ok(())
-        }
-        ParsedPrTarget::GitLab {
-            host,
-            project_path: proj,
-            iid,
-        } => {
-            let encoded_proj = proj.replace('/', "%2F");
-            let api = format!("https://{host}/api/v4/projects/{encoded_proj}/merge_requests/{iid}/notes");
-            let payload = serde_json::json!({
-                "body": format!("`{file_path}:{line}`\n\n{body}")
-            });
-            client
-                .post(&api)
-                .header("PRIVATE-TOKEN", tok)
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to post GitLab comment: {e}"))?
-                .error_for_status()
-                .map_err(|e| format!("GitLab post comment error: {e}"))?;
-            Ok(())
         }
     }
 }
