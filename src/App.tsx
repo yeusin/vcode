@@ -12,6 +12,14 @@ const RECENT_STORAGE_KEY = "vcode.recentProjects";
 const EDITOR_STORAGE_KEY = "vcode.editorCommand";
 const MAX_RECENT_PROJECTS = 5;
 
+interface ProjectSettingsPayload {
+  showImportEdges: boolean;
+  showCallEdges: boolean;
+  hiddenImportGroupIds: string[];
+  hiddenCallGroupIds: string[];
+  editorCommand: string;
+}
+
 function loadEditorCommand(): string {
   try {
     return localStorage.getItem(EDITOR_STORAGE_KEY) ?? "";
@@ -54,6 +62,7 @@ export const App: React.FC = () => {
   const [viewport, setViewport] = useState<Viewport>({ tx: 40, ty: 40, scale: 0.45 });
 
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const settingsLoadedPathRef = useRef<string | null>(null);
   const layout = useMemo(() => computeLayout(graph), [graph]);
 
   const hiddenEdgeIds = useMemo(() => {
@@ -156,10 +165,33 @@ export const App: React.FC = () => {
         const analyzed = await invoke<ProjectGraph>("analyze_project", {
           projectPath,
         });
+        let saved: ProjectSettingsPayload | null = null;
+        try {
+          saved = await invoke<ProjectSettingsPayload | null>("load_project_settings", {
+            projectPath: analyzed.rootPath,
+          });
+        } catch {
+          saved = null;
+        }
+
+        settingsLoadedPathRef.current = null;
         setGraph(analyzed);
         setSelectedId(null);
-        setHiddenImportGroupIds(new Set());
-        setHiddenCallGroupIds(new Set());
+        if (saved) {
+          setShowImportEdges(saved.showImportEdges);
+          setShowCallEdges(saved.showCallEdges);
+          setHiddenImportGroupIds(new Set(saved.hiddenImportGroupIds));
+          setHiddenCallGroupIds(new Set(saved.hiddenCallGroupIds));
+          if (saved.editorCommand) {
+            setEditorCommand(saved.editorCommand);
+          }
+        } else {
+          setShowImportEdges(true);
+          setShowCallEdges(true);
+          setHiddenImportGroupIds(new Set());
+          setHiddenCallGroupIds(new Set());
+        }
+        settingsLoadedPathRef.current = analyzed.rootPath;
         recordRecentProject(analyzed.rootName, analyzed.rootPath);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -170,6 +202,35 @@ export const App: React.FC = () => {
     },
     [recordRecentProject]
   );
+
+  useEffect(() => {
+    if (
+      graph.rootPath.startsWith("sample://") ||
+      settingsLoadedPathRef.current !== graph.rootPath
+    ) {
+      return;
+    }
+    const payload: ProjectSettingsPayload = {
+      showImportEdges,
+      showCallEdges,
+      hiddenImportGroupIds: Array.from(hiddenImportGroupIds),
+      hiddenCallGroupIds: Array.from(hiddenCallGroupIds),
+      editorCommand,
+    };
+    void invoke("save_project_settings", {
+      projectPath: graph.rootPath,
+      settings: payload,
+    }).catch(() => {
+      // ignore persistence errors when running outside Tauri
+    });
+  }, [
+    graph.rootPath,
+    showImportEdges,
+    showCallEdges,
+    hiddenImportGroupIds,
+    hiddenCallGroupIds,
+    editorCommand,
+  ]);
 
   const handleOpenProject = async () => {
     setErrorMsg(null);
