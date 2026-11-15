@@ -1,5 +1,15 @@
 import React, { useMemo } from "react";
-import { AlertTriangle, Box, Code2, FileCode2, Folder, FolderTree, Search } from "lucide-react";
+import {
+  AlertTriangle,
+  Box,
+  Code2,
+  FileCode2,
+  Folder,
+  FolderTree,
+  GitBranch,
+  Search,
+  Workflow,
+} from "lucide-react";
 import type { FunctionNode, GroupNode, ProjectGraph } from "../types/graph";
 
 interface SidebarProps {
@@ -9,6 +19,10 @@ interface SidebarProps {
   selectedId: string | null;
   onSelectGroup: (group: GroupNode) => void;
   onSelectFunction: (fn: FunctionNode) => void;
+  hiddenImportGroupIds: Set<string>;
+  hiddenCallGroupIds: Set<string>;
+  onToggleGroupImport: (groupId: string) => void;
+  onToggleGroupCall: (groupId: string) => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -18,6 +32,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   selectedId,
   onSelectGroup,
   onSelectFunction,
+  hiddenImportGroupIds,
+  hiddenCallGroupIds,
+  onToggleGroupImport,
+  onToggleGroupCall,
 }) => {
   const query = searchQuery.trim().toLowerCase();
 
@@ -61,33 +79,79 @@ export const Sidebar: React.FC<SidebarProps> = ({
     return map;
   }, [filteredGroups]);
 
+  const renderGroupRow = (g: GroupNode, paddingLeft: number, label: string) => {
+    const importHidden = hiddenImportGroupIds.has(g.id);
+    const callHidden = hiddenCallGroupIds.has(g.id);
+
+    return (
+      <div
+        className={`tree-row ${selectedId === g.id ? "is-selected" : ""} ${
+          importHidden || callHidden ? "has-hidden-edges" : ""
+        }`}
+      >
+        <button
+          className={`tree-item tree-${g.kind}`}
+          style={{ paddingLeft }}
+          onClick={() => onSelectGroup(g)}
+          title={g.qualifiedName}
+        >
+          <span className="tree-icon">
+            {g.kind === "directory" ? (
+              g.isPackage ? (
+                <FolderTree size={14} />
+              ) : (
+                <Folder size={14} />
+              )
+            ) : g.kind === "module" ? (
+              <FileCode2 size={14} />
+            ) : (
+              <Box size={13} />
+            )}
+          </span>
+          <span className="tree-label">{label}</span>
+        </button>
+
+        <div className="tree-edge-toggles">
+          <button
+            className={`tree-edge-btn ${importHidden ? "is-hidden" : ""}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleGroupImport(g.id);
+            }}
+            title={
+              importHidden
+                ? `Show import edges for ${g.name}`
+                : `Hide import edges for ${g.name}`
+            }
+          >
+            <GitBranch size={11} />
+          </button>
+          <button
+            className={`tree-edge-btn ${callHidden ? "is-hidden" : ""}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleGroupCall(g.id);
+            }}
+            title={
+              callHidden
+                ? `Show call edges for ${g.name}`
+                : `Hide call edges for ${g.name}`
+            }
+          >
+            <Workflow size={11} />
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   const renderGroupTree = (parentKey: string, depth: number): React.ReactNode => {
     const children = groupsByParent.get(parentKey) ?? [];
     return children.map((g) => {
       const directFns = fnsByParent.get(g.id) ?? [];
       return (
         <div key={g.id}>
-          <button
-            className={`tree-item tree-${g.kind} ${selectedId === g.id ? "is-selected" : ""}`}
-            style={{ paddingLeft: 10 + depth * 14 }}
-            onClick={() => onSelectGroup(g)}
-            title={g.qualifiedName}
-          >
-            <span className="tree-icon">
-              {g.kind === "directory" ? (
-                g.isPackage ? (
-                  <FolderTree size={14} />
-                ) : (
-                  <Folder size={14} />
-                )
-              ) : g.kind === "module" ? (
-                <FileCode2 size={14} />
-              ) : (
-                <Box size={13} />
-              )}
-            </span>
-            <span className="tree-label">{g.name}</span>
-          </button>
+          {renderGroupRow(g, 10 + depth * 14, g.name)}
           {renderGroupTree(g.id, depth + 1)}
           {directFns.map((fn) => (
             <button
@@ -148,13 +212,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
         ) : query ? (
           <>
             {filteredGroups.map((g) => (
-              <button
-                key={g.id}
-                className={`tree-item tree-${g.kind} ${selectedId === g.id ? "is-selected" : ""}`}
-                onClick={() => onSelectGroup(g)}
-              >
-                <span className="tree-label">{g.qualifiedName}</span>
-              </button>
+              <React.Fragment key={g.id}>
+                {renderGroupRow(g, 10, g.qualifiedName)}
+              </React.Fragment>
             ))}
             {filteredFunctions.map((fn) => (
               <button

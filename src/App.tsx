@@ -36,10 +36,63 @@ export const App: React.FC = () => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showImportEdges, setShowImportEdges] = useState(true);
   const [showCallEdges, setShowCallEdges] = useState(true);
+  const [hiddenImportGroupIds, setHiddenImportGroupIds] = useState<Set<string>>(() => new Set());
+  const [hiddenCallGroupIds, setHiddenCallGroupIds] = useState<Set<string>>(() => new Set());
   const [viewport, setViewport] = useState<Viewport>({ tx: 40, ty: 40, scale: 0.45 });
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const layout = useMemo(() => computeLayout(graph), [graph]);
+
+  const hiddenEdgeIds = useMemo(() => {
+    const hidden = new Set<string>();
+    if (hiddenImportGroupIds.size === 0 && hiddenCallGroupIds.size === 0) {
+      return hidden;
+    }
+
+    const parentMap = new Map<string, string | null>();
+    for (const g of graph.groups) {
+      parentMap.set(g.id, g.parentId);
+    }
+    for (const fn of graph.functions) {
+      parentMap.set(fn.id, fn.parentId);
+    }
+
+    const isBlocked = (nodeId: string, blockedGroups: Set<string>): boolean => {
+      if (blockedGroups.size === 0) return false;
+      let cur: string | null | undefined = nodeId;
+      while (cur) {
+        if (blockedGroups.has(cur)) return true;
+        cur = parentMap.get(cur);
+      }
+      return false;
+    };
+
+    for (const edge of graph.edges) {
+      const blocked = edge.kind === "import" ? hiddenImportGroupIds : hiddenCallGroupIds;
+      if (isBlocked(edge.sourceId, blocked) || isBlocked(edge.targetId, blocked)) {
+        hidden.add(edge.id);
+      }
+    }
+    return hidden;
+  }, [graph, hiddenImportGroupIds, hiddenCallGroupIds]);
+
+  const toggleGroupImport = useCallback((groupId: string) => {
+    setHiddenImportGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
+
+  const toggleGroupCall = useCallback((groupId: string) => {
+    setHiddenCallGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
 
   const fitRect = useCallback(
     (rect: Rect, minScale?: number) => {
@@ -92,6 +145,8 @@ export const App: React.FC = () => {
         });
         setGraph(analyzed);
         setSelectedId(null);
+        setHiddenImportGroupIds(new Set());
+        setHiddenCallGroupIds(new Set());
         recordRecentProject(analyzed.rootName, analyzed.rootPath);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -186,6 +241,10 @@ export const App: React.FC = () => {
             selectedId={selectedId}
             onSelectGroup={handleSelectGroup}
             onSelectFunction={handleSelectFunction}
+            hiddenImportGroupIds={hiddenImportGroupIds}
+            hiddenCallGroupIds={hiddenCallGroupIds}
+            onToggleGroupImport={toggleGroupImport}
+            onToggleGroupCall={toggleGroupCall}
           />
         )}
 
@@ -198,6 +257,7 @@ export const App: React.FC = () => {
             onSelect={setSelectedId}
             showImportEdges={showImportEdges}
             showCallEdges={showCallEdges}
+            hiddenEdgeIds={hiddenEdgeIds}
             onFocusRect={fitRect}
           />
           <div className="canvas-hint">

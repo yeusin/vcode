@@ -30,6 +30,7 @@ interface CanvasProps {
   onSelect: (id: string | null) => void;
   showImportEdges: boolean;
   showCallEdges: boolean;
+  hiddenEdgeIds: Set<string>;
   onFocusRect: (rect: Rect, minScale?: number) => void;
 }
 
@@ -126,6 +127,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   onSelect,
   showImportEdges,
   showCallEdges,
+  hiddenEdgeIds,
   onFocusRect,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -144,6 +146,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   const selectedIdRef = useRef<string | null>(selectedId);
   const showImportRef = useRef(showImportEdges);
   const showCallRef = useRef(showCallEdges);
+  const hiddenEdgesRef = useRef(hiddenEdgeIds);
 
   const [renderVp, setRenderVp] = useState<Viewport>(viewport);
   const [isDragging, setIsDragging] = useState(false);
@@ -151,6 +154,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   selectedIdRef.current = selectedId;
   showImportRef.current = showImportEdges;
   showCallRef.current = showCallEdges;
+  hiddenEdgesRef.current = hiddenEdgeIds;
 
   // Pre-tokenize all function code once per layout for instant 2D canvas rendering
   const tokenizedByFn = useMemo(() => {
@@ -331,6 +335,7 @@ export const Canvas: React.FC<CanvasProps> = ({
     for (const edge of layout.edges) {
       if (edge.kind === "import" && !showImportRef.current) continue;
       if (edge.kind === "call" && !showCallRef.current) continue;
+      if (hiddenEdgesRef.current.has(edge.id)) continue;
       const edgeBox: Rect = {
         x: Math.min(edge.x1, edge.x2) - 60,
         y: Math.min(edge.y1, edge.y2) - 60,
@@ -489,7 +494,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   // Redraw when layout, selection, or edge toggles change
   useEffect(() => {
     scheduleDraw();
-  }, [layout, selectedId, showImportEdges, showCallEdges, scheduleDraw]);
+  }, [layout, selectedId, showImportEdges, showCallEdges, hiddenEdgeIds, scheduleDraw]);
 
   const commitNow = useCallback(() => {
     if (commitTimerRef.current !== null) {

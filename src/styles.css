@@ -394,6 +394,71 @@ body,
   text-align: center;
 }
 
+.tree-row {
+  display: flex;
+  align-items: center;
+  border-radius: 5px;
+  padding-right: 4px;
+}
+
+.tree-row:hover {
+  background: var(--bg-elevated);
+}
+
+.tree-row.is-selected {
+  background: rgba(99, 102, 241, 0.2);
+}
+
+.tree-row.is-selected .tree-item {
+  color: #fff;
+}
+
+.tree-row .tree-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-row .tree-item:hover {
+  background: transparent;
+}
+
+.tree-edge-toggles {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.tree-row:hover .tree-edge-toggles,
+.tree-row.has-hidden-edges .tree-edge-toggles {
+  opacity: 1;
+}
+
+.tree-edge-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.tree-edge-btn:hover {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--text-primary);
+}
+
+.tree-edge-btn.is-hidden {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.14);
+}
+
 .tree-item {
   width: 100%;
   display: flex;
