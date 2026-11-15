@@ -258,6 +258,8 @@ export const App: React.FC = () => {
             showImportEdges={showImportEdges}
             showCallEdges={showCallEdges}
             hiddenEdgeIds={hiddenEdgeIds}
+            hiddenImportGroupIds={hiddenImportGroupIds}
+            hiddenCallGroupIds={hiddenCallGroupIds}
             onFocusRect={fitRect}
           />
           <div className="canvas-hint">

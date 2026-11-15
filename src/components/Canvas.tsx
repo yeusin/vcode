@@ -31,6 +31,8 @@ interface CanvasProps {
   showImportEdges: boolean;
   showCallEdges: boolean;
   hiddenEdgeIds: Set<string>;
+  hiddenImportGroupIds: Set<string>;
+  hiddenCallGroupIds: Set<string>;
   onFocusRect: (rect: Rect, minScale?: number) => void;
 }
 
@@ -128,6 +130,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   showImportEdges,
   showCallEdges,
   hiddenEdgeIds,
+  hiddenImportGroupIds,
+  hiddenCallGroupIds,
   onFocusRect,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -147,6 +151,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   const showImportRef = useRef(showImportEdges);
   const showCallRef = useRef(showCallEdges);
   const hiddenEdgesRef = useRef(hiddenEdgeIds);
+  const hiddenImportGroupsRef = useRef(hiddenImportGroupIds);
+  const hiddenCallGroupsRef = useRef(hiddenCallGroupIds);
 
   const [renderVp, setRenderVp] = useState<Viewport>(viewport);
   const [isDragging, setIsDragging] = useState(false);
@@ -155,6 +161,8 @@ export const Canvas: React.FC<CanvasProps> = ({
   showImportRef.current = showImportEdges;
   showCallRef.current = showCallEdges;
   hiddenEdgesRef.current = hiddenEdgeIds;
+  hiddenImportGroupsRef.current = hiddenImportGroupIds;
+  hiddenCallGroupsRef.current = hiddenCallGroupIds;
 
   // Pre-tokenize all function code once per layout for instant 2D canvas rendering
   const tokenizedByFn = useMemo(() => {
@@ -369,7 +377,19 @@ export const Canvas: React.FC<CanvasProps> = ({
       const fontSize = isDir ? 13 : isMod ? 12 : 11.5;
       ctx.font = `600 ${fontSize}px ${FONT_SANS}`;
 
-      const label = isMod ? `${g.name} (${g.functionCount})` : g.name;
+      const impOff = hiddenImportGroupsRef.current.has(g.id);
+      const callOff = hiddenCallGroupsRef.current.has(g.id);
+      const offSuffix =
+        impOff && callOff
+          ? " · no graphs"
+          : impOff
+          ? " · no imports"
+          : callOff
+          ? " · no calls"
+          : "";
+
+      const baseLabel = isMod ? `${g.name} (${g.functionCount})` : g.name;
+      const label = `${baseLabel}${offSuffix}`;
       const textW = ctx.measureText(label).width;
       const pillW = Math.min(Math.max(sw - 8, 64), textW + 18);
       const pillH = fontSize + 10;
@@ -381,11 +401,14 @@ export const Canvas: React.FC<CanvasProps> = ({
         ? "rgba(17, 24, 39, 0.92)"
         : "rgba(30, 27, 54, 0.92)";
       ctx.fill();
-      ctx.strokeStyle = isDir
-        ? "rgba(56, 189, 248, 0.45)"
-        : isMod
-        ? "rgba(99, 102, 241, 0.45)"
-        : "rgba(167, 139, 250, 0.45)";
+      ctx.strokeStyle =
+        impOff || callOff
+          ? "rgba(248, 113, 113, 0.7)"
+          : isDir
+          ? "rgba(56, 189, 248, 0.45)"
+          : isMod
+          ? "rgba(99, 102, 241, 0.45)"
+          : "rgba(167, 139, 250, 0.45)";
       ctx.lineWidth = 1;
       ctx.stroke();
 
@@ -494,7 +517,16 @@ export const Canvas: React.FC<CanvasProps> = ({
   // Redraw when layout, selection, or edge toggles change
   useEffect(() => {
     scheduleDraw();
-  }, [layout, selectedId, showImportEdges, showCallEdges, hiddenEdgeIds, scheduleDraw]);
+  }, [
+    layout,
+    selectedId,
+    showImportEdges,
+    showCallEdges,
+    hiddenEdgeIds,
+    hiddenImportGroupIds,
+    hiddenCallGroupIds,
+    scheduleDraw,
+  ]);
 
   const commitNow = useCallback(() => {
     if (commitTimerRef.current !== null) {
