@@ -979,7 +979,7 @@ pub fn App() -> impl IntoView {
                             <input
                                 class="review-input"
                                 type="password"
-                                placeholder="GitHub/GitLab Token (optional, saved locally)"
+                                placeholder="Token (optional — auto-uses gh/glab or SSH)"
                                 prop:value=move || git_token.get()
                                 on:input=move |ev| {
                                     let v = event_target_value(&ev);

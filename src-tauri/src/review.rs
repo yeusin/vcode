@@ -495,6 +495,73 @@ fn resolve_pr_target(project_path: &Path, input: &str) -> Result<ParsedPrTarget,
     }
 }
 
+fn resolve_cli_token(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok)
+    }
+}
+
+fn resolve_token(target: &ParsedPrTarget, explicit: Option<String>) -> Option<String> {
+    if let Some(t) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Some(t);
+    }
+    match target {
+        ParsedPrTarget::GitHub { .. } => std::env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("GH_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| resolve_cli_token("gh", &["auth", "token"])),
+        ParsedPrTarget::GitLab { .. } => std::env::var("GITLAB_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| resolve_cli_token("glab", &["config", "get", "token"])),
+    }
+}
+
+fn fetch_pr_via_git_ssh(
+    root: &Path,
+    ref_spec: &str,
+    provider: &str,
+    number: u64,
+    url: String,
+) -> Result<GitDiffSummary, String> {
+    run_git(root, &["fetch", "origin", ref_spec])?;
+    let head_sha = run_git(root, &["rev-parse", "FETCH_HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let base = if run_git(root, &["rev-parse", "--verify", "origin/main"]).is_ok() {
+        "origin/main"
+    } else if run_git(root, &["rev-parse", "--verify", "origin/master"]).is_ok() {
+        "origin/master"
+    } else {
+        "HEAD"
+    };
+    let range = format!("{base}...FETCH_HEAD");
+    let diff_out = run_git(root, &["diff", "--unified=3", "--no-color", &range])?;
+    let files = parse_unified_diff(root, &diff_out);
+    Ok(GitDiffSummary {
+        branch: format!("pr-{number}"),
+        base_ref: base.to_string(),
+        files,
+        pr: Some(PrInfo {
+            provider: provider.to_string(),
+            number,
+            title: format!("PR #{number} (via Git SSH)"),
+            url,
+            base_branch: base.to_string(),
+            head_branch: format!("pr-{number}"),
+            head_sha,
+        }),
+    })
+}
+
 pub async fn fetch_pr_review(
     project_path: &str,
     pr_url_or_number: &str,
@@ -502,9 +569,7 @@ pub async fn fetch_pr_review(
 ) -> Result<(GitDiffSummary, Vec<ReviewComment>), String> {
     let root = Path::new(project_path);
     let target = resolve_pr_target(root, pr_url_or_number)?;
-    let tok = token
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let tok = resolve_token(&target, token);
 
     let client = reqwest::Client::builder()
         .user_agent("vcode-reviewer/0.1")
@@ -522,15 +587,25 @@ pub async fn fetch_pr_review(
             if let Some(t) = &tok {
                 req = req.bearer_auth(t);
             }
-            let pr_json: serde_json::Value = req
-                .send()
-                .await
-                .map_err(|e| format!("GitHub request failed: {e}"))?
-                .error_for_status()
-                .map_err(|e| format!("GitHub API error: {e}"))?
-                .json()
-                .await
-                .map_err(|e| format!("Invalid GitHub JSON: {e}"))?;
+            let api_resp = match req.send().await {
+                Ok(r) => r.error_for_status().map_err(|e| format!("GitHub API error: {e}")),
+                Err(e) => Err(format!("GitHub request failed: {e}")),
+            };
+            let pr_json: serde_json::Value = match api_resp {
+                Ok(r) => r
+                    .json()
+                    .await
+                    .map_err(|e| format!("Invalid GitHub JSON: {e}"))?,
+                Err(api_err) => {
+                    // Fallback to git fetch over the repo's SSH/origin remote
+                    let pr_url = format!("https://github.com/{owner}/{repo}/pull/{number}");
+                    let ref_spec = format!("pull/{number}/head");
+                    if let Ok(ssh_diff) = fetch_pr_via_git_ssh(root, &ref_spec, "github", number, pr_url) {
+                        return Ok((ssh_diff, Vec::new()));
+                    }
+                    return Err(api_err);
+                }
+            };
 
             let title = pr_json["title"].as_str().unwrap_or("PR").to_string();
             let url = pr_json["html_url"].as_str().unwrap_or("").to_string();
@@ -638,15 +713,24 @@ pub async fn fetch_pr_review(
             if let Some(t) = &tok {
                 req = req.header("PRIVATE-TOKEN", t);
             }
-            let mr_json: serde_json::Value = req
-                .send()
-                .await
-                .map_err(|e| format!("GitLab request failed: {e}"))?
-                .error_for_status()
-                .map_err(|e| format!("GitLab API error: {e}"))?
-                .json()
-                .await
-                .map_err(|e| format!("Invalid GitLab JSON: {e}"))?;
+            let mr_resp = match req.send().await {
+                Ok(r) => r.error_for_status().map_err(|e| format!("GitLab API error: {e}")),
+                Err(e) => Err(format!("GitLab request failed: {e}")),
+            };
+            let mr_json: serde_json::Value = match mr_resp {
+                Ok(r) => r
+                    .json()
+                    .await
+                    .map_err(|e| format!("Invalid GitLab JSON: {e}"))?,
+                Err(api_err) => {
+                    let mr_url = format!("https://{host}/{proj}/-/merge_requests/{iid}");
+                    let ref_spec = format!("merge-requests/{iid}/head");
+                    if let Ok(ssh_diff) = fetch_pr_via_git_ssh(root, &ref_spec, "gitlab", iid, mr_url) {
+                        return Ok((ssh_diff, Vec::new()));
+                    }
+                    return Err(api_err);
+                }
+            };
 
             let title = mr_json["title"].as_str().unwrap_or("MR").to_string();
             let url = mr_json["web_url"].as_str().unwrap_or("").to_string();
@@ -725,12 +809,11 @@ pub async fn post_pr_comment(
     line: usize,
     body: &str,
 ) -> Result<(), String> {
-    let tok = token.trim();
-    if tok.is_empty() {
-        return Err("A GitHub or GitLab token is required to post comments.".to_string());
-    }
     let root = Path::new(project_path);
     let target = resolve_pr_target(root, pr_url_or_number)?;
+    let tok = resolve_token(&target, Some(token.to_string())).ok_or_else(|| {
+        "No token found. Authenticate with `gh auth login` / `glab auth login` or enter a token.".to_string()
+    })?;
     let client = reqwest::Client::builder()
         .user_agent("vcode-reviewer/0.1")
         .build()
