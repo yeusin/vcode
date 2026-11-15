@@ -2,22 +2,29 @@ import React from "react";
 import {
   FolderOpen,
   GitBranch,
+  History,
   Maximize2,
   PanelLeft,
   Search,
-  Sparkles,
   Workflow,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import type { LodLevel } from "./Canvas";
 
+export interface RecentProject {
+  name: string;
+  path: string;
+}
+
 interface ToolbarProps {
   projectName: string;
+  currentRootPath: string;
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
   onOpenProject: () => void;
-  onLoadSample: () => void;
+  recentProjects: RecentProject[];
+  onOpenRecent: (path: string) => void;
   loading: boolean;
   searchQuery: string;
   onSearchChange: (q: string) => void;
@@ -40,10 +47,12 @@ const LOD_LABELS: Record<LodLevel, string> = {
 
 export const Toolbar: React.FC<ToolbarProps> = ({
   projectName,
+  currentRootPath,
   sidebarOpen,
   onToggleSidebar,
   onOpenProject,
-  onLoadSample,
+  recentProjects,
+  onOpenRecent,
   loading,
   searchQuery,
   onSearchChange,
@@ -69,7 +78,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </button>
         <div className="brand">
           <span className="brand-logo">VCode</span>
-          <span className="brand-project" title={projectName}>
+          <span className="brand-project" title={currentRootPath}>
             {projectName}
           </span>
         </div>
@@ -77,10 +86,26 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           <FolderOpen size={15} />
           <span>{loading ? "Analyzing..." : "Open Project"}</span>
         </button>
-        <button className="btn btn-ghost" onClick={onLoadSample} disabled={loading} title="Load built-in sample project">
-          <Sparkles size={14} />
-          <span>Sample</span>
-        </button>
+
+        {recentProjects.length > 0 && (
+          <div className="recent-chips" title="Recent Projects">
+            <History size={13} className="recent-icon" />
+            {recentProjects.map((proj) => {
+              const isCurrent = proj.path === currentRootPath;
+              return (
+                <button
+                  key={proj.path}
+                  className={`recent-chip ${isCurrent ? "is-active" : ""}`}
+                  onClick={() => onOpenRecent(proj.path)}
+                  disabled={loading}
+                  title={proj.path}
+                >
+                  {proj.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div className="toolbar-center">

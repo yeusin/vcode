@@ -3,13 +3,32 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Canvas, getLodLevel, type Viewport } from "./components/Canvas";
 import { Sidebar } from "./components/Sidebar";
-import { Toolbar } from "./components/Toolbar";
+import { Toolbar, type RecentProject } from "./components/Toolbar";
 import { SAMPLE_PROJECT } from "./data/sampleProject";
 import { computeLayout } from "./layout/layoutEngine";
 import type { FunctionNode, GroupNode, ProjectGraph, Rect } from "./types/graph";
 
+const RECENT_STORAGE_KEY = "vcode.recentProjects";
+const MAX_RECENT_PROJECTS = 5;
+
+function loadRecentProjects(): RecentProject[] {
+  try {
+    const raw = localStorage.getItem(RECENT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is RecentProject =>
+        Boolean(item && typeof item.name === "string" && typeof item.path === "string")
+    );
+  } catch {
+    return [];
+  }
+}
+
 export const App: React.FC = () => {
   const [graph, setGraph] = useState<ProjectGraph>(SAMPLE_PROJECT);
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -48,6 +67,42 @@ export const App: React.FC = () => {
     fitAll();
   }, [fitAll]);
 
+  const recordRecentProject = useCallback((name: string, path: string) => {
+    setRecentProjects((prev) => {
+      const next = [{ name, path }, ...prev.filter((p) => p.path !== path)].slice(
+        0,
+        MAX_RECENT_PROJECTS
+      );
+      try {
+        localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // ignore storage quota errors
+      }
+      return next;
+    });
+  }, []);
+
+  const openProjectPath = useCallback(
+    async (projectPath: string) => {
+      setErrorMsg(null);
+      setLoading(true);
+      try {
+        const analyzed = await invoke<ProjectGraph>("analyze_project", {
+          projectPath,
+        });
+        setGraph(analyzed);
+        setSelectedId(null);
+        recordRecentProject(analyzed.rootName, analyzed.rootPath);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setErrorMsg(msg);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [recordRecentProject]
+  );
+
   const handleOpenProject = async () => {
     setErrorMsg(null);
     try {
@@ -57,25 +112,11 @@ export const App: React.FC = () => {
         title: "Select Project Folder",
       });
       if (!selected || Array.isArray(selected)) return;
-
-      setLoading(true);
-      const analyzed = await invoke<ProjectGraph>("analyze_project", {
-        projectPath: selected,
-      });
-      setGraph(analyzed);
-      setSelectedId(null);
+      await openProjectPath(selected);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorMsg(msg);
-    } finally {
-      setLoading(false);
     }
-  };
-
-  const handleLoadSample = () => {
-    setErrorMsg(null);
-    setGraph(SAMPLE_PROJECT);
-    setSelectedId(null);
   };
 
   const handleSelectGroup = (group: GroupNode) => {
@@ -111,10 +152,12 @@ export const App: React.FC = () => {
     <div className="app-shell">
       <Toolbar
         projectName={graph.rootName}
+        currentRootPath={graph.rootPath}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onOpenProject={handleOpenProject}
-        onLoadSample={handleLoadSample}
+        recentProjects={recentProjects}
+        onOpenRecent={openProjectPath}
         loading={loading}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
