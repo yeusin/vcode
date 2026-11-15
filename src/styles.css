@@ -1049,3 +1049,48 @@ body,
   color: var(--text-secondary);
   font-size: 13px;
 }
+
+
+.canvas-hover-badge {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 500;
+  pointer-events: none;
+  z-index: 15;
+}
+
+.fn-code-pre {
+  margin: 0;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  overflow: auto;
+  height: 100%;
+  background: rgba(15, 23, 42, 0.96);
+  border-radius: 0 0 8px 8px;
+  user-select: text;
+}
+
+.fn-code-line {
+  display: flex;
+  gap: 10px;
+  white-space: pre;
+}
+
+.fn-line-no {
+  color: #475569;
+  user-select: none;
+  min-width: 28px;
+  text-align: right;
+}
+
+.fn-line-src {
+  color: #e2e8f0;
+}

@@ -4,12 +4,13 @@
   "version": "0.1.0",
   "identifier": "com.vcode.visualizer",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "trunk serve --port 1420",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "trunk build --release",
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "VCode — Code Visualizer",

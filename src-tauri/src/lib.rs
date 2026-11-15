@@ -279,6 +279,23 @@ fn open_in_editor(
         .map_err(|e| format!("Failed to launch '{program}': {e}"))
 }
 
+#[tauri::command]
+async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .set_title("Select Project Folder")
+            .blocking_pick_folder();
+        Ok(picked
+            .and_then(|p| p.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| format!("Failed to open folder dialog: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -291,7 +308,8 @@ pub fn run() {
             unwatch_project,
             load_project_settings,
             save_project_settings,
-            open_in_editor
+            open_in_editor,
+            pick_project_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
