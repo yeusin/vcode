@@ -611,6 +611,47 @@ fn render_canvas(
         }
     }
 
+    // 6. Screen-space Caller / Callee Count Badge on Hovered Node
+    if let Some(hid) = hovered_id {
+        if let Some(rect) = layout.node_rects.get(hid) {
+            let mut callers = HashSet::new();
+            let mut callees = HashSet::new();
+            for e in &layout.edges {
+                if e.edge.target_id == hid {
+                    callers.insert(e.edge.source_id.as_str());
+                }
+                if e.edge.source_id == hid {
+                    callees.insert(e.edge.target_id.as_str());
+                }
+            }
+            let is_fn = layout.functions.iter().any(|f| f.node.id == hid);
+            if is_fn || !callers.is_empty() || !callees.is_empty() {
+                let c_in = callers.len();
+                let c_out = callees.len();
+                let in_lbl = if c_in == 1 { "caller" } else { "callers" };
+                let out_lbl = if c_out == 1 { "callee" } else { "callees" };
+                let badge = format!("{c_in} {in_lbl} · {c_out} {out_lbl}");
+
+                ctx.set_font("600 11px 'Inter', system-ui, sans-serif");
+                let tw = ctx.measure_text(&badge).map(|m| m.width()).unwrap_or(90.0);
+                let pw = tw + 18.0;
+                let ph = 22.0;
+                let bx = (rect.x + rect.width) * scale + viewport.x - pw;
+                let by = (rect.y * scale + viewport.y - ph - 6.0).max(8.0);
+
+                round_rect(&ctx, bx, by, pw, ph, 999.0);
+                ctx.set_fill_style_str("rgba(15, 23, 42, 0.96)");
+                ctx.fill();
+                ctx.set_line_width(1.2);
+                ctx.set_stroke_style_str("#fbbf24");
+                ctx.stroke();
+
+                ctx.set_fill_style_str("#fef3c7");
+                let _ = ctx.fill_text(&badge, bx + 9.0, by + 15.0);
+            }
+        }
+    }
+
     ctx.restore();
 }
 
@@ -1055,7 +1096,8 @@ pub fn CanvasView(
                 callees.insert(e.edge.target_id.clone());
             }
         }
-        if callers.is_empty() && callees.is_empty() {
+        let is_fn = l.functions.iter().any(|f| f.node.id == hid);
+        if !is_fn && callers.is_empty() && callees.is_empty() {
             return None;
         }
         let c_in = callers.len();
