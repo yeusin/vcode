@@ -1,9 +1,9 @@
+use ignore::WalkBuilder;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lang {
@@ -225,25 +225,31 @@ pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
         .to_string();
 
     let mut source_files: Vec<(PathBuf, Lang)> = Vec::new();
-    for entry in WalkDir::new(&root)
-        .sort_by_file_name()
-        .into_iter()
+    let mut walker = WalkBuilder::new(&root);
+    walker
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .filter_entry(|e| {
             if e.depth() == 0 {
                 return true;
             }
-            if e.file_type().is_dir() {
+            if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 let name = e.file_name().to_str().unwrap_or("");
                 return !should_skip_dir(name);
             }
             true
-        })
-    {
+        });
+
+    for entry in walker.build() {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if entry.file_type().is_file() {
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             if let Some(lang) = Lang::from_path(entry.path()) {
                 source_files.push((entry.path().to_path_buf(), lang));
             }
@@ -1421,6 +1427,28 @@ mod tests {
         assert!(graph.edges.iter().any(|e| e.kind == "call" && e.source_id == "fn:py/app.py::Engine.run" && e.target_id == "fn:py/app.py::Engine.step"));
         assert!(graph.edges.iter().any(|e| e.kind == "call" && e.source_id == "fn:rust_mod/lib.rs::Worker.work" && e.target_id == "fn:rust_mod/lib.rs::Worker.done"));
         assert!(graph.edges.iter().any(|e| e.kind == "call" && e.source_id == "fn:go_mod/srv.go::Server.Handle" && e.target_id == "fn:go_mod/srv.go::Server.reply"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn excludes_files_and_dirs_matching_gitignore() {
+        let tmp = std::env::temp_dir().join(format!("vcode_gitignore_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::create_dir_all(tmp.join("ignored_dir")).unwrap();
+
+        fs::write(tmp.join(".gitignore"), "ignored_dir/\n*.gen.py\n").unwrap();
+        fs::write(tmp.join("src/app.py"), "def main():\n    pass\n").unwrap();
+        fs::write(tmp.join("src/schema.gen.py"), "def gen():\n    pass\n").unwrap();
+        fs::write(tmp.join("ignored_dir/secret.py"), "def hidden():\n    pass\n").unwrap();
+
+        let graph = analyze_project(&tmp).unwrap();
+        assert_eq!(graph.stats.total_files, 1);
+        assert_eq!(graph.stats.total_functions, 1);
+        assert!(graph.groups.iter().any(|g| g.id == "file:src/app.py"));
+        assert!(!graph.groups.iter().any(|g| g.id == "file:src/schema.gen.py"));
+        assert!(!graph.groups.iter().any(|g| g.id == "dir:ignored_dir"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
