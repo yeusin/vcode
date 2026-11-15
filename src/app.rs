@@ -54,7 +54,7 @@ fn save_editor_command(cmd: &str) {
 struct TreeEntry {
     id: String,
     label: String,
-    kind_tag: &'static str,
+    kind_class: &'static str,
     is_group: bool,
     depth: usize,
     children: Vec<TreeEntry>,
@@ -98,7 +98,7 @@ fn build_tree(
                     children.push(TreeEntry {
                         id: f.id.clone(),
                         label: f.name.clone(),
-                        kind_tag: "fn",
+                        kind_class: "fn",
                         is_group: false,
                         depth: depth + 1,
                         children: Vec::new(),
@@ -114,15 +114,15 @@ fn build_tree(
             return None;
         }
 
-        let kind_tag = match g.kind {
-            GroupKind::Directory => "dir",
-            GroupKind::Module => "file",
+        let kind_class = match g.kind {
+            GroupKind::Directory => "directory",
+            GroupKind::Module => "module",
             GroupKind::Class => "class",
         };
         Some(TreeEntry {
             id: g.id.clone(),
             label: g.name.clone(),
-            kind_tag,
+            kind_class,
             is_group: true,
             depth,
             children,
@@ -522,27 +522,60 @@ pub fn App() -> impl IntoView {
             <div class="workspace">
                 <Show when=move || sidebar_open.get()>
                     <aside class="sidebar">
-                        <div class="sidebar-header">
-                            <span class="sidebar-title">"Project Structure"</span>
-                            <span class="sidebar-stats">
-                                {move || {
-                                    let s = graph.get().stats;
-                                    format!("{} files · {} cls · {} fns", s.total_files, s.total_classes, s.total_functions)
-                                }}
-                            </span>
+                        <div class="sidebar-stats">
+                            <div class="stat-chip">
+                                <span class="stat-val">{move || graph.get().stats.total_files}</span>
+                                <span class="stat-lbl">"Files"</span>
+                            </div>
+                            <div class="stat-chip">
+                                <span class="stat-val">{move || graph.get().stats.total_classes}</span>
+                                <span class="stat-lbl">"Classes"</span>
+                            </div>
+                            <div class="stat-chip">
+                                <span class="stat-val">{move || graph.get().stats.total_functions}</span>
+                                <span class="stat-lbl">"Functions"</span>
+                            </div>
                         </div>
+
+                        <div class="sidebar-section-title">"Project Structure"</div>
+
                         <div class="sidebar-search">
-                            <input
-                                type="text"
-                                placeholder="Filter files, classes, functions..."
-                                prop:value=move || search_query.get()
-                                on:input=move |ev| search_query.set(event_target_value(&ev))
-                            />
+                            <div class="search-box">
+                                <svg class="search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="11" cy="11" r="8" />
+                                    <path d="m21 21-4.3-4.3" />
+                                </svg>
+                                <input
+                                    type="text"
+                                    placeholder="Filter files, classes, functions..."
+                                    prop:value=move || search_query.get()
+                                    on:input=move |ev| search_query.set(event_target_value(&ev))
+                                />
+                                <Show when=move || !search_query.get().is_empty()>
+                                    <button
+                                        class="search-clear"
+                                        title="Clear filter"
+                                        on:click=move |_| search_query.set(String::new())
+                                    >
+                                        "×"
+                                    </button>
+                                </Show>
+                            </div>
                         </div>
-                        <div class="tree-list">
+
+                        <div class="sidebar-tree">
                             {move || {
-                                flat_tree.get().into_iter().map(|entry| {
+                                let entries = flat_tree.get();
+                                if entries.is_empty() {
+                                    return view! {
+                                        <div class="sidebar-empty">"No matching items"</div>
+                                    }.into_any();
+                                }
+                                entries.into_iter().map(|entry| {
                                     let id = entry.id.clone();
+                                    let id_row_sel = entry.id.clone();
+                                    let id_row_imp = entry.id.clone();
+                                    let id_row_call = entry.id.clone();
                                     let id_sel = entry.id.clone();
                                     let id_dbl = entry.id.clone();
                                     let id_col = entry.id.clone();
@@ -552,18 +585,24 @@ pub fn App() -> impl IntoView {
                                     let id_call_cls = entry.id.clone();
                                     let has_children = !entry.children.is_empty();
                                     let is_group = entry.is_group;
-                                    let indent = format!("padding-left: {}px;", 10 + entry.depth * 14);
+                                    let kind_class = entry.kind_class;
+                                    let indent = format!("padding-left: {}px;", 6 + entry.depth * 14);
                                     view! {
                                         <div
-                                            class=move || if selected_id.get().as_deref() == Some(id.as_str()) {
-                                                "tree-row is-selected"
-                                            } else {
-                                                "tree-row"
+                                            class=move || {
+                                                let sel = selected_id.get().as_deref() == Some(id_row_sel.as_str());
+                                                let hidden = is_group
+                                                    && (hidden_import_groups.get().contains(&id_row_imp)
+                                                        || hidden_call_groups.get().contains(&id_row_call));
+                                                match (sel, hidden) {
+                                                    (true, true) => "tree-row is-selected has-hidden-edges",
+                                                    (true, false) => "tree-row is-selected",
+                                                    (false, true) => "tree-row has-hidden-edges",
+                                                    (false, false) => "tree-row",
+                                                }
                                             }
                                             style=indent
-                                            attr:data-node-id=entry.id.clone()
-                                            on:click=move |_| selected_id.set(Some(id_sel.clone()))
-                                            on:dblclick=move |_| focus_node.run(id_dbl.clone())
+                                            attr:data-node-id=id
                                         >
                                             {if has_children {
                                                 let id_c = id_col.clone();
@@ -579,22 +618,67 @@ pub fn App() -> impl IntoView {
                                                             });
                                                         }
                                                     >
-                                                        {move || if collapsed_ids.get().contains(&id_col) { "▸" } else { "▾" }}
+                                                        {move || if collapsed_ids.get().contains(&id_col) {
+                                                            view! {
+                                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="m9 18 6-6-6-6" />
+                                                                </svg>
+                                                            }.into_any()
+                                                        } else {
+                                                            view! {
+                                                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="m6 9 6 6 6-6" />
+                                                                </svg>
+                                                            }.into_any()
+                                                        }}
                                                     </button>
                                                 }.into_any()
                                             } else {
                                                 view! { <span class="tree-caret-spacer" /> }.into_any()
                                             }}
-                                            <span class=format!("tree-tag tree-tag-{}", entry.kind_tag)>{entry.kind_tag}</span>
-                                            <span class="tree-label">{entry.label}</span>
+                                            <button
+                                                class=format!("tree-item tree-{kind_class}")
+                                                on:click=move |_| selected_id.set(Some(id_sel.clone()))
+                                                on:dblclick=move |_| focus_node.run(id_dbl.clone())
+                                            >
+                                                <span class="tree-icon">
+                                                    {match kind_class {
+                                                        "directory" => view! {
+                                                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+                                                            </svg>
+                                                        }.into_any(),
+                                                        "module" => view! {
+                                                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+                                                                <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+                                                            </svg>
+                                                        }.into_any(),
+                                                        "class" => view! {
+                                                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" />
+                                                                <path d="m3.3 7 8.7 5 8.7-5" />
+                                                                <path d="M12 22V12" />
+                                                            </svg>
+                                                        }.into_any(),
+                                                        _ => view! {
+                                                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <polyline points="16 18 22 12 16 6" />
+                                                                <polyline points="8 6 2 12 8 18" />
+                                                            </svg>
+                                                        }.into_any(),
+                                                    }}
+                                                </span>
+                                                <span class="tree-label">{entry.label}</span>
+                                            </button>
                                             {if is_group {
                                                 view! {
-                                                    <span class="tree-actions">
+                                                    <span class="tree-edge-toggles">
                                                         <button
                                                             class=move || if hidden_import_groups.get().contains(&id_imp_cls) {
                                                                 "tree-edge-btn is-hidden"
                                                             } else {
-                                                                "tree-edge-btn is-import"
+                                                                "tree-edge-btn"
                                                             }
                                                             title="Toggle import graph"
                                                             on:click=move |ev| {
@@ -602,13 +686,18 @@ pub fn App() -> impl IntoView {
                                                                 toggle_group_import.run(id_imp.clone());
                                                             }
                                                         >
-                                                            "I"
+                                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <line x1="6" x2="6" y1="3" y2="15" />
+                                                                <circle cx="18" cy="6" r="3" />
+                                                                <circle cx="6" cy="18" r="3" />
+                                                                <path d="M18 9a9 9 0 0 1-9 9" />
+                                                            </svg>
                                                         </button>
                                                         <button
                                                             class=move || if hidden_call_groups.get().contains(&id_call_cls) {
                                                                 "tree-edge-btn is-hidden"
                                                             } else {
-                                                                "tree-edge-btn is-call"
+                                                                "tree-edge-btn"
                                                             }
                                                             title="Toggle call graph"
                                                             on:click=move |ev| {
@@ -616,7 +705,11 @@ pub fn App() -> impl IntoView {
                                                                 toggle_group_call.run(id_call.clone());
                                                             }
                                                         >
-                                                            "C"
+                                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                <path d="M18 6H5a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h13l4-3.5L18 6Z" />
+                                                                <path d="M12 13v8" />
+                                                                <path d="M12 3v3" />
+                                                            </svg>
                                                         </button>
                                                     </span>
                                                 }.into_any()
@@ -625,7 +718,7 @@ pub fn App() -> impl IntoView {
                                             }}
                                         </div>
                                     }
-                                }).collect_view()
+                                }).collect_view().into_any()
                             }}
                         </div>
 
@@ -635,11 +728,14 @@ pub fn App() -> impl IntoView {
                                 view! { <span /> }.into_any()
                             } else {
                                 view! {
-                                    <div class="parse-errors">
-                                        <div class="parse-errors-title">{format!("Parse Errors ({})", errs.len())}</div>
+                                    <div class="sidebar-errors">
+                                        <div class="errors-header">
+                                            <span>{format!("Parse Errors ({})", errs.len())}</span>
+                                        </div>
                                         {errs.into_iter().map(|pe| view! {
-                                            <div class="parse-error-item">
-                                                <strong>{pe.file_path}</strong>": "{pe.error}
+                                            <div class="error-item">
+                                                <div class="error-file">{pe.file_path}</div>
+                                                <div class="error-msg">{pe.error}</div>
                                             </div>
                                         }).collect_view()}
                                     </div>
