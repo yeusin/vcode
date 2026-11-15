@@ -611,20 +611,20 @@ fn render_canvas(
         }
     }
 
-    // 6. Screen-space Caller / Callee Count Badge on Hovered Node
-    if let Some(hid) = hovered_id {
-        if let Some(rect) = layout.node_rects.get(hid) {
+    // 6. Screen-space Caller / Callee Count Badge on Hovered or Selected Node
+    if let Some(target_id) = hovered_id.or(selected_id) {
+        if let Some(rect) = layout.node_rects.get(target_id) {
             let mut callers = HashSet::new();
             let mut callees = HashSet::new();
             for e in &layout.edges {
-                if e.edge.target_id == hid {
+                if e.edge.target_id == target_id {
                     callers.insert(e.edge.source_id.as_str());
                 }
-                if e.edge.source_id == hid {
+                if e.edge.source_id == target_id {
                     callees.insert(e.edge.target_id.as_str());
                 }
             }
-            let is_fn = layout.functions.iter().any(|f| f.node.id == hid);
+            let is_fn = layout.functions.iter().any(|f| f.node.id == target_id);
             if is_fn || !callers.is_empty() || !callees.is_empty() {
                 let c_in = callers.len();
                 let c_out = callees.len();
@@ -1082,9 +1082,9 @@ pub fn CanvasView(
         }
     };
 
-    // Hover caller / callee badge
+    // Hover / Selected caller / callee badge
     let hover_badge = Memo::new(move |_| {
-        let hid = hovered_id.get()?;
+        let hid = hovered_id.get().or_else(|| selected_id.get())?;
         let l = layout.get();
         let mut callers = HashSet::new();
         let mut callees = HashSet::new();
