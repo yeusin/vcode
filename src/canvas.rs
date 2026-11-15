@@ -14,6 +14,16 @@ use crate::types::{
     PositionedFunction, PositionedGroup, Rect, Viewport,
 };
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ReviewOverlay {
+    pub active: bool,
+    pub changed_only: bool,
+    pub changed_ids: HashSet<String>,
+    pub blast_radius_ids: HashSet<String>,
+    pub diff_stats: HashMap<String, (usize, usize)>,
+    pub comment_counts: HashMap<String, usize>,
+}
+
 #[derive(Clone)]
 enum ActionKind {
     ToggleImport(String),
@@ -179,6 +189,7 @@ fn render_canvas(
     fn_parent: &HashMap<String, String>,
     group_meta: &HashMap<String, String>,
     fn_counts: &HashMap<String, (usize, usize)>,
+    review: &ReviewOverlay,
     action_hits: &mut Vec<ActionHit>,
 ) {
     action_hits.clear();
@@ -243,8 +254,11 @@ fn render_canvas(
         }
         let is_selected = selected_id == Some(g.node.id.as_str());
         let is_hovered = hovered_id == Some(g.node.id.as_str());
+        let is_changed = review.active && review.changed_ids.contains(&g.node.id);
+        let is_blast = review.active && review.blast_radius_ids.contains(&g.node.id);
+        let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
 
-        let (fill, stroke, radius) = match g.node.kind {
+        let (fill, mut stroke, radius) = match g.node.kind {
             GroupKind::Directory => (
                 "rgba(15, 23, 42, 0.55)",
                 if is_selected {
@@ -279,17 +293,31 @@ fn render_canvas(
                 9.0,
             ),
         };
+        if !is_selected && !is_hovered {
+            if is_changed {
+                stroke = "#f59e0b";
+            } else if is_blast {
+                stroke = "#a855f7";
+            }
+        }
 
+        ctx.save();
+        if dimmed {
+            ctx.set_global_alpha(0.35);
+        }
         round_rect(&ctx, g.rect.x, g.rect.y, g.rect.width, g.rect.height, radius);
         ctx.set_fill_style_str(fill);
         ctx.fill();
-        ctx.set_line_width(if is_selected || is_hovered {
+        ctx.set_line_width(if is_selected || is_hovered || is_changed {
             2.2 / scale.sqrt()
+        } else if is_blast {
+            1.7 / scale.sqrt()
         } else {
             1.2 / scale.sqrt()
         });
         ctx.set_stroke_style_str(stroke);
         ctx.stroke();
+        ctx.restore();
     }
 
     // 2. Draw visible edges
@@ -375,7 +403,14 @@ fn render_canvas(
         }
         let is_selected = selected_id == Some(fn_item.node.id.as_str());
         let is_hovered = hovered_id == Some(fn_item.node.id.as_str());
+        let is_changed = review.active && review.changed_ids.contains(&fn_item.node.id);
+        let is_blast = review.active && review.blast_radius_ids.contains(&fn_item.node.id);
+        let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
 
+        ctx.save();
+        if dimmed {
+            ctx.set_global_alpha(0.28);
+        }
         round_rect(
             &ctx,
             fn_item.rect.x,
@@ -392,15 +427,19 @@ fn render_canvas(
             "#0f172a"
         });
         ctx.fill();
-        ctx.set_line_width(if is_selected {
+        ctx.set_line_width(if is_selected || is_changed {
             2.4
-        } else if is_hovered {
+        } else if is_hovered || is_blast {
             1.8
         } else {
             1.1
         });
         ctx.set_stroke_style_str(if is_selected {
             "#38bdf8"
+        } else if is_changed {
+            "#f59e0b"
+        } else if is_blast {
+            "#a855f7"
         } else if is_hovered {
             "#60a5fa"
         } else {
@@ -477,6 +516,7 @@ fn render_canvas(
                 }
             }
         }
+        ctx.restore();
     }
 
     // Restore world transform -> back to screen space for crisp title pills & action icons
@@ -879,6 +919,7 @@ pub fn CanvasView(
     selected_id: RwSignal<Option<String>>,
     hovered_id: RwSignal<Option<String>>,
     edge_vis: Memo<EdgeVisibility>,
+    review_overlay: Memo<ReviewOverlay>,
     on_toggle_group_import: Callback<String>,
     on_toggle_group_call: Callback<String>,
     on_open_in_editor: Callback<String>,
@@ -1061,6 +1102,7 @@ pub fn CanvasView(
         let fp = fn_parent.get();
         let gm = group_meta.get();
         let fc = fn_counts.get();
+        let rev = review_overlay.get();
 
         let mut hits = hits_for_render.borrow_mut();
         render_canvas(
@@ -1074,6 +1116,7 @@ pub fn CanvasView(
             &fp,
             &gm,
             &fc,
+            &rev,
             &mut hits,
         );
     });

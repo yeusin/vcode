@@ -175,3 +175,158 @@ pub fn local_storage_set(key: &str, value: &str) {
         let _ = storage.set_item(key, value);
     }
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitDiffArgs<'a> {
+    project_path: &'a str,
+    base_ref: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCommentArgs<'a> {
+    project_path: &'a str,
+    file_path: &'a str,
+    line: usize,
+    node_id: Option<&'a str>,
+    author: &'a str,
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentIdArgs<'a> {
+    project_path: &'a str,
+    comment_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchPrArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    token: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostPrCommentArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    token: &'a str,
+    head_sha: &'a str,
+    file_path: &'a str,
+    line: usize,
+    body: &'a str,
+}
+
+pub async fn get_git_diff(
+    project_path: &str,
+    base_ref: Option<&str>,
+) -> Result<crate::types::GitDiffSummary, String> {
+    invoke(
+        "get_git_diff",
+        &GitDiffArgs {
+            project_path,
+            base_ref,
+        },
+    )
+    .await
+}
+
+pub async fn load_review_comments(
+    project_path: &str,
+) -> Result<Vec<crate::types::ReviewComment>, String> {
+    invoke("load_review_comments", &ProjectPathArgs { project_path }).await
+}
+
+pub async fn add_review_comment(
+    project_path: &str,
+    file_path: &str,
+    line: usize,
+    node_id: Option<&str>,
+    author: &str,
+    body: &str,
+) -> Result<Vec<crate::types::ReviewComment>, String> {
+    invoke(
+        "add_review_comment",
+        &AddCommentArgs {
+            project_path,
+            file_path,
+            line,
+            node_id,
+            author,
+            body,
+        },
+    )
+    .await
+}
+
+pub async fn toggle_resolve_comment(
+    project_path: &str,
+    comment_id: &str,
+) -> Result<Vec<crate::types::ReviewComment>, String> {
+    invoke(
+        "toggle_resolve_comment",
+        &CommentIdArgs {
+            project_path,
+            comment_id,
+        },
+    )
+    .await
+}
+
+pub async fn delete_review_comment(
+    project_path: &str,
+    comment_id: &str,
+) -> Result<Vec<crate::types::ReviewComment>, String> {
+    invoke(
+        "delete_review_comment",
+        &CommentIdArgs {
+            project_path,
+            comment_id,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_pr_review(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: Option<&str>,
+) -> Result<(crate::types::GitDiffSummary, Vec<crate::types::ReviewComment>), String> {
+    invoke(
+        "fetch_pr_review",
+        &FetchPrArgs {
+            project_path,
+            pr_url_or_number,
+            token,
+        },
+    )
+    .await
+}
+
+pub async fn post_pr_comment(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: &str,
+    head_sha: &str,
+    file_path: &str,
+    line: usize,
+    body: &str,
+) -> Result<(), String> {
+    invoke(
+        "post_pr_comment",
+        &PostPrCommentArgs {
+            project_path,
+            pr_url_or_number,
+            token,
+            head_sha,
+            file_path,
+            line,
+            body,
+        },
+    )
+    .await
+}

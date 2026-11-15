@@ -1,4 +1,5 @@
 mod analyzer;
+mod review;
 
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -296,6 +297,90 @@ async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>, St
     .map_err(|e| format!("Failed to open folder dialog: {e}"))?
 }
 
+#[tauri::command]
+fn get_git_diff(
+    project_path: String,
+    base_ref: Option<String>,
+) -> Result<review::GitDiffSummary, String> {
+    review::get_git_diff(&project_path, base_ref)
+}
+
+fn project_review_dir(project_path: &str) -> Result<PathBuf, String> {
+    let settings_file = project_settings_file(project_path)?;
+    settings_file
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Invalid settings directory".to_string())
+}
+
+#[tauri::command]
+fn load_review_comments(project_path: String) -> Result<Vec<review::ReviewComment>, String> {
+    let dir = project_review_dir(&project_path)?;
+    review::load_review_comments_in_dir(&dir)
+}
+
+#[tauri::command]
+fn add_review_comment(
+    project_path: String,
+    file_path: String,
+    line: usize,
+    node_id: Option<String>,
+    author: String,
+    body: String,
+) -> Result<Vec<review::ReviewComment>, String> {
+    let dir = project_review_dir(&project_path)?;
+    review::add_review_comment_in_dir(&dir, file_path, line, node_id, author, body, None)
+}
+
+#[tauri::command]
+fn toggle_resolve_comment(
+    project_path: String,
+    comment_id: String,
+) -> Result<Vec<review::ReviewComment>, String> {
+    let dir = project_review_dir(&project_path)?;
+    review::toggle_resolve_comment_in_dir(&dir, &comment_id)
+}
+
+#[tauri::command]
+fn delete_review_comment(
+    project_path: String,
+    comment_id: String,
+) -> Result<Vec<review::ReviewComment>, String> {
+    let dir = project_review_dir(&project_path)?;
+    review::delete_review_comment_in_dir(&dir, &comment_id)
+}
+
+#[tauri::command]
+async fn fetch_pr_review(
+    project_path: String,
+    pr_url_or_number: String,
+    token: Option<String>,
+) -> Result<(review::GitDiffSummary, Vec<review::ReviewComment>), String> {
+    review::fetch_pr_review(&project_path, &pr_url_or_number, token).await
+}
+
+#[tauri::command]
+async fn post_pr_comment(
+    project_path: String,
+    pr_url_or_number: String,
+    token: String,
+    head_sha: String,
+    file_path: String,
+    line: usize,
+    body: String,
+) -> Result<(), String> {
+    review::post_pr_comment(
+        &project_path,
+        &pr_url_or_number,
+        &token,
+        &head_sha,
+        &file_path,
+        line,
+        &body,
+    )
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -309,7 +394,14 @@ pub fn run() {
             load_project_settings,
             save_project_settings,
             open_in_editor,
-            pick_project_folder
+            pick_project_folder,
+            get_git_diff,
+            load_review_comments,
+            add_review_comment,
+            toggle_resolve_comment,
+            delete_review_comment,
+            fetch_pr_review,
+            post_pr_comment
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

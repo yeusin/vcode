@@ -3,13 +3,13 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::canvas::CanvasView;
+use crate::canvas::{CanvasView, ReviewOverlay};
 use crate::layout::compute_layout;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
-    EdgeVisibility, FunctionNode, GroupKind, GroupNode, LodLevel, ProjectGraph, ProjectSettings,
-    RecentProject, Viewport,
+    DiffStatus, EdgeVisibility, FunctionNode, GitDiffSummary, GroupKind, GroupNode, LodLevel,
+    ProjectGraph, ProjectSettings, RecentProject, ReviewComment, Viewport,
 };
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
@@ -184,6 +184,21 @@ pub fn App() -> impl IntoView {
     let settings_input = RwSignal::new(load_editor_command());
     let pending_editor_file = RwSignal::new(Option::<String>::None);
 
+    // Code Review & PR state
+    let review_open = RwSignal::new(false);
+    let review_changed_only = RwSignal::new(false);
+    let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
+    let review_comments = RwSignal::new(Vec::<ReviewComment>::new());
+    let git_base_ref = RwSignal::new("HEAD".to_string());
+    let pr_input = RwSignal::new(String::new());
+    let git_token = RwSignal::new(
+        tauri_bridge::local_storage_get("vcode.gitToken").unwrap_or_default(),
+    );
+    let review_busy = RwSignal::new(false);
+    let review_error = RwSignal::new(Option::<String>::None);
+    let comment_line_input = RwSignal::new(1usize);
+    let comment_body_input = RwSignal::new(String::new());
+
     let layout = Memo::new(move |_| compute_layout(&graph.get()));
     let edge_vis = Memo::new(move |_| EdgeVisibility {
         show_imports: show_imports.get(),
@@ -191,6 +206,112 @@ pub fn App() -> impl IntoView {
         hidden_import_group_ids: hidden_import_groups.get(),
         hidden_call_group_ids: hidden_call_groups.get(),
     });
+
+    let review_overlay = Memo::new(move |_| {
+        let active = review_open.get();
+        if !active {
+            return ReviewOverlay::default();
+        }
+        let g = graph.get();
+        let diff_opt = diff_summary.get();
+        let comments = review_comments.get();
+
+        let mut changed_ids = HashSet::new();
+        let mut diff_stats: HashMap<String, (usize, usize)> = HashMap::new();
+
+        if let Some(diff) = &diff_opt {
+            for fd in &diff.files {
+                for grp in &g.groups {
+                    if grp.kind == GroupKind::Module {
+                        if let Some(fp) = &grp.file_path {
+                            if fp == &fd.abs_path
+                                || fp.ends_with(&format!("/{}", fd.file_path))
+                                || fp == &fd.file_path
+                            {
+                                changed_ids.insert(grp.id.clone());
+                                diff_stats
+                                    .insert(grp.id.clone(), (fd.additions, fd.deletions));
+                            }
+                        }
+                    }
+                }
+                for fnode in &g.functions {
+                    let matches_file = fnode.file_path == fd.abs_path
+                        || fnode.file_path.ends_with(&format!("/{}", fd.file_path))
+                        || fnode.file_path == fd.file_path;
+                    if !matches_file {
+                        continue;
+                    }
+                    let whole_file = matches!(fd.status, DiffStatus::Added | DiffStatus::Deleted);
+                    let hunk_hits = fd.hunks.iter().any(|h| {
+                        h.lines.iter().any(|ln| {
+                            if ln.kind == "context" {
+                                return false;
+                            }
+                            let lno = ln.new_line.or(ln.old_line).unwrap_or(0);
+                            lno >= fnode.start_line && lno <= fnode.end_line
+                        })
+                    });
+                    if whole_file || hunk_hits {
+                        changed_ids.insert(fnode.id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut blast_radius_ids = HashSet::new();
+        for e in &g.edges {
+            if changed_ids.contains(&e.source_id) && !changed_ids.contains(&e.target_id) {
+                blast_radius_ids.insert(e.target_id.clone());
+            }
+            if changed_ids.contains(&e.target_id) && !changed_ids.contains(&e.source_id) {
+                blast_radius_ids.insert(e.source_id.clone());
+            }
+        }
+
+        let mut comment_counts: HashMap<String, usize> = HashMap::new();
+        for c in &comments {
+            if c.status == "open" {
+                if let Some(nid) = &c.node_id {
+                    *comment_counts.entry(nid.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        ReviewOverlay {
+            active: true,
+            changed_only: review_changed_only.get(),
+            changed_ids,
+            blast_radius_ids,
+            diff_stats,
+            comment_counts,
+        }
+    });
+
+    let refresh_local_review = move || {
+        let proj = graph.get_untracked().root_path;
+        if proj.is_empty() || proj.starts_with("sample://") || !tauri_bridge::is_tauri_available() {
+            return;
+        }
+        let base = git_base_ref.get_untracked();
+        review_busy.set(true);
+        review_error.set(None);
+        spawn_local(async move {
+            let base_opt = if base.trim().is_empty() {
+                None
+            } else {
+                Some(base.as_str())
+            };
+            match tauri_bridge::get_git_diff(&proj, base_opt).await {
+                Ok(d) => diff_summary.set(Some(d)),
+                Err(e) => review_error.set(Some(e)),
+            }
+            if let Ok(comments) = tauri_bridge::load_review_comments(&proj).await {
+                review_comments.set(comments);
+            }
+            review_busy.set(false);
+        });
+    };
 
     let persist_project_settings = move || {
         let g = graph.get_untracked();
@@ -465,6 +586,27 @@ pub fn App() -> impl IntoView {
                     >
                         "Calls"
                     </button>
+                    <button
+                        class=move || if review_open.get() { "toggle-pill review-pill is-active" } else { "toggle-pill review-pill" }
+                        on:click=move |_| {
+                            let next = !review_open.get_untracked();
+                            review_open.set(next);
+                            if next {
+                                refresh_local_review();
+                            }
+                        }
+                    >
+                        "Review"
+                    </button>
+                    <Show when=move || review_open.get()>
+                        <button
+                            class=move || if review_changed_only.get() { "toggle-pill impact-pill is-active" } else { "toggle-pill impact-pill" }
+                            title="Dim unchanged code and highlight modified + blast-radius nodes"
+                            on:click=move |_| review_changed_only.update(|v| *v = !*v)
+                        >
+                            "Changed + Impact"
+                        </button>
+                    </Show>
                     <div class="divider" />
                     <span class=move || {
                         let lod = LodLevel::from_scale(viewport.get().scale);
@@ -757,6 +899,7 @@ pub fn App() -> impl IntoView {
                                     selected_id=selected_id
                                     hovered_id=hovered_id
                                     edge_vis=edge_vis
+                                    review_overlay=review_overlay
                                     on_toggle_group_import=toggle_group_import
                                     on_toggle_group_call=toggle_group_call
                                     on_open_in_editor=handle_open_in_editor
@@ -766,6 +909,370 @@ pub fn App() -> impl IntoView {
                         }
                     }}
                 </main>
+
+                <Show when=move || review_open.get()>
+                    <aside class="review-panel">
+                        <div class="review-header">
+                            <span class="review-title">"Code Review"</span>
+                            <button class="btn btn-ghost" on:click=move |_| review_open.set(false)>"✕"</button>
+                        </div>
+
+                        <div class="review-controls">
+                            <div class="review-row">
+                                <input
+                                    class="review-input"
+                                    type="text"
+                                    placeholder="Base ref (HEAD, main...)"
+                                    prop:value=move || git_base_ref.get()
+                                    on:input=move |ev| git_base_ref.set(event_target_value(&ev))
+                                />
+                                <button
+                                    class="btn btn-ghost"
+                                    disabled=move || review_busy.get()
+                                    on:click=move |_| refresh_local_review()
+                                >
+                                    "Git Diff"
+                                </button>
+                            </div>
+                            <div class="review-row">
+                                <input
+                                    class="review-input"
+                                    type="text"
+                                    placeholder="GitHub/GitLab PR URL or #num"
+                                    prop:value=move || pr_input.get()
+                                    on:input=move |ev| pr_input.set(event_target_value(&ev))
+                                />
+                                <button
+                                    class="btn btn-primary"
+                                    disabled=move || review_busy.get()
+                                    on:click=move |_| {
+                                        let proj = graph.get_untracked().root_path;
+                                        let pr_val = pr_input.get_untracked();
+                                        let tok = git_token.get_untracked();
+                                        if proj.is_empty() || pr_val.trim().is_empty() {
+                                            return;
+                                        }
+                                        review_busy.set(true);
+                                        review_error.set(None);
+                                        spawn_local(async move {
+                                            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                            match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
+                                                Ok((pr_diff, remote_comments)) => {
+                                                    diff_summary.set(Some(pr_diff));
+                                                    let mut local = tauri_bridge::load_review_comments(&proj).await.unwrap_or_default();
+                                                    for rc in remote_comments {
+                                                        if !local.iter().any(|c| c.remote_id.is_some() && c.remote_id == rc.remote_id) {
+                                                            local.push(rc);
+                                                        }
+                                                    }
+                                                    review_comments.set(local);
+                                                }
+                                                Err(e) => review_error.set(Some(e)),
+                                            }
+                                            review_busy.set(false);
+                                        });
+                                    }
+                                >
+                                    "Load PR"
+                                </button>
+                            </div>
+                            <input
+                                class="review-input"
+                                type="password"
+                                placeholder="GitHub/GitLab Token (optional, saved locally)"
+                                prop:value=move || git_token.get()
+                                on:input=move |ev| {
+                                    let v = event_target_value(&ev);
+                                    git_token.set(v.clone());
+                                    tauri_bridge::local_storage_set("vcode.gitToken", &v);
+                                }
+                            />
+                        </div>
+
+                        {move || {
+                            review_error.get().map(|err| view! {
+                                <div class="review-error">{err}</div>
+                            })
+                        }}
+
+                        {move || {
+                            diff_summary.get().map(|d| {
+                                let pr_badge = d.pr.as_ref().map(|p| format!("{} #{}: {}", p.provider, p.number, p.title));
+                                view! {
+                                    <div class="review-meta">
+                                        <div>{format!("Branch: {}  vs  {}", d.branch, d.base_ref)}</div>
+                                        {pr_badge.map(|t| view! { <div class="review-pr-title">{t}</div> })}
+                                        <div class="review-counts">
+                                            {format!("{} changed files · {} impacted nodes", d.files.len(), review_overlay.get().blast_radius_ids.len())}
+                                        </div>
+                                    </div>
+                                }
+                            })
+                        }}
+
+                        <div class="review-scroll">
+                            <div class="review-section-title">"Changed Files"</div>
+                            {move || {
+                                let Some(diff) = diff_summary.get() else {
+                                    return view! { <div class="review-empty">"Click Git Diff or Load PR to inspect changes."</div> }.into_any();
+                                };
+                                if diff.files.is_empty() {
+                                    return view! { <div class="review-empty">"Working tree is clean."</div> }.into_any();
+                                }
+                                let g = graph.get();
+                                diff.files.into_iter().map(|fd| {
+                                    let rel = fd.file_path.clone();
+                                    let abs = fd.abs_path.clone();
+                                    let matched_group = g.groups.iter().find(|grp| {
+                                        grp.kind == GroupKind::Module
+                                            && grp.file_path.as_ref().is_some_and(|fp| {
+                                                fp == &abs || fp.ends_with(&format!("/{rel}")) || fp == &rel
+                                            })
+                                    }).map(|grp| grp.id.clone());
+                                    view! {
+                                        <div
+                                            class="review-file-row"
+                                            on:click=move |_| {
+                                                if let Some(gid) = &matched_group {
+                                                    selected_id.set(Some(gid.clone()));
+                                                    focus_node.run(gid.clone());
+                                                }
+                                            }
+                                        >
+                                            <span class="review-file-name">{fd.file_path}</span>
+                                            <span class="review-diff-stat">
+                                                <span class="diff-add">{format!("+{}", fd.additions)}</span>
+                                                " "
+                                                <span class="diff-del">{format!("-{}", fd.deletions)}</span>
+                                            </span>
+                                        </div>
+                                    }
+                                }).collect_view().into_any()
+                            }}
+
+                            <div class="review-section-title">"Diff Hunks"</div>
+                            {move || {
+                                let Some(diff) = diff_summary.get() else {
+                                    return view! { <span /> }.into_any();
+                                };
+                                let sel = selected_id.get();
+                                let g = graph.get();
+                                let target_file = sel.as_deref().and_then(|sid| {
+                                    g.functions
+                                        .iter()
+                                        .find(|f| f.id == sid)
+                                        .map(|f| f.file_path.clone())
+                                        .or_else(|| {
+                                            g.groups
+                                                .iter()
+                                                .find(|grp| grp.id == sid)
+                                                .and_then(|grp| grp.file_path.clone())
+                                        })
+                                });
+                                let active_fd = target_file
+                                    .and_then(|tf| {
+                                        diff.files.iter().find(|fd| {
+                                            fd.abs_path == tf
+                                                || tf.ends_with(&format!("/{}", fd.file_path))
+                                                || fd.file_path == tf
+                                        }).cloned()
+                                    })
+                                    .or_else(|| diff.files.first().cloned());
+
+                                let Some(fd) = active_fd else {
+                                    return view! { <div class="review-empty">"No diff hunks."</div> }.into_any();
+                                };
+
+                                view! {
+                                    <div class="diff-hunk-box">
+                                        <div class="diff-file-hdr">{fd.file_path}</div>
+                                        {fd.hunks.into_iter().map(|h| view! {
+                                            <div class="diff-hunk">
+                                                <div class="diff-hunk-hdr">{format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines)}</div>
+                                                {h.lines.into_iter().map(|ln| {
+                                                    let lno = ln.new_line.or(ln.old_line).unwrap_or(1);
+                                                    let cls = match ln.kind.as_str() {
+                                                        "add" => "diff-line is-add",
+                                                        "del" => "diff-line is-del",
+                                                        _ => "diff-line",
+                                                    };
+                                                    let prefix = match ln.kind.as_str() {
+                                                        "add" => "+",
+                                                        "del" => "-",
+                                                        _ => " ",
+                                                    };
+                                                    view! {
+                                                        <div
+                                                            class=cls
+                                                            title="Click to comment on this line"
+                                                            on:click=move |_| comment_line_input.set(lno)
+                                                        >
+                                                            <span class="diff-ln">{lno}</span>
+                                                            <span class="diff-sig">{prefix}</span>
+                                                            <span class="diff-txt">{ln.text}</span>
+                                                        </div>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        }).collect_view()}
+                                    </div>
+                                }.into_any()
+                            }}
+
+                            <div class="review-section-title">"Comments"</div>
+                            <div class="review-comment-form">
+                                <div class="review-row">
+                                    <label class="review-lbl">"Line"</label>
+                                    <input
+                                        class="review-input review-line-input"
+                                        type="number"
+                                        min="1"
+                                        prop:value=move || comment_line_input.get().to_string()
+                                        on:input=move |ev| {
+                                            if let Ok(n) = event_target_value(&ev).parse::<usize>() {
+                                                comment_line_input.set(n.max(1));
+                                            }
+                                        }
+                                    />
+                                </div>
+                                <textarea
+                                    class="review-textarea"
+                                    rows="2"
+                                    placeholder="Write a review comment..."
+                                    prop:value=move || comment_body_input.get()
+                                    on:input=move |ev| comment_body_input.set(event_target_value(&ev))
+                                />
+                                <div class="review-row">
+                                    <button
+                                        class="btn btn-primary"
+                                        on:click=move |_| {
+                                            let proj = graph.get_untracked().root_path;
+                                            let body = comment_body_input.get_untracked();
+                                            if proj.is_empty() || proj.starts_with("sample://") || body.trim().is_empty() {
+                                                return;
+                                            }
+                                            let sel = selected_id.get_untracked();
+                                            let g = graph.get_untracked();
+                                            let file_path = sel.as_deref().and_then(|sid| {
+                                                g.functions.iter().find(|f| f.id == sid).map(|f| f.file_path.clone())
+                                                    .or_else(|| g.groups.iter().find(|grp| grp.id == sid).and_then(|grp| grp.file_path.clone()))
+                                            }).or_else(|| diff_summary.get_untracked().and_then(|d| d.files.first().map(|f| f.file_path.clone())))
+                                            .unwrap_or_else(|| "project".to_string());
+                                            let rel_path = file_path.strip_prefix(&format!("{proj}/")).unwrap_or(&file_path).to_string();
+                                            let line = comment_line_input.get_untracked();
+                                            spawn_local(async move {
+                                                match tauri_bridge::add_review_comment(&proj, &rel_path, line, sel.as_deref(), "reviewer", &body).await {
+                                                    Ok(list) => {
+                                                        review_comments.set(list);
+                                                        comment_body_input.set(String::new());
+                                                    }
+                                                    Err(e) => review_error.set(Some(e)),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        "Add Comment"
+                                    </button>
+                                    <Show when=move || diff_summary.get().and_then(|d| d.pr).is_some()>
+                                        <button
+                                            class="btn btn-ghost"
+                                            on:click=move |_| {
+                                                let proj = graph.get_untracked().root_path;
+                                                let body = comment_body_input.get_untracked();
+                                                let pr_val = pr_input.get_untracked();
+                                                let tok = git_token.get_untracked();
+                                                let Some(pr_info) = diff_summary.get_untracked().and_then(|d| d.pr) else {
+                                                    return;
+                                                };
+                                                if body.trim().is_empty() {
+                                                    return;
+                                                }
+                                                let sel = selected_id.get_untracked();
+                                                let g = graph.get_untracked();
+                                                let file_path = sel.as_deref().and_then(|sid| {
+                                                    g.functions.iter().find(|f| f.id == sid).map(|f| f.file_path.clone())
+                                                        .or_else(|| g.groups.iter().find(|grp| grp.id == sid).and_then(|grp| grp.file_path.clone()))
+                                                }).or_else(|| diff_summary.get_untracked().and_then(|d| d.files.first().map(|f| f.file_path.clone())))
+                                                .unwrap_or_default();
+                                                let rel_path = file_path.strip_prefix(&format!("{proj}/")).unwrap_or(&file_path).to_string();
+                                                let line = comment_line_input.get_untracked();
+                                                spawn_local(async move {
+                                                    match tauri_bridge::post_pr_comment(&proj, &pr_val, &tok, &pr_info.head_sha, &rel_path, line, &body).await {
+                                                        Ok(()) => {
+                                                            let _ = tauri_bridge::add_review_comment(&proj, &rel_path, line, sel.as_deref(), "you", &body).await.map(|l| review_comments.set(l));
+                                                            comment_body_input.set(String::new());
+                                                        }
+                                                        Err(e) => review_error.set(Some(e)),
+                                                    }
+                                                });
+                                            }
+                                        >
+                                            "Post to PR"
+                                        </button>
+                                    </Show>
+                                </div>
+                            </div>
+
+                            {move || {
+                                review_comments.get().into_iter().map(|c| {
+                                    let cid_res = c.id.clone();
+                                    let cid_del = c.id.clone();
+                                    let nid = c.node_id.clone();
+                                    let is_resolved = c.status == "resolved";
+                                    view! {
+                                        <div
+                                            class=if is_resolved { "review-comment is-resolved" } else { "review-comment" }
+                                            on:click=move |_| {
+                                                if let Some(id) = &nid {
+                                                    selected_id.set(Some(id.clone()));
+                                                    focus_node.run(id.clone());
+                                                }
+                                            }
+                                        >
+                                            <div class="review-comment-hdr">
+                                                <span class="review-comment-loc">{format!("{}:{}", c.file_path, c.line)}</span>
+                                                <span class="review-comment-author">{c.author}</span>
+                                            </div>
+                                            <div class="review-comment-body">{c.body}</div>
+                                            <div class="review-comment-actions">
+                                                <button
+                                                    class="btn btn-ghost"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        let proj = graph.get_untracked().root_path;
+                                                        let id = cid_res.clone();
+                                                        spawn_local(async move {
+                                                            if let Ok(list) = tauri_bridge::toggle_resolve_comment(&proj, &id).await {
+                                                                review_comments.set(list);
+                                                            }
+                                                        });
+                                                    }
+                                                >
+                                                    {if is_resolved { "Reopen" } else { "Resolve" }}
+                                                </button>
+                                                <button
+                                                    class="btn btn-ghost"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        let proj = graph.get_untracked().root_path;
+                                                        let id = cid_del.clone();
+                                                        spawn_local(async move {
+                                                            if let Ok(list) = tauri_bridge::delete_review_comment(&proj, &id).await {
+                                                                review_comments.set(list);
+                                                            }
+                                                        });
+                                                    }
+                                                >
+                                                    "Delete"
+                                                </button>
+                                            </div>
+                                        </div>
+                                    }
+                                }).collect_view()
+                            }}
+                        </div>
+                    </aside>
+                </Show>
             </div>
 
             <Show when=move || settings_open.get()>
