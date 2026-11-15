@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import {
   AlertTriangle,
   Box,
@@ -37,7 +37,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleGroupImport,
   onToggleGroupCall,
 }) => {
+  const treeRef = useRef<HTMLDivElement | null>(null);
   const query = searchQuery.trim().toLowerCase();
+
+  useEffect(() => {
+    if (!selectedId || !treeRef.current) return;
+    const el = treeRef.current.querySelector<HTMLElement>(
+      `[data-node-id="${CSS.escape(selectedId)}"]`
+    );
+    if (el) {
+      el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [selectedId]);
 
   const { filteredGroups, filteredFunctions } = useMemo(() => {
     if (!query) {
@@ -85,6 +96,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
     return (
       <div
+        data-node-id={g.id}
         className={`tree-row ${selectedId === g.id ? "is-selected" : ""} ${
           importHidden || callHidden ? "has-hidden-edges" : ""
         }`}
@@ -156,6 +168,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {directFns.map((fn) => (
             <button
               key={fn.id}
+              data-node-id={fn.id}
               className={`tree-item tree-fn ${selectedId === fn.id ? "is-selected" : ""}`}
               style={{ paddingLeft: 10 + (depth + 1) * 14 }}
               onClick={() => onSelectFunction(fn)}
@@ -206,7 +219,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
         </div>
       </div>
-      <div className="sidebar-tree">
+      <div ref={treeRef} className="sidebar-tree">
         {query && filteredGroups.length === 0 && filteredFunctions.length === 0 ? (
           <div className="sidebar-empty">No matches for "{searchQuery}"</div>
         ) : query ? (
@@ -219,6 +232,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {filteredFunctions.map((fn) => (
               <button
                 key={fn.id}
+                data-node-id={fn.id}
                 className={`tree-item tree-fn ${selectedId === fn.id ? "is-selected" : ""}`}
                 onClick={() => onSelectFunction(fn)}
               >
