@@ -1,9 +1,14 @@
 mod analyzer;
 
+use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -13,6 +18,23 @@ pub struct ProjectSettings {
     pub hidden_import_group_ids: Vec<String>,
     pub hidden_call_group_ids: Vec<String>,
     pub editor_command: String,
+}
+
+struct ActiveWatcher {
+    _watcher: notify::RecommendedWatcher,
+    stop_tx: mpsc::Sender<()>,
+}
+
+struct WatcherState {
+    active: Mutex<Option<ActiveWatcher>>,
+}
+
+impl Default for WatcherState {
+    fn default() -> Self {
+        Self {
+            active: Mutex::new(None),
+        }
+    }
 }
 
 fn config_root_dir() -> Result<PathBuf, String> {
@@ -82,17 +104,106 @@ fn project_settings_file(project_path: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn analyze_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
-    let path = Path::new(&project_path);
+async fn analyze_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
+    let path = PathBuf::from(&project_path);
     if !path.is_dir() {
         return Err(format!("Selected path is not a directory: {project_path}"));
     }
-    analyzer::analyze_project(path)
+    tauri::async_runtime::spawn_blocking(move || analyzer::analyze_project(&path))
+        .await
+        .map_err(|e| format!("Analyzer task failed: {e}"))?
 }
 
 #[tauri::command]
-fn analyze_python_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
-    analyze_project(project_path)
+async fn analyze_python_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
+    analyze_project(project_path).await
+}
+
+#[tauri::command]
+fn watch_project(
+    app: AppHandle,
+    state: State<'_, WatcherState>,
+    project_path: String,
+) -> Result<(), String> {
+    let root = PathBuf::from(&project_path);
+    if !root.is_dir() {
+        return Err(format!("Not a directory: {project_path}"));
+    }
+
+    let mut guard = state
+        .active
+        .lock()
+        .map_err(|_| "Watcher mutex poisoned".to_string())?;
+    if let Some(prev) = guard.take() {
+        let _ = prev.stop_tx.send(());
+    }
+
+    let (dirty_tx, dirty_rx) = mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let dirty_flag = Arc::new(dirty_tx);
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+        if let Ok(event) = res {
+            if event.kind.is_access() {
+                return;
+            }
+            let relevant = event
+                .paths
+                .iter()
+                .any(|p| analyzer::is_watched_path(p) || p.is_dir());
+            if relevant {
+                let _ = dirty_flag.send(());
+            }
+        }
+    })
+    .map_err(|e| format!("Failed to initialize file watcher: {e}"))?;
+
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|e| format!("Failed to watch {}: {e}", root.display()))?;
+
+    std::thread::spawn(move || {
+        let debounce = Duration::from_millis(300);
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            match dirty_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(()) => {
+                    // Coalesce rapid file events (e.g. nvim swap/write sequences)
+                    std::thread::sleep(debounce);
+                    while dirty_rx.try_recv().is_ok() {}
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if let Ok(graph) = analyzer::analyze_project(&root) {
+                        let _ = app.emit("project-updated", graph);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    *guard = Some(ActiveWatcher {
+        _watcher: watcher,
+        stop_tx,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_project(state: State<'_, WatcherState>) -> Result<(), String> {
+    let mut guard = state
+        .active
+        .lock()
+        .map_err(|_| "Watcher mutex poisoned".to_string())?;
+    if let Some(prev) = guard.take() {
+        let _ = prev.stop_tx.send(());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -171,10 +282,13 @@ fn open_in_editor(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(WatcherState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             analyze_project,
             analyze_python_project,
+            watch_project,
+            unwatch_project,
             load_project_settings,
             save_project_settings,
             open_in_editor

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Canvas, getLodLevel, type Viewport } from "./components/Canvas";
 import { Sidebar } from "./components/Sidebar";
@@ -63,6 +64,9 @@ export const App: React.FC = () => {
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const settingsLoadedPathRef = useRef<string | null>(null);
+  const currentRootPathRef = useRef<string>(graph.rootPath);
+  const pendingFitAllRef = useRef<boolean>(true);
+  currentRootPathRef.current = graph.rootPath;
   const layout = useMemo(() => computeLayout(graph), [graph]);
 
   const hiddenEdgeIds = useMemo(() => {
@@ -139,8 +143,29 @@ export const App: React.FC = () => {
   }, [fitRect, layout.bounds.width, layout.bounds.height]);
 
   useEffect(() => {
+    if (!pendingFitAllRef.current) return;
+    pendingFitAllRef.current = false;
     fitAll();
   }, [fitAll]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<ProjectGraph>("project-updated", (event) => {
+      if (event.payload.rootPath === currentRootPathRef.current) {
+        setGraph(event.payload);
+      }
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        // ignore when running outside Tauri
+      });
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   const recordRecentProject = useCallback((name: string, path: string) => {
     setRecentProjects((prev) => {
@@ -175,6 +200,7 @@ export const App: React.FC = () => {
         }
 
         settingsLoadedPathRef.current = null;
+        pendingFitAllRef.current = true;
         setGraph(analyzed);
         setSelectedId(null);
         if (saved) {
@@ -193,6 +219,9 @@ export const App: React.FC = () => {
         }
         settingsLoadedPathRef.current = analyzed.rootPath;
         recordRecentProject(analyzed.rootName, analyzed.rootPath);
+        void invoke("watch_project", { projectPath: analyzed.rootPath }).catch(() => {
+          // ignore watcher errors outside Tauri
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setErrorMsg(msg);

@@ -138,6 +138,19 @@ fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || name.ends_with(".egg-info")
 }
 
+pub fn is_watched_path(path: &Path) -> bool {
+    for comp in path.components() {
+        if let std::path::Component::Normal(s) = comp {
+            if let Some(name) = s.to_str() {
+                if should_skip_dir(name) {
+                    return false;
+                }
+            }
+        }
+    }
+    Lang::from_path(path).is_some()
+}
+
 fn node_text<'a>(node: Node<'a>, src: &'a str) -> &'a str {
     &src[node.byte_range()]
 }
