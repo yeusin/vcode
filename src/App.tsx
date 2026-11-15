@@ -45,9 +45,11 @@ function loadRecentProjects(): RecentProject[] {
 }
 
 export const App: React.FC = () => {
-  const [graph, setGraph] = useState<ProjectGraph>(SAMPLE_PROJECT);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
-  const [loading, setLoading] = useState(false);
+  const [graph, setGraph] = useState<ProjectGraph | null>(() =>
+    loadRecentProjects().length > 0 ? null : SAMPLE_PROJECT
+  );
+  const [loading, setLoading] = useState(() => loadRecentProjects().length > 0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -64,14 +66,14 @@ export const App: React.FC = () => {
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const settingsLoadedPathRef = useRef<string | null>(null);
-  const currentRootPathRef = useRef<string>(graph.rootPath);
+  const currentRootPathRef = useRef<string>(graph?.rootPath ?? "");
   const pendingFitAllRef = useRef<boolean>(true);
-  currentRootPathRef.current = graph.rootPath;
-  const layout = useMemo(() => computeLayout(graph), [graph]);
+  currentRootPathRef.current = graph?.rootPath ?? "";
+  const layout = useMemo(() => (graph ? computeLayout(graph) : null), [graph]);
 
   const hiddenEdgeIds = useMemo(() => {
     const hidden = new Set<string>();
-    if (hiddenImportGroupIds.size === 0 && hiddenCallGroupIds.size === 0) {
+    if (!graph || (hiddenImportGroupIds.size === 0 && hiddenCallGroupIds.size === 0)) {
       return hidden;
     }
 
@@ -139,14 +141,15 @@ export const App: React.FC = () => {
   );
 
   const fitAll = useCallback(() => {
+    if (!layout) return;
     fitRect({ x: 0, y: 0, width: layout.bounds.width, height: layout.bounds.height });
-  }, [fitRect, layout.bounds.width, layout.bounds.height]);
+  }, [fitRect, layout]);
 
   useEffect(() => {
-    if (!pendingFitAllRef.current) return;
+    if (!layout || !pendingFitAllRef.current) return;
     pendingFitAllRef.current = false;
     fitAll();
-  }, [fitAll]);
+  }, [fitAll, layout]);
 
   useEffect(() => {
     let unlisten: (() => void) | null = null;
@@ -225,6 +228,7 @@ export const App: React.FC = () => {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setErrorMsg(msg);
+        setGraph((cur) => cur ?? SAMPLE_PROJECT);
       } finally {
         setLoading(false);
       }
@@ -234,6 +238,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (
+      !graph ||
       graph.rootPath.startsWith("sample://") ||
       settingsLoadedPathRef.current !== graph.rootPath
     ) {
@@ -253,7 +258,7 @@ export const App: React.FC = () => {
       // ignore persistence errors when running outside Tauri
     });
   }, [
-    graph.rootPath,
+    graph,
     showImportEdges,
     showCallEdges,
     hiddenImportGroupIds,
@@ -286,7 +291,7 @@ export const App: React.FC = () => {
 
   const handleSelectGroup = (group: GroupNode) => {
     setSelectedId(group.id);
-    const rect = layout.nodeRects[group.id];
+    const rect = layout?.nodeRects[group.id];
     if (rect) {
       fitRect(rect);
     }
@@ -294,7 +299,7 @@ export const App: React.FC = () => {
 
   const handleSelectFunction = (fn: FunctionNode) => {
     setSelectedId(fn.id);
-    const rect = layout.nodeRects[fn.id];
+    const rect = layout?.nodeRects[fn.id];
     if (rect) {
       fitRect(rect, 1.05);
     }
@@ -329,7 +334,7 @@ export const App: React.FC = () => {
 
   const handleOpenFileInEditor = useCallback(
     (relFilePath: string) => {
-      if (graph.rootPath.startsWith("sample://")) {
+      if (!graph || graph.rootPath.startsWith("sample://")) {
         setErrorMsg("Open a local project folder first to open files in your editor.");
         return;
       }
@@ -343,7 +348,7 @@ export const App: React.FC = () => {
       }
       void launchEditor(editorCommand, absPath, graph.rootPath);
     },
-    [graph.rootPath, editorCommand, launchEditor]
+    [graph, editorCommand, launchEditor]
   );
 
   const handleOpenSettings = () => {
@@ -362,11 +367,11 @@ export const App: React.FC = () => {
       // ignore storage errors
     }
     setSettingsOpen(false);
-    if (trimmed && pendingEditorFile) {
-      const fileToOpen = pendingEditorFile;
-      setPendingEditorFile(null);
-      void launchEditor(trimmed, fileToOpen, graph.rootPath);
-    } else {
+      if (trimmed && pendingEditorFile && graph) {
+        const fileToOpen = pendingEditorFile;
+        setPendingEditorFile(null);
+        void launchEditor(trimmed, fileToOpen, graph.rootPath);
+      } else {
       setPendingEditorFile(null);
     }
   };
@@ -374,8 +379,8 @@ export const App: React.FC = () => {
   return (
     <div className="app-shell">
       <Toolbar
-        projectName={graph.rootName}
-        currentRootPath={graph.rootPath}
+        projectName={graph?.rootName ?? recentProjects[0]?.name ?? "VCode"}
+        currentRootPath={graph?.rootPath ?? ""}
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onOpenProject={handleOpenProject}
@@ -402,7 +407,7 @@ export const App: React.FC = () => {
       )}
 
       <div className="workspace">
-        {sidebarOpen && (
+        {sidebarOpen && graph && (
           <Sidebar
             graph={graph}
             searchQuery={searchQuery}
@@ -418,23 +423,31 @@ export const App: React.FC = () => {
         )}
 
         <main ref={stageRef} className="canvas-stage">
-          <Canvas
-            layout={layout}
-            viewport={viewport}
-            onViewportCommit={setViewport}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            showImportEdges={showImportEdges}
-            showCallEdges={showCallEdges}
-            hiddenEdgeIds={hiddenEdgeIds}
-            hiddenImportGroupIds={hiddenImportGroupIds}
-            hiddenCallGroupIds={hiddenCallGroupIds}
-            onFocusRect={fitRect}
-            onOpenFileInEditor={handleOpenFileInEditor}
-          />
-          <div className="canvas-hint">
-            Scroll to zoom (overview → structure → readable code) · Drag to pan · Double-click any diagram to focus
-          </div>
+          {layout ? (
+            <>
+              <Canvas
+                layout={layout}
+                viewport={viewport}
+                onViewportCommit={setViewport}
+                selectedId={selectedId}
+                onSelect={setSelectedId}
+                showImportEdges={showImportEdges}
+                showCallEdges={showCallEdges}
+                hiddenEdgeIds={hiddenEdgeIds}
+                hiddenImportGroupIds={hiddenImportGroupIds}
+                hiddenCallGroupIds={hiddenCallGroupIds}
+                onFocusRect={fitRect}
+                onOpenFileInEditor={handleOpenFileInEditor}
+              />
+              <div className="canvas-hint">
+                Scroll to zoom (overview → structure → readable code) · Drag to pan · Double-click any diagram to focus
+              </div>
+            </>
+          ) : (
+            <div className="canvas-loading">
+              Analyzing {recentProjects[0]?.name ?? "project"}...
+            </div>
+          )}
         </main>
       </div>
 
