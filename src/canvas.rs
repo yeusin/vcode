@@ -197,6 +197,7 @@ fn render_canvas(
     fn_parent: &HashMap<String, String>,
     group_meta: &HashMap<String, String>,
     fn_counts: &HashMap<String, (usize, usize)>,
+    edges_by_node: &HashMap<String, Vec<usize>>,
     review: &ReviewOverlay,
     action_hits: &mut Vec<ActionHit>,
 ) {
@@ -340,52 +341,14 @@ fn render_canvas(
     let mut bg_edge_count = 0usize;
     let mut connected_in_count = 0usize;
     let mut connected_out_count = 0usize;
-    const MAX_BG_EDGES_PER_FRAME: usize = 1200;
+    const MAX_BG_EDGES_PER_FRAME: usize = 400;
     const MAX_CONNECTED_EDGES_PER_DIR: usize = 99;
+    let large_edge_graph = layout.edges.len() > 2000;
 
-    for e in &layout.edges {
-        if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
-            continue;
-        }
-        let is_in = focus_id == Some(e.edge.target_id.as_str());
-        let is_out = focus_id == Some(e.edge.source_id.as_str());
-        let connected = is_in || is_out;
-        if connected {
-            if is_in && connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                continue;
-            }
-            if is_out && connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                continue;
-            }
-        } else {
-            if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
-                continue;
-            }
-            if (e.x2 - e.x1).hypot(e.y2 - e.y1) * scale < 4.0 {
-                continue;
-            }
-        }
-        let min_x = e.x1.min(e.x2) - 80.0;
-        let max_x = e.x1.max(e.x2) + 80.0;
-        let min_y = e.y1.min(e.y2) - 80.0;
-        let max_y = e.y1.max(e.y2) + 80.0;
-        if max_x < world_left
-            || min_x > world_left + world_w
-            || max_y < world_top
-            || min_y > world_top + world_h
-        {
-            continue;
-        }
-        if is_in {
-            connected_in_count += 1;
-        } else if is_out {
-            connected_out_count += 1;
-        } else {
-            bg_edge_count += 1;
-        }
-
-        let dimmed = focus_id.is_some() && !connected;
-
+    let draw_single_edge = |e: &PositionedEdge,
+                            connected: bool,
+                            dimmed: bool,
+                            ctx: &CanvasRenderingContext2d| {
         let color = match e.edge.kind {
             EdgeKind::Import => {
                 if connected {
@@ -432,7 +395,100 @@ fn render_canvas(
         ctx.stroke();
 
         if !dimmed {
-            draw_arrow_head(&ctx, cx2, cy2, e.x2, e.y2, if connected { 9.0 } else { 6.5 }, color);
+            draw_arrow_head(ctx, cx2, cy2, e.x2, e.y2, if connected { 9.0 } else { 6.5 }, color);
+        }
+    };
+
+    if large_edge_graph {
+        if let Some(fid) = focus_id {
+            if let Some(indices) = edges_by_node.get(fid) {
+                for &idx in indices {
+                    let e = &layout.edges[idx];
+                    if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
+                        continue;
+                    }
+                    let is_in = e.edge.target_id == fid;
+                    if is_in {
+                        if connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                            continue;
+                        }
+                        connected_in_count += 1;
+                    } else {
+                        if connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                            continue;
+                        }
+                        connected_out_count += 1;
+                    }
+                    draw_single_edge(e, true, false, &ctx);
+                }
+            }
+        } else if lod == LodLevel::Micro {
+            for e in &layout.edges {
+                if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
+                    break;
+                }
+                let min_x = e.x1.min(e.x2) - 80.0;
+                let max_x = e.x1.max(e.x2) + 80.0;
+                let min_y = e.y1.min(e.y2) - 80.0;
+                let max_y = e.y1.max(e.y2) + 80.0;
+                if max_x < world_left
+                    || min_x > world_left + world_w
+                    || max_y < world_top
+                    || min_y > world_top + world_h
+                {
+                    continue;
+                }
+                if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
+                    continue;
+                }
+                bg_edge_count += 1;
+                draw_single_edge(e, false, false, &ctx);
+            }
+        }
+    } else {
+        for e in &layout.edges {
+            if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
+                continue;
+            }
+            let is_in = focus_id == Some(e.edge.target_id.as_str());
+            let is_out = focus_id == Some(e.edge.source_id.as_str());
+            let connected = is_in || is_out;
+            if connected {
+                if is_in && connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                    continue;
+                }
+                if is_out && connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                    continue;
+                }
+            } else {
+                if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
+                    continue;
+                }
+                if (e.x2 - e.x1).hypot(e.y2 - e.y1) * scale < 4.0 {
+                    continue;
+                }
+            }
+            let min_x = e.x1.min(e.x2) - 80.0;
+            let max_x = e.x1.max(e.x2) + 80.0;
+            let min_y = e.y1.min(e.y2) - 80.0;
+            let max_y = e.y1.max(e.y2) + 80.0;
+            if max_x < world_left
+                || min_x > world_left + world_w
+                || max_y < world_top
+                || min_y > world_top + world_h
+            {
+                continue;
+            }
+            if is_in {
+                connected_in_count += 1;
+            } else if is_out {
+                connected_out_count += 1;
+            } else {
+                bg_edge_count += 1;
+            }
+
+            let dimmed = focus_id.is_some() && !connected;
+            draw_single_edge(e, connected, dimmed, &ctx);
         }
     }
     let _ = ctx.set_line_dash(&empty_dash);
@@ -779,12 +835,15 @@ fn render_canvas(
         if let Some(rect) = layout.node_rects.get(target_id) {
             let mut callers = HashSet::new();
             let mut callees = HashSet::new();
-            for e in &layout.edges {
-                if e.edge.target_id == target_id {
-                    callers.insert(e.edge.source_id.as_str());
-                }
-                if e.edge.source_id == target_id {
-                    callees.insert(e.edge.target_id.as_str());
+            if let Some(indices) = edges_by_node.get(target_id) {
+                for &idx in indices {
+                    let e = &layout.edges[idx];
+                    if e.edge.target_id == target_id {
+                        callers.insert(e.edge.source_id.as_str());
+                    }
+                    if e.edge.source_id == target_id {
+                        callees.insert(e.edge.target_id.as_str());
+                    }
                 }
             }
             let is_fn = layout.functions.iter().any(|f| f.node.id == target_id);
@@ -1170,6 +1229,18 @@ pub fn CanvasView(
         )
     });
 
+    let edges_by_node = Memo::new(move |_| {
+        let l = layout.get();
+        let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, e) in l.edges.iter().enumerate() {
+            map.entry(e.edge.source_id.clone()).or_default().push(idx);
+            if e.edge.target_id != e.edge.source_id {
+                map.entry(e.edge.target_id.clone()).or_default().push(idx);
+            }
+        }
+        Arc::new(map)
+    });
+
     // Render on reactive state changes
     let hits_for_render = action_hits.clone();
     Effect::new(move |_| {
@@ -1186,6 +1257,7 @@ pub fn CanvasView(
         let fp = fn_parent.get();
         let gm = group_meta.get();
         let fc = fn_counts.get();
+        let ebn = edges_by_node.get();
         let rev = review_overlay.get();
 
         let mut hits = hits_for_render.borrow_mut();
@@ -1200,6 +1272,7 @@ pub fn CanvasView(
             &fp,
             &gm,
             &fc,
+            &ebn,
             &rev,
             &mut hits,
         );
@@ -1217,7 +1290,7 @@ pub fn CanvasView(
         let factor = if ev.delta_y() < 0.0 { 1.12 } else { 1.0 / 1.12 };
 
         viewport.update(|vp| {
-            let new_scale = (vp.scale * factor).clamp(0.08, 3.0);
+            let new_scale = (vp.scale * factor).clamp(0.001, 3.0);
             let ratio = new_scale / vp.scale;
             vp.x = mx - (mx - vp.x) * ratio;
             vp.y = my - (my - vp.y) * ratio;
@@ -1352,14 +1425,18 @@ pub fn CanvasView(
     let hover_badge = Memo::new(move |_| {
         let hid = hovered_id.get().or_else(|| selected_id.get())?;
         let l = layout.get();
+        let ebn = edges_by_node.get();
         let mut callers = HashSet::new();
         let mut callees = HashSet::new();
-        for e in &l.edges {
-            if e.edge.target_id == hid {
-                callers.insert(e.edge.source_id.clone());
-            }
-            if e.edge.source_id == hid {
-                callees.insert(e.edge.target_id.clone());
+        if let Some(indices) = ebn.get(&hid) {
+            for &idx in indices {
+                let e = &l.edges[idx];
+                if e.edge.target_id == hid {
+                    callers.insert(e.edge.source_id.clone());
+                }
+                if e.edge.source_id == hid {
+                    callees.insert(e.edge.target_id.clone());
+                }
             }
         }
         let is_fn = l.functions.iter().any(|f| f.node.id == hid);

@@ -400,7 +400,12 @@ pub fn App() -> impl IntoView {
         }
         let (vw, vh) = web_sys::window()
             .and_then(|w| w.document())
-            .and_then(|d| d.query_selector(".canvas-viewport").ok().flatten())
+            .and_then(|d| {
+                d.query_selector(".canvas-viewport")
+                    .ok()
+                    .flatten()
+                    .or_else(|| d.query_selector(".canvas-stage").ok().flatten())
+            })
             .map(|el| {
                 let r = el.get_bounding_client_rect();
                 (r.width(), r.height())
@@ -411,7 +416,7 @@ pub fn App() -> impl IntoView {
         }
         let scale = ((vw - 64.0) / l.bounds.width)
             .min((vh - 64.0) / l.bounds.height)
-            .clamp(0.1, 1.0);
+            .clamp(0.001, 1.0);
         let x = (vw - l.bounds.width * scale) / 2.0;
         let y = (vh - l.bounds.height * scale) / 2.0;
         viewport.set(Viewport { x, y, scale });

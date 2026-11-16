@@ -435,4 +435,122 @@ mod tests {
         assert!(mod_g.rect.y > dir.rect.y);
         assert_eq!(dir.function_count, 2);
     }
+
+    #[test]
+    fn computes_large_project_layout_5k_files_40k_functions() {
+        let num_dirs = 200usize;
+        let num_files = 5000usize;
+        let num_classes = 6000usize;
+        let num_functions = 40000usize;
+
+        let mut groups = Vec::with_capacity(1 + num_dirs + num_files + num_classes);
+        groups.push(GroupNode {
+            id: "dir:.".to_string(),
+            kind: GroupKind::Directory,
+            name: "root".to_string(),
+            qualified_name: "root".to_string(),
+            parent_id: None,
+            file_path: None,
+            is_package: true,
+            docstring: None,
+            line_count: 0,
+        });
+        for d in 0..num_dirs {
+            groups.push(GroupNode {
+                id: format!("dir:d{d}"),
+                kind: GroupKind::Directory,
+                name: format!("d{d}"),
+                qualified_name: format!("d{d}"),
+                parent_id: Some("dir:.".to_string()),
+                file_path: None,
+                is_package: true,
+                docstring: None,
+                line_count: 0,
+            });
+        }
+        for f in 0..num_files {
+            let d = f % num_dirs;
+            groups.push(GroupNode {
+                id: format!("mod:m{f}"),
+                kind: GroupKind::Module,
+                name: format!("m{f}.py"),
+                qualified_name: format!("d{d}.m{f}"),
+                parent_id: Some(format!("dir:d{d}")),
+                file_path: Some(format!("/tmp/big/d{d}/m{f}.py")),
+                is_package: false,
+                docstring: None,
+                line_count: 50,
+            });
+        }
+        for c in 0..num_classes {
+            let f = c % num_files;
+            groups.push(GroupNode {
+                id: format!("cls:c{c}"),
+                kind: GroupKind::Class,
+                name: format!("Class{c}"),
+                qualified_name: format!("Class{c}"),
+                parent_id: Some(format!("mod:m{f}")),
+                file_path: None,
+                is_package: false,
+                docstring: None,
+                line_count: 20,
+            });
+        }
+
+        let mut functions = Vec::with_capacity(num_functions);
+        for i in 0..num_functions {
+            let c = i % num_classes;
+            let f = c % num_files;
+            functions.push(FunctionNode {
+                id: format!("fn:f{i}"),
+                name: format!("fn_{i}"),
+                qualified_name: format!("Class{c}.fn_{i}"),
+                parent_id: format!("cls:c{c}"),
+                file_path: format!("/tmp/big/d{}/m{f}.py", f % num_dirs),
+                is_async: false,
+                is_method: true,
+                decorators: vec![],
+                signature: "(self, x: int) -> int".to_string(),
+                docstring: None,
+                start_line: 1,
+                end_line: 4,
+                code: "def fn(self, x):\n    return x + 1".to_string(),
+            });
+        }
+
+        let mut edges = Vec::with_capacity(num_functions * 2);
+        for i in 0..num_functions {
+            edges.push(GraphEdge {
+                id: format!("e:c{i}"),
+                kind: EdgeKind::Call,
+                source_id: format!("fn:f{i}"),
+                target_id: format!("fn:f{}", (i + 1) % num_functions),
+                label: None,
+            });
+            edges.push(GraphEdge {
+                id: format!("e:c2_{i}"),
+                kind: EdgeKind::Call,
+                source_id: format!("fn:f{i}"),
+                target_id: format!("fn:f{}", (i + 7) % num_functions),
+                label: None,
+            });
+        }
+
+        let graph = ProjectGraph {
+            root_name: "big".to_string(),
+            root_path: "/tmp/big".to_string(),
+            groups,
+            functions,
+            edges,
+            parse_errors: vec![],
+            stats: ProjectStats::default(),
+        };
+
+        let layout = compute_layout(&graph);
+        assert_eq!(layout.groups.len(), 1 + num_dirs + num_files + num_classes);
+        assert_eq!(layout.functions.len(), num_functions);
+        assert_eq!(layout.edges.len(), num_functions * 2);
+        let fit_scale = (1000.0 / layout.bounds.width).min(720.0 / layout.bounds.height);
+        assert!(fit_scale > 0.001, "fit_scale was {fit_scale}");
+    }
 }
