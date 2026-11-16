@@ -10,8 +10,8 @@ use crate::layout::compute_layout;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
-    AnalyzeProgress, DiffStatus, EdgeVisibility, FunctionNode, GitDiffSummary, GroupKind,
-    GroupNode, LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    AnalyzeProgress, DiffStatus, FunctionNode, GitDiffSummary, GroupKind, GroupNode, LodLevel,
+    ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
 
 fn format_duration(ms: u64) -> String {
@@ -197,11 +197,6 @@ pub fn App() -> impl IntoView {
     let search_query = RwSignal::new(String::new());
     let collapsed_ids = RwSignal::new(HashSet::<String>::new());
 
-    let show_imports = RwSignal::new(true);
-    let show_calls = RwSignal::new(true);
-    let hidden_import_groups = RwSignal::new(HashSet::<String>::new());
-    let hidden_call_groups = RwSignal::new(HashSet::<String>::new());
-
     let editor_command = RwSignal::new(load_editor_command());
     let settings_open = RwSignal::new(false);
     let settings_input = RwSignal::new(load_editor_command());
@@ -223,12 +218,6 @@ pub fn App() -> impl IntoView {
     let review_error = RwSignal::new(Option::<String>::None);
 
     let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
-    let edge_vis = Memo::new(move |_| EdgeVisibility {
-        show_imports: show_imports.get(),
-        show_calls: show_calls.get(),
-        hidden_import_group_ids: hidden_import_groups.get(),
-        hidden_call_group_ids: hidden_call_groups.get(),
-    });
 
     let review_overlay = Memo::new(move |_| {
         let diff_opt = diff_summary.get();
@@ -381,10 +370,10 @@ pub fn App() -> impl IntoView {
         }
         let cmd = editor_command.get_untracked();
         let settings = ProjectSettings {
-            show_import_edges: show_imports.get_untracked(),
-            show_call_edges: show_calls.get_untracked(),
-            hidden_import_group_ids: hidden_import_groups.get_untracked().into_iter().collect(),
-            hidden_call_group_ids: hidden_call_groups.get_untracked().into_iter().collect(),
+            show_import_edges: false,
+            show_call_edges: false,
+            hidden_import_group_ids: Vec::new(),
+            hidden_call_group_ids: Vec::new(),
             editor_command: if cmd.trim().is_empty() { None } else { Some(cmd) },
         };
         let path = g.root_path.clone();
@@ -465,21 +454,12 @@ pub fn App() -> impl IntoView {
                 Ok(new_graph) => {
                     let saved = tauri_bridge::load_project_settings(&path).await.ok().flatten();
                     if let Some(s) = saved {
-                        show_imports.set(s.show_import_edges);
-                        show_calls.set(s.show_call_edges);
-                        hidden_import_groups.set(s.hidden_import_group_ids.into_iter().collect());
-                        hidden_call_groups.set(s.hidden_call_group_ids.into_iter().collect());
                         if let Some(cmd) = s.editor_command {
                             if !cmd.trim().is_empty() {
                                 editor_command.set(cmd.clone());
                                 save_editor_command(&cmd);
                             }
                         }
-                    } else {
-                        show_imports.set(true);
-                        show_calls.set(true);
-                        hidden_import_groups.set(HashSet::new());
-                        hidden_call_groups.set(HashSet::new());
                     }
 
                     let recent = push_recent_project(&new_graph.root_path, &new_graph.root_name);
@@ -590,24 +570,6 @@ pub fn App() -> impl IntoView {
         });
     });
 
-    let toggle_group_import = Callback::new(move |group_id: String| {
-        hidden_import_groups.update(|set| {
-            if !set.remove(&group_id) {
-                set.insert(group_id);
-            }
-        });
-        persist_project_settings();
-    });
-
-    let toggle_group_call = Callback::new(move |group_id: String| {
-        hidden_call_groups.update(|set| {
-            if !set.remove(&group_id) {
-                set.insert(group_id);
-            }
-        });
-        persist_project_settings();
-    });
-
     let flat_tree = Memo::new(move |_| {
         let q = search_query.get();
         let collapsed = collapsed_ids.get();
@@ -655,24 +617,6 @@ pub fn App() -> impl IntoView {
                 </div>
 
                 <div class="toolbar-right">
-                    <button
-                        class=move || if show_imports.get() { "toggle-pill import-pill is-active" } else { "toggle-pill import-pill" }
-                        on:click=move |_| {
-                            show_imports.update(|v| *v = !*v);
-                            persist_project_settings();
-                        }
-                    >
-                        "Imports"
-                    </button>
-                    <button
-                        class=move || if show_calls.get() { "toggle-pill call-pill is-active" } else { "toggle-pill call-pill" }
-                        on:click=move |_| {
-                            show_calls.update(|v| *v = !*v);
-                            persist_project_settings();
-                        }
-                    >
-                        "Calls"
-                    </button>
                     <button
                         class=move || {
                             let pr_loaded = diff_summary.get().and_then(|d| d.pr).is_some();
@@ -801,31 +745,19 @@ pub fn App() -> impl IntoView {
                                 entries.into_iter().take(400).map(|entry| {
                                     let id = entry.id.clone();
                                     let id_row_sel = entry.id.clone();
-                                    let id_row_imp = entry.id.clone();
-                                    let id_row_call = entry.id.clone();
                                     let id_sel = entry.id.clone();
                                     let id_dbl = entry.id.clone();
                                     let id_col = entry.id.clone();
-                                    let id_imp = entry.id.clone();
-                                    let id_call = entry.id.clone();
-                                    let id_imp_cls = entry.id.clone();
-                                    let id_call_cls = entry.id.clone();
                                     let has_children = !entry.children.is_empty();
-                                    let is_group = entry.is_group;
                                     let kind_class = entry.kind_class;
                                     let indent = format!("padding-left: {}px;", 6 + entry.depth * 14);
                                     view! {
                                         <div
                                             class=move || {
-                                                let sel = selected_id.get().as_deref() == Some(id_row_sel.as_str());
-                                                let hidden = is_group
-                                                    && (hidden_import_groups.get().contains(&id_row_imp)
-                                                        || hidden_call_groups.get().contains(&id_row_call));
-                                                match (sel, hidden) {
-                                                    (true, true) => "tree-row is-selected has-hidden-edges",
-                                                    (true, false) => "tree-row is-selected",
-                                                    (false, true) => "tree-row has-hidden-edges",
-                                                    (false, false) => "tree-row",
+                                                if selected_id.get().as_deref() == Some(id_row_sel.as_str()) {
+                                                    "tree-row is-selected"
+                                                } else {
+                                                    "tree-row"
                                                 }
                                             }
                                             style=indent
@@ -898,51 +830,6 @@ pub fn App() -> impl IntoView {
                                                 </span>
                                                 <span class="tree-label">{entry.label}</span>
                                             </button>
-                                            {if is_group && matches!(kind_class, "directory" | "module") {
-                                                view! {
-                                                    <span class="tree-edge-toggles">
-                                                        <button
-                                                            class=move || if hidden_import_groups.get().contains(&id_imp_cls) {
-                                                                "tree-edge-btn is-hidden"
-                                                            } else {
-                                                                "tree-edge-btn"
-                                                            }
-                                                            title="Toggle import graph"
-                                                            on:click=move |ev| {
-                                                                ev.stop_propagation();
-                                                                toggle_group_import.run(id_imp.clone());
-                                                            }
-                                                        >
-                                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                <line x1="6" x2="6" y1="3" y2="15" />
-                                                                <circle cx="18" cy="6" r="3" />
-                                                                <circle cx="6" cy="18" r="3" />
-                                                                <path d="M18 9a9 9 0 0 1-9 9" />
-                                                            </svg>
-                                                        </button>
-                                                        <button
-                                                            class=move || if hidden_call_groups.get().contains(&id_call_cls) {
-                                                                "tree-edge-btn is-hidden"
-                                                            } else {
-                                                                "tree-edge-btn"
-                                                            }
-                                                            title="Toggle call graph"
-                                                            on:click=move |ev| {
-                                                                ev.stop_propagation();
-                                                                toggle_group_call.run(id_call.clone());
-                                                            }
-                                                        >
-                                                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                <path d="M18 6H5a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h13l4-3.5L18 6Z" />
-                                                                <path d="M12 13v8" />
-                                                                <path d="M12 3v3" />
-                                                            </svg>
-                                                        </button>
-                                                    </span>
-                                                }.into_any()
-                                            } else {
-                                                view! { <span /> }.into_any()
-                                            }}
                                         </div>
                                     }
                                 }).collect_view().into_any()
@@ -1016,10 +903,7 @@ pub fn App() -> impl IntoView {
                                     viewport=viewport
                                     selected_id=selected_id
                                     hovered_id=hovered_id
-                                    edge_vis=edge_vis
                                     review_overlay=review_overlay
-                                    on_toggle_group_import=toggle_group_import
-                                    on_toggle_group_call=toggle_group_call
                                     on_open_in_editor=handle_open_in_editor
                                     on_focus_node=focus_node
                                 />

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,25 +143,6 @@ pub struct LayoutResult {
     pub edges: Vec<PositionedEdge>,
     pub node_rects: HashMap<String, Rect>,
     pub bounds: Rect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeVisibility {
-    pub show_imports: bool,
-    pub show_calls: bool,
-    pub hidden_import_group_ids: HashSet<String>,
-    pub hidden_call_group_ids: HashSet<String>,
-}
-
-impl Default for EdgeVisibility {
-    fn default() -> Self {
-        Self {
-            show_imports: true,
-            show_calls: true,
-            hidden_import_group_ids: HashSet::new(),
-            hidden_call_group_ids: HashSet::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

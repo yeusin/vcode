@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::f64::consts::PI;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,8 +10,8 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlElement, MouseEve
 
 use crate::highlight::tokenize_code_line;
 use crate::types::{
-    EdgeKind, EdgeVisibility, GroupKind, LayoutResult, LodLevel, PositionedEdge,
-    PositionedFunction, PositionedGroup, Rect, Viewport,
+    EdgeKind, GroupKind, LayoutResult, LodLevel, PositionedFunction, PositionedGroup, Rect,
+    Viewport,
 };
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -26,8 +25,6 @@ pub struct ReviewOverlay {
 
 #[derive(Clone)]
 enum ActionKind {
-    ToggleImport(String),
-    ToggleCall(String),
     OpenEditor(String),
 }
 
@@ -104,85 +101,11 @@ fn truncate_to_width(ctx: &CanvasRenderingContext2d, text: &str, max_w: f64) -> 
     "…".to_string()
 }
 
-fn draw_arrow_head(
-    ctx: &CanvasRenderingContext2d,
-    cx: f64,
-    cy: f64,
-    tx: f64,
-    ty: f64,
-    size: f64,
-    color: &str,
-) {
-    let angle = (ty - cy).atan2(tx - cx);
-    ctx.save();
-    ctx.set_fill_style_str(color);
-    ctx.begin_path();
-    ctx.move_to(tx, ty);
-    ctx.line_to(
-        tx - size * (angle - PI / 6.0).cos(),
-        ty - size * (angle - PI / 6.0).sin(),
-    );
-    ctx.line_to(
-        tx - size * (angle + PI / 6.0).cos(),
-        ty - size * (angle + PI / 6.0).sin(),
-    );
-    ctx.close_path();
-    ctx.fill();
-    ctx.restore();
-}
-
 fn fmt_edge_count(n: usize) -> String {
     if n > 99 {
         "99+".to_string()
     } else {
         n.to_string()
-    }
-}
-
-fn is_edge_visible(
-    edge: &PositionedEdge,
-    vis: &EdgeVisibility,
-    group_ancestors: &HashMap<String, Vec<String>>,
-    fn_parent: &HashMap<String, String>,
-) -> bool {
-    match edge.edge.kind {
-        EdgeKind::Import => {
-            if !vis.show_imports {
-                return false;
-            }
-            if vis.hidden_import_group_ids.is_empty() {
-                return true;
-            }
-            let check = |id: &str| {
-                if vis.hidden_import_group_ids.contains(id) {
-                    return true;
-                }
-                if let Some(anc) = group_ancestors.get(id) {
-                    return anc.iter().any(|a| vis.hidden_import_group_ids.contains(a));
-                }
-                false
-            };
-            !check(&edge.edge.source_id) && !check(&edge.edge.target_id)
-        }
-        EdgeKind::Call => {
-            if !vis.show_calls {
-                return false;
-            }
-            if vis.hidden_call_group_ids.is_empty() {
-                return true;
-            }
-            let check = |id: &str| {
-                let grp_id = fn_parent.get(id).map(String::as_str).unwrap_or(id);
-                if vis.hidden_call_group_ids.contains(grp_id) {
-                    return true;
-                }
-                if let Some(anc) = group_ancestors.get(grp_id) {
-                    return anc.iter().any(|a| vis.hidden_call_group_ids.contains(a));
-                }
-                false
-            };
-            !check(&edge.edge.source_id) && !check(&edge.edge.target_id)
-        }
     }
 }
 
@@ -192,9 +115,6 @@ fn render_canvas(
     viewport: Viewport,
     selected_id: Option<&str>,
     hovered_id: Option<&str>,
-    edge_vis: &EdgeVisibility,
-    group_ancestors: &HashMap<String, Vec<String>>,
-    fn_parent: &HashMap<String, String>,
     group_meta: &HashMap<String, String>,
     fn_counts: &HashMap<String, (usize, usize)>,
     edges_by_node: &HashMap<String, Vec<usize>>,
@@ -332,168 +252,7 @@ fn render_canvas(
         ctx.restore();
     }
 
-    // 2. Draw visible edges
-    let focus_id = hovered_id.or(selected_id);
-    let dash_arr = js_sys::Array::new();
-    dash_arr.push(&wasm_bindgen::JsValue::from_f64(6.0));
-    dash_arr.push(&wasm_bindgen::JsValue::from_f64(4.0));
-    let empty_dash = js_sys::Array::new();
-    let mut bg_edge_count = 0usize;
-    let mut connected_in_count = 0usize;
-    let mut connected_out_count = 0usize;
-    const MAX_BG_EDGES_PER_FRAME: usize = 400;
-    const MAX_CONNECTED_EDGES_PER_DIR: usize = 99;
-    let large_edge_graph = layout.edges.len() > 2000;
-
-    let draw_single_edge = |e: &PositionedEdge,
-                            connected: bool,
-                            dimmed: bool,
-                            ctx: &CanvasRenderingContext2d| {
-        let color = match e.edge.kind {
-            EdgeKind::Import => {
-                if connected {
-                    "#38bdf8"
-                } else if dimmed {
-                    "rgba(56, 189, 248, 0.12)"
-                } else {
-                    "rgba(56, 189, 248, 0.42)"
-                }
-            }
-            EdgeKind::Call => {
-                if connected {
-                    "#fbbf24"
-                } else if dimmed {
-                    "rgba(251, 191, 36, 0.10)"
-                } else {
-                    "rgba(251, 191, 36, 0.36)"
-                }
-            }
-        };
-
-        let dx = (e.x2 - e.x1).abs();
-        let dy = (e.y2 - e.y1).abs();
-        let (cx1, cy1, cx2, cy2) = if dx >= dy {
-            let off = (dx * 0.42).max(40.0);
-            let dir = if e.x2 >= e.x1 { 1.0 } else { -1.0 };
-            (e.x1 + off * dir, e.y1, e.x2 - off * dir, e.y2)
-        } else {
-            let off = (dy * 0.42).max(40.0);
-            let dir = if e.y2 >= e.y1 { 1.0 } else { -1.0 };
-            (e.x1, e.y1 + off * dir, e.x2, e.y2 - off * dir)
-        };
-
-        ctx.set_stroke_style_str(color);
-        ctx.set_line_width(if connected { 2.4 } else { 1.4 });
-        if e.edge.kind == EdgeKind::Import {
-            let _ = ctx.set_line_dash(&dash_arr);
-        } else {
-            let _ = ctx.set_line_dash(&empty_dash);
-        }
-        ctx.begin_path();
-        ctx.move_to(e.x1, e.y1);
-        ctx.bezier_curve_to(cx1, cy1, cx2, cy2, e.x2, e.y2);
-        ctx.stroke();
-
-        if !dimmed {
-            draw_arrow_head(ctx, cx2, cy2, e.x2, e.y2, if connected { 9.0 } else { 6.5 }, color);
-        }
-    };
-
-    if large_edge_graph {
-        if let Some(fid) = focus_id {
-            if let Some(indices) = edges_by_node.get(fid) {
-                for &idx in indices {
-                    let e = &layout.edges[idx];
-                    if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
-                        continue;
-                    }
-                    let is_in = e.edge.target_id == fid;
-                    if is_in {
-                        if connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                            continue;
-                        }
-                        connected_in_count += 1;
-                    } else {
-                        if connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                            continue;
-                        }
-                        connected_out_count += 1;
-                    }
-                    draw_single_edge(e, true, false, &ctx);
-                }
-            }
-        } else if lod == LodLevel::Micro {
-            for e in &layout.edges {
-                if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
-                    break;
-                }
-                let min_x = e.x1.min(e.x2) - 80.0;
-                let max_x = e.x1.max(e.x2) + 80.0;
-                let min_y = e.y1.min(e.y2) - 80.0;
-                let max_y = e.y1.max(e.y2) + 80.0;
-                if max_x < world_left
-                    || min_x > world_left + world_w
-                    || max_y < world_top
-                    || min_y > world_top + world_h
-                {
-                    continue;
-                }
-                if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
-                    continue;
-                }
-                bg_edge_count += 1;
-                draw_single_edge(e, false, false, &ctx);
-            }
-        }
-    } else {
-        for e in &layout.edges {
-            if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
-                continue;
-            }
-            let is_in = focus_id == Some(e.edge.target_id.as_str());
-            let is_out = focus_id == Some(e.edge.source_id.as_str());
-            let connected = is_in || is_out;
-            if connected {
-                if is_in && connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                    continue;
-                }
-                if is_out && connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
-                    continue;
-                }
-            } else {
-                if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
-                    continue;
-                }
-                if (e.x2 - e.x1).hypot(e.y2 - e.y1) * scale < 4.0 {
-                    continue;
-                }
-            }
-            let min_x = e.x1.min(e.x2) - 80.0;
-            let max_x = e.x1.max(e.x2) + 80.0;
-            let min_y = e.y1.min(e.y2) - 80.0;
-            let max_y = e.y1.max(e.y2) + 80.0;
-            if max_x < world_left
-                || min_x > world_left + world_w
-                || max_y < world_top
-                || min_y > world_top + world_h
-            {
-                continue;
-            }
-            if is_in {
-                connected_in_count += 1;
-            } else if is_out {
-                connected_out_count += 1;
-            } else {
-                bg_edge_count += 1;
-            }
-
-            let dimmed = focus_id.is_some() && !connected;
-            draw_single_edge(e, connected, dimmed, &ctx);
-        }
-    }
-    let _ = ctx.set_line_dash(&empty_dash);
-
-    // 3. Draw functions in world space
+    // 2. Draw functions in world space
     for fn_item in &layout.functions {
         let sw = fn_item.rect.width * scale;
         let sh = fn_item.rect.height * scale;
@@ -674,11 +433,8 @@ fn render_canvas(
         ctx.set_font("600 11.5px 'Inter', system-ui, sans-serif");
         let icon_pad = 19.0;
         let meta = group_meta.get(&g.node.id).map(String::as_str).unwrap_or("");
-        let show_edge_btns = matches!(g.node.kind, GroupKind::Directory | GroupKind::Module);
         let btn_reserve = if g.node.kind == GroupKind::Module {
-            82.0
-        } else if g.node.kind == GroupKind::Directory {
-            56.0
+            28.0
         } else {
             8.0
         };
@@ -729,68 +485,26 @@ fn render_canvas(
             let _ = ctx.fill_text(&clipped_meta, sx + 9.0 + icon_pad + name_w, sy + 16.0);
         }
 
-        // Icon buttons next to title pill (Import/Call toggles only for dir and file levels)
-        if show_edge_btns {
-            let mut bx = sx + pill_w + 6.0;
-            let btn_size = 22.0;
-
-            let imp_hidden = edge_vis.hidden_import_group_ids.contains(&g.node.id);
-            draw_icon_button(
-                &ctx,
-                bx,
-                sy + 1.0,
-                btn_size,
-                ButtonIcon::Import,
-                !imp_hidden,
-                "#38bdf8",
-            );
-            action_hits.push(ActionHit {
-                x: bx,
-                y: sy + 1.0,
-                w: btn_size,
-                h: btn_size,
-                kind: ActionKind::ToggleImport(g.node.id.clone()),
-            });
-            bx += btn_size + 4.0;
-
-            let call_hidden = edge_vis.hidden_call_group_ids.contains(&g.node.id);
-            draw_icon_button(
-                &ctx,
-                bx,
-                sy + 1.0,
-                btn_size,
-                ButtonIcon::Call,
-                !call_hidden,
-                "#fbbf24",
-            );
-            action_hits.push(ActionHit {
-                x: bx,
-                y: sy + 1.0,
-                w: btn_size,
-                h: btn_size,
-                kind: ActionKind::ToggleCall(g.node.id.clone()),
-            });
-            bx += btn_size + 4.0;
-
-            if g.node.kind == GroupKind::Module {
-                if let Some(fp) = &g.node.file_path {
-                    draw_icon_button(
-                        &ctx,
-                        bx,
-                        sy + 1.0,
-                        btn_size,
-                        ButtonIcon::OpenEditor,
-                        true,
-                        "#94a3b8",
-                    );
-                    action_hits.push(ActionHit {
-                        x: bx,
-                        y: sy + 1.0,
-                        w: btn_size,
-                        h: btn_size,
-                        kind: ActionKind::OpenEditor(fp.clone()),
-                    });
-                }
+        if g.node.kind == GroupKind::Module {
+            if let Some(fp) = &g.node.file_path {
+                let bx = sx + pill_w + 6.0;
+                let btn_size = 22.0;
+                draw_icon_button(
+                    &ctx,
+                    bx,
+                    sy + 1.0,
+                    btn_size,
+                    ButtonIcon::OpenEditor,
+                    true,
+                    "#94a3b8",
+                );
+                action_hits.push(ActionHit {
+                    x: bx,
+                    y: sy + 1.0,
+                    w: btn_size,
+                    h: btn_size,
+                    kind: ActionKind::OpenEditor(fp.clone()),
+                });
             }
         }
     }
@@ -883,8 +597,6 @@ fn render_canvas(
 
 #[derive(Clone, Copy)]
 enum ButtonIcon {
-    Import,
-    Call,
     OpenEditor,
 }
 
@@ -981,37 +693,6 @@ fn draw_icon_button(
     ctx.set_line_join("round");
     ctx.begin_path();
     match icon {
-        ButtonIcon::Import => {
-            // Git-branch style import icon
-            ctx.move_to(ix + s * 0.25, iy + s * 0.15);
-            ctx.line_to(ix + s * 0.25, iy + s * 0.72);
-            ctx.move_to(ix + s * 0.75, iy + s * 0.35);
-            let _ = ctx.quadratic_curve_to(
-                ix + s * 0.75,
-                iy + s * 0.72,
-                ix + s * 0.35,
-                iy + s * 0.72,
-            );
-            ctx.stroke();
-            ctx.begin_path();
-            let _ = ctx.arc(ix + s * 0.25, iy + s * 0.80, 1.6, 0.0, PI * 2.0);
-            ctx.stroke();
-            ctx.begin_path();
-            let _ = ctx.arc(ix + s * 0.75, iy + s * 0.22, 1.6, 0.0, PI * 2.0);
-        }
-        ButtonIcon::Call => {
-            // Arrow-curve call flow icon
-            ctx.move_to(ix + s * 0.15, iy + s * 0.75);
-            let _ = ctx.quadratic_curve_to(
-                ix + s * 0.15,
-                iy + s * 0.25,
-                ix + s * 0.82,
-                iy + s * 0.25,
-            );
-            ctx.move_to(ix + s * 0.60, iy + s * 0.06);
-            ctx.line_to(ix + s * 0.85, iy + s * 0.25);
-            ctx.line_to(ix + s * 0.60, iy + s * 0.44);
-        }
         ButtonIcon::OpenEditor => {
             // External link box + arrow
             ctx.move_to(ix + s * 0.45, iy + s * 0.15);
@@ -1057,10 +738,7 @@ pub fn CanvasView(
     viewport: RwSignal<Viewport>,
     selected_id: RwSignal<Option<String>>,
     hovered_id: RwSignal<Option<String>>,
-    edge_vis: Memo<EdgeVisibility>,
     review_overlay: Memo<ReviewOverlay>,
-    on_toggle_group_import: Callback<String>,
-    on_toggle_group_call: Callback<String>,
     on_open_in_editor: Callback<String>,
     on_focus_node: Callback<String>,
 ) -> impl IntoView {
@@ -1068,36 +746,6 @@ pub fn CanvasView(
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     let action_hits = Rc::new(RefCell::new(Vec::<ActionHit>::new()));
     let drag_state = Rc::new(RefCell::new(DragState::default()));
-
-    let group_ancestors = Memo::new(move |_| {
-        let l = layout.get();
-        let parent_map: HashMap<String, Option<String>> = l
-            .groups
-            .iter()
-            .map(|g| (g.node.id.clone(), g.node.parent_id.clone()))
-            .collect();
-        let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        for g in &l.groups {
-            let mut anc = Vec::new();
-            let mut cur = g.node.parent_id.clone();
-            while let Some(pid) = cur {
-                anc.push(pid.clone());
-                cur = parent_map.get(&pid).and_then(|x| x.clone());
-            }
-            out.insert(g.node.id.clone(), anc);
-        }
-        Arc::new(out)
-    });
-
-    let fn_parent = Memo::new(move |_| {
-        let l = layout.get();
-        Arc::new(
-            l.functions
-                .iter()
-                .map(|f| (f.node.id.clone(), f.node.parent_id.clone()))
-                .collect::<HashMap<String, String>>(),
-        )
-    });
 
     // ResizeObserver to keep canvas crisp on HiDPI
     Effect::new(move |_| {
@@ -1252,9 +900,6 @@ pub fn CanvasView(
         let vp = viewport.get();
         let sel = selected_id.get();
         let hov = hovered_id.get();
-        let ev = edge_vis.get();
-        let anc = group_ancestors.get();
-        let fp = fn_parent.get();
         let gm = group_meta.get();
         let fc = fn_counts.get();
         let ebn = edges_by_node.get();
@@ -1267,9 +912,6 @@ pub fn CanvasView(
             vp,
             sel.as_deref(),
             hov.as_deref(),
-            &ev,
-            &anc,
-            &fp,
             &gm,
             &fc,
             &ebn,
@@ -1381,8 +1023,6 @@ pub fn CanvasView(
             .map(|h| h.kind.clone())
         {
             match action {
-                ActionKind::ToggleImport(id) => on_toggle_group_import.run(id),
-                ActionKind::ToggleCall(id) => on_toggle_group_call.run(id),
                 ActionKind::OpenEditor(fp) => on_open_in_editor.run(fp),
             }
             return;
