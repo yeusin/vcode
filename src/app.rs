@@ -1124,7 +1124,7 @@ pub fn App() -> impl IntoView {
                                 </button>
                             </div>
                             <div class="review-refresh-row">
-                                <span class="review-lbl">"Auto"</span>
+                                <span class="review-lbl">"Auto-refresh PR"</span>
                                 {PR_REFRESH_PERIODS.iter().map(|&(label, ms)| {
                                     view! {
                                         <button
