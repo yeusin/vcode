@@ -19,7 +19,6 @@ pub struct ReviewOverlay {
     pub active: bool,
     pub changed_only: bool,
     pub changed_ids: HashSet<String>,
-    pub blast_radius_ids: HashSet<String>,
     pub diff_stats: HashMap<String, (usize, usize)>,
 }
 
@@ -187,8 +186,7 @@ fn render_canvas(
         let is_selected = selected_id == Some(g.node.id.as_str());
         let is_hovered = hovered_id == Some(g.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&g.node.id);
-        let is_blast = review.active && review.blast_radius_ids.contains(&g.node.id);
-        let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
+        let dimmed = review.active && review.changed_only && !is_changed;
 
         let (mut fill, mut stroke, radius) = match g.node.kind {
             GroupKind::Directory => (
@@ -232,13 +230,6 @@ fn render_canvas(
             } else if !is_hovered {
                 stroke = "#f59e0b";
             }
-        } else if is_blast {
-            if is_selected {
-                stroke = "#e879f9";
-                fill = "rgba(168, 85, 247, 0.14)";
-            } else if !is_hovered {
-                stroke = "#a855f7";
-            }
         }
 
         ctx.save();
@@ -250,8 +241,6 @@ fn render_canvas(
         ctx.fill();
         ctx.set_line_width(if is_selected || is_hovered || is_changed {
             2.2 / scale.sqrt()
-        } else if is_blast {
-            1.7 / scale.sqrt()
         } else {
             1.2 / scale.sqrt()
         });
@@ -273,13 +262,10 @@ fn render_canvas(
         let is_selected = selected_id == Some(fn_item.node.id.as_str());
         let is_hovered = hovered_id == Some(fn_item.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&fn_item.node.id);
-        let is_blast = review.active && review.blast_radius_ids.contains(&fn_item.node.id);
 
         if lod != LodLevel::Micro && sw < 16.0 && !is_selected && !is_hovered {
             ctx.set_fill_style_str(if is_changed {
                 "#f59e0b"
-            } else if is_blast {
-                "#a855f7"
             } else {
                 "#1e293b"
             });
@@ -291,7 +277,7 @@ fn render_canvas(
             );
             continue;
         }
-        let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
+        let dimmed = review.active && review.changed_only && !is_changed;
 
         ctx.save();
         if dimmed {
@@ -307,8 +293,6 @@ fn render_canvas(
         );
         ctx.set_fill_style_str(if is_selected && is_changed {
             "#2a1b0e"
-        } else if is_selected && is_blast {
-            "#251436"
         } else if is_selected {
             "#16233b"
         } else if is_hovered {
@@ -319,21 +303,17 @@ fn render_canvas(
         ctx.fill();
         ctx.set_line_width(if is_selected || is_changed {
             2.4
-        } else if is_hovered || is_blast {
+        } else if is_hovered {
             1.8
         } else {
             1.1
         });
         ctx.set_stroke_style_str(if is_selected && is_changed {
             "#fb923c"
-        } else if is_selected && is_blast {
-            "#e879f9"
         } else if is_selected {
             "#38bdf8"
         } else if is_changed {
             "#f59e0b"
-        } else if is_blast {
-            "#a855f7"
         } else if is_hovered {
             "#60a5fa"
         } else {

@@ -286,7 +286,6 @@ pub fn App() -> impl IntoView {
 
         let mut changed_ids = HashSet::new();
         let mut diff_stats: HashMap<String, (usize, usize)> = HashMap::new();
-        let mut blast_radius_ids = HashSet::new();
 
         graph.with(|g| {
             if let Some(diff) = &diff_opt {
@@ -322,22 +321,12 @@ pub fn App() -> impl IntoView {
                     }
                 }
             }
-
-            for e in &g.edges {
-                if changed_ids.contains(&e.source_id) && !changed_ids.contains(&e.target_id) {
-                    blast_radius_ids.insert(e.target_id.clone());
-                }
-                if changed_ids.contains(&e.target_id) && !changed_ids.contains(&e.source_id) {
-                    blast_radius_ids.insert(e.source_id.clone());
-                }
-            }
         });
 
         ReviewOverlay {
             active: true,
             changed_only: is_pr_loaded || review_changed_only.get(),
             changed_ids,
-            blast_radius_ids,
             diff_stats,
         }
     });
@@ -757,14 +746,14 @@ pub fn App() -> impl IntoView {
                                 "toggle-pill impact-pill"
                             }
                         }
-                        title="Dim unchanged code and highlight modified + blast-radius nodes (always on when a PR is loaded)"
+                        title="Dim unchanged code and highlight modified files/functions (always on when a PR is loaded)"
                         on:click=move |_| {
                             if diff_summary.get_untracked().and_then(|d| d.pr).is_none() {
                                 review_changed_only.update(|v| *v = !*v);
                             }
                         }
                     >
-                        "Changed + Impact"
+                        "Changed Only"
                     </button>
                     <div class="divider" />
                     <span class=move || {
@@ -1177,9 +1166,8 @@ pub fn App() -> impl IntoView {
                                                     String::new()
                                                 };
                                                 format!(
-                                                    "{} changed files · {} impacted nodes{}",
+                                                    "{} changed files{}",
                                                     d.files.len(),
-                                                    review_overlay.get().blast_radius_ids.len(),
                                                     auto_label
                                                 )
                                             }}
