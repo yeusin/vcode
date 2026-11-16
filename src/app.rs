@@ -185,7 +185,6 @@ pub fn App() -> impl IntoView {
     let pending_editor_file = RwSignal::new(Option::<String>::None);
 
     // Code Review & PR state
-    let review_open = RwSignal::new(false);
     let review_changed_only = RwSignal::new(false);
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let review_comments = RwSignal::new(Vec::<ReviewComment>::new());
@@ -208,13 +207,13 @@ pub fn App() -> impl IntoView {
     });
 
     let review_overlay = Memo::new(move |_| {
-        let active = review_open.get();
-        if !active {
-            return ReviewOverlay::default();
-        }
         let g = graph.get();
         let diff_opt = diff_summary.get();
         let comments = review_comments.get();
+        let is_pr_loaded = diff_opt
+            .as_ref()
+            .and_then(|d| d.pr.as_ref())
+            .is_some();
 
         let mut changed_ids = HashSet::new();
         let mut diff_stats: HashMap<String, (usize, usize)> = HashMap::new();
@@ -280,7 +279,7 @@ pub fn App() -> impl IntoView {
 
         ReviewOverlay {
             active: true,
-            changed_only: review_changed_only.get(),
+            changed_only: is_pr_loaded || review_changed_only.get(),
             changed_ids,
             blast_radius_ids,
             diff_stats,
@@ -420,6 +419,7 @@ pub fn App() -> impl IntoView {
                     graph.set(new_graph);
                     loading_label.set(None);
                     fit_to_view();
+                    refresh_local_review();
                     let _ = tauri_bridge::watch_project(&path).await;
                 }
                 Err(err) => {
@@ -587,26 +587,23 @@ pub fn App() -> impl IntoView {
                         "Calls"
                     </button>
                     <button
-                        class=move || if review_open.get() { "toggle-pill review-pill is-active" } else { "toggle-pill review-pill" }
+                        class=move || {
+                            let pr_loaded = diff_summary.get().and_then(|d| d.pr).is_some();
+                            if pr_loaded || review_changed_only.get() {
+                                "toggle-pill impact-pill is-active"
+                            } else {
+                                "toggle-pill impact-pill"
+                            }
+                        }
+                        title="Dim unchanged code and highlight modified + blast-radius nodes (always on when a PR is loaded)"
                         on:click=move |_| {
-                            let next = !review_open.get_untracked();
-                            review_open.set(next);
-                            if next {
-                                refresh_local_review();
+                            if diff_summary.get_untracked().and_then(|d| d.pr).is_none() {
+                                review_changed_only.update(|v| *v = !*v);
                             }
                         }
                     >
-                        "Review"
+                        "Changed + Impact"
                     </button>
-                    <Show when=move || review_open.get()>
-                        <button
-                            class=move || if review_changed_only.get() { "toggle-pill impact-pill is-active" } else { "toggle-pill impact-pill" }
-                            title="Dim unchanged code and highlight modified + blast-radius nodes"
-                            on:click=move |_| review_changed_only.update(|v| *v = !*v)
-                        >
-                            "Changed + Impact"
-                        </button>
-                    </Show>
                     <div class="divider" />
                     <span class=move || {
                         let lod = LodLevel::from_scale(viewport.get().scale);
@@ -910,12 +907,10 @@ pub fn App() -> impl IntoView {
                     }}
                 </main>
 
-                <Show when=move || review_open.get()>
-                    <aside class="review-panel">
-                        <div class="review-header">
-                            <span class="review-title">"Code Review"</span>
-                            <button class="btn btn-ghost" on:click=move |_| review_open.set(false)>"✕"</button>
-                        </div>
+                <aside class="review-panel">
+                    <div class="review-header">
+                        <span class="review-title">"Code Review"</span>
+                    </div>
 
                         <div class="review-controls">
                             <div class="review-row">
@@ -959,6 +954,7 @@ pub fn App() -> impl IntoView {
                                             match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
                                                 Ok((pr_diff, remote_comments)) => {
                                                     diff_summary.set(Some(pr_diff));
+                                                    review_changed_only.set(true);
                                                     let mut local = tauri_bridge::load_review_comments(&proj).await.unwrap_or_default();
                                                     for rc in remote_comments {
                                                         if !local.iter().any(|c| c.remote_id.is_some() && c.remote_id == rc.remote_id) {
@@ -1235,7 +1231,6 @@ pub fn App() -> impl IntoView {
                             }}
                         </div>
                     </aside>
-                </Show>
             </div>
 
             <Show when=move || settings_open.get()>
