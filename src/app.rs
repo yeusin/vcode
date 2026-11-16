@@ -1438,7 +1438,7 @@ pub fn App() -> impl IntoView {
                                     <div class="diff-hunk-box">
                                         <div class="diff-file-hdr">{fd.file_path}</div>
                                         {fd.hunks.into_iter().filter_map(|h| {
-                                            let diff_lines: Vec<_> = h.lines.into_iter().filter(|ln| ln.kind != "context").collect();
+                                            let diff_lines: Vec<_> = h.lines.into_iter().filter(|ln| ln.kind != "context").take(200).collect();
                                             if diff_lines.is_empty() {
                                                 return None;
                                             }

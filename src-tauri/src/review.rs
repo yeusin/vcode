@@ -83,6 +83,8 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((os, ol, ns, nl))
 }
 
+const MAX_DIFF_LINES_PER_FILE: usize = 1500;
+
 pub fn parse_hunks_from_patch(patch: &str) -> (Vec<DiffHunk>, usize, usize) {
     let mut hunks = Vec::new();
     let mut current: Option<DiffHunk> = None;
@@ -90,11 +92,17 @@ pub fn parse_hunks_from_patch(patch: &str) -> (Vec<DiffHunk>, usize, usize) {
     let mut new_ln = 0usize;
     let mut additions = 0usize;
     let mut deletions = 0usize;
+    let mut stored_lines = 0usize;
+    let mut truncated = false;
 
     for raw in patch.lines() {
         if raw.starts_with("@@ ") {
             if let Some(h) = current.take() {
                 hunks.push(h);
+            }
+            if stored_lines >= MAX_DIFF_LINES_PER_FILE {
+                truncated = true;
+                continue;
             }
             if let Some((os, ol, ns, nl)) = parse_hunk_header(raw) {
                 old_ln = os;
@@ -109,40 +117,75 @@ pub fn parse_hunks_from_patch(patch: &str) -> (Vec<DiffHunk>, usize, usize) {
             }
             continue;
         }
-        let Some(h) = current.as_mut() else {
-            continue;
-        };
         if let Some(text) = raw.strip_prefix('+') {
             additions += 1;
-            h.lines.push(DiffLine {
-                kind: "add".to_string(),
-                old_line: None,
-                new_line: Some(new_ln),
-                text: text.to_string(),
-            });
+            if let Some(h) = current.as_mut() {
+                if stored_lines < MAX_DIFF_LINES_PER_FILE {
+                    h.lines.push(DiffLine {
+                        kind: "add".to_string(),
+                        old_line: None,
+                        new_line: Some(new_ln),
+                        text: text.to_string(),
+                    });
+                    stored_lines += 1;
+                } else {
+                    truncated = true;
+                }
+            }
             new_ln += 1;
         } else if let Some(text) = raw.strip_prefix('-') {
             deletions += 1;
-            h.lines.push(DiffLine {
-                kind: "del".to_string(),
-                old_line: Some(old_ln),
-                new_line: None,
-                text: text.to_string(),
-            });
+            if let Some(h) = current.as_mut() {
+                if stored_lines < MAX_DIFF_LINES_PER_FILE {
+                    h.lines.push(DiffLine {
+                        kind: "del".to_string(),
+                        old_line: Some(old_ln),
+                        new_line: None,
+                        text: text.to_string(),
+                    });
+                    stored_lines += 1;
+                } else {
+                    truncated = true;
+                }
+            }
             old_ln += 1;
         } else if let Some(text) = raw.strip_prefix(' ') {
-            h.lines.push(DiffLine {
-                kind: "context".to_string(),
-                old_line: Some(old_ln),
-                new_line: Some(new_ln),
-                text: text.to_string(),
-            });
+            if let Some(h) = current.as_mut() {
+                if stored_lines < MAX_DIFF_LINES_PER_FILE {
+                    h.lines.push(DiffLine {
+                        kind: "context".to_string(),
+                        old_line: Some(old_ln),
+                        new_line: Some(new_ln),
+                        text: text.to_string(),
+                    });
+                    stored_lines += 1;
+                } else {
+                    truncated = true;
+                }
+            }
             old_ln += 1;
             new_ln += 1;
         }
     }
-    if let Some(h) = current {
+    if let Some(mut h) = current {
+        if truncated {
+            h.lines.push(DiffLine {
+                kind: "context".to_string(),
+                old_line: None,
+                new_line: None,
+                text: format!("... diff truncated (showing first {MAX_DIFF_LINES_PER_FILE} lines) ..."),
+            });
+        }
         hunks.push(h);
+    } else if truncated {
+        if let Some(last) = hunks.last_mut() {
+            last.lines.push(DiffLine {
+                kind: "context".to_string(),
+                old_line: None,
+                new_line: None,
+                text: format!("... diff truncated (showing first {MAX_DIFF_LINES_PER_FILE} lines) ..."),
+            });
+        }
     }
     (hunks, additions, deletions)
 }
@@ -721,5 +764,18 @@ index 111..222 100644
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(files[0].hunks[0].new_start, 10);
         assert_eq!(files[0].hunks[0].lines.len(), 4);
+    }
+
+    #[test]
+    fn truncates_huge_diffs_while_preserving_counts() {
+        let mut patch = String::from("@@ -1,1 +1,35000 @@\n");
+        for i in 0..35_000 {
+            patch.push_str(&format!("+line {i}\n"));
+        }
+        let (hunks, adds, dels) = parse_hunks_from_patch(&patch);
+        assert_eq!(adds, 35_000);
+        assert_eq!(dels, 0);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), MAX_DIFF_LINES_PER_FILE + 1);
     }
 }
