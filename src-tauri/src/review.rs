@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -61,27 +60,6 @@ pub struct GitDiffSummary {
     pub base_ref: String,
     pub files: Vec<FileDiff>,
     pub pr: Option<PrInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReviewComment {
-    pub id: String,
-    pub file_path: String,
-    pub line: usize,
-    pub node_id: Option<String>,
-    pub author: String,
-    pub body: String,
-    pub status: String, // "open" | "resolved"
-    pub created_at: u64,
-    pub remote_id: Option<u64>,
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
@@ -309,88 +287,6 @@ pub fn get_git_diff(project_path: &str, base_ref: Option<String>) -> Result<GitD
     })
 }
 
-fn reviews_file(settings_dir: &Path) -> PathBuf {
-    settings_dir.join("reviews.json")
-}
-
-pub fn load_review_comments_in_dir(settings_dir: &Path) -> Result<Vec<ReviewComment>, String> {
-    let file = reviews_file(settings_dir);
-    if !file.is_file() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(&file)
-        .map_err(|e| format!("Failed to read reviews {}: {e}", file.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse reviews: {e}"))
-}
-
-pub fn save_review_comments_in_dir(
-    settings_dir: &Path,
-    comments: &[ReviewComment],
-) -> Result<(), String> {
-    fs::create_dir_all(settings_dir).map_err(|e| format!("Failed to create dir: {e}"))?;
-    let file = reviews_file(settings_dir);
-    let json = serde_json::to_string_pretty(comments)
-        .map_err(|e| format!("Failed to serialize reviews: {e}"))?;
-    fs::write(&file, json).map_err(|e| format!("Failed to write reviews: {e}"))
-}
-
-pub fn add_review_comment_in_dir(
-    settings_dir: &Path,
-    file_path: String,
-    line: usize,
-    node_id: Option<String>,
-    author: String,
-    body: String,
-    remote_id: Option<u64>,
-) -> Result<Vec<ReviewComment>, String> {
-    let mut list = load_review_comments_in_dir(settings_dir)?;
-    let ts = now_secs();
-    let id = format!("rev-{ts}-{}", list.len() + 1);
-    list.push(ReviewComment {
-        id,
-        file_path,
-        line,
-        node_id,
-        author: if author.trim().is_empty() {
-            "reviewer".to_string()
-        } else {
-            author
-        },
-        body,
-        status: "open".to_string(),
-        created_at: ts,
-        remote_id,
-    });
-    save_review_comments_in_dir(settings_dir, &list)?;
-    Ok(list)
-}
-
-pub fn toggle_resolve_comment_in_dir(
-    settings_dir: &Path,
-    comment_id: &str,
-) -> Result<Vec<ReviewComment>, String> {
-    let mut list = load_review_comments_in_dir(settings_dir)?;
-    if let Some(c) = list.iter_mut().find(|c| c.id == comment_id) {
-        c.status = if c.status == "resolved" {
-            "open".to_string()
-        } else {
-            "resolved".to_string()
-        };
-    }
-    save_review_comments_in_dir(settings_dir, &list)?;
-    Ok(list)
-}
-
-pub fn delete_review_comment_in_dir(
-    settings_dir: &Path,
-    comment_id: &str,
-) -> Result<Vec<ReviewComment>, String> {
-    let mut list = load_review_comments_in_dir(settings_dir)?;
-    list.retain(|c| c.id != comment_id);
-    save_review_comments_in_dir(settings_dir, &list)?;
-    Ok(list)
-}
-
 enum ParsedPrTarget {
     GitHub {
         owner: String,
@@ -569,7 +465,7 @@ pub async fn fetch_pr_review(
     project_path: &str,
     pr_url_or_number: &str,
     token: Option<String>,
-) -> Result<(GitDiffSummary, Vec<ReviewComment>), String> {
+) -> Result<GitDiffSummary, String> {
     let root = Path::new(project_path);
     let target = resolve_pr_target(root, pr_url_or_number)?;
     let tok = resolve_token(&target, token);
@@ -602,7 +498,7 @@ pub async fn fetch_pr_review(
                 Err(api_err) => {
                     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{number}");
                     if let Ok(cli_diff) = fetch_pr_via_cli(root, "github", number, pr_url) {
-                        return Ok((cli_diff, Vec::new()));
+                        return Ok(cli_diff);
                     }
                     return Err(api_err);
                 }
@@ -650,57 +546,20 @@ pub async fn fetch_pr_review(
                 });
             }
 
-            let mut c_req = client.get(format!("{api_base}/comments?per_page=100"));
-            if let Some(t) = &tok {
-                c_req = c_req.bearer_auth(t);
-            }
-            let mut comments = Vec::new();
-            if let Ok(resp) = c_req.send().await {
-                if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
-                    for c in arr {
-                        let cid = c["id"].as_u64();
-                        let path = c["path"].as_str().unwrap_or("").to_string();
-                        let line = c["line"]
-                            .as_u64()
-                            .or_else(|| c["original_line"].as_u64())
-                            .unwrap_or(1) as usize;
-                        let author = c["user"]["login"]
-                            .as_str()
-                            .unwrap_or("github")
-                            .to_string();
-                        let body = c["body"].as_str().unwrap_or("").to_string();
-                        comments.push(ReviewComment {
-                            id: format!("gh-{}", cid.unwrap_or(0)),
-                            file_path: path,
-                            line,
-                            node_id: None,
-                            author,
-                            body,
-                            status: "open".to_string(),
-                            created_at: now_secs(),
-                            remote_id: cid,
-                        });
-                    }
-                }
-            }
-
-            Ok((
-                GitDiffSummary {
-                    branch: head_branch.clone(),
-                    base_ref: base_branch.clone(),
-                    files,
-                    pr: Some(PrInfo {
-                        provider: "github".to_string(),
-                        number,
-                        title,
-                        url,
-                        base_branch,
-                        head_branch,
-                        head_sha,
-                    }),
-                },
-                comments,
-            ))
+            Ok(GitDiffSummary {
+                branch: head_branch.clone(),
+                base_ref: base_branch.clone(),
+                files,
+                pr: Some(PrInfo {
+                    provider: "github".to_string(),
+                    number,
+                    title,
+                    url,
+                    base_branch,
+                    head_branch,
+                    head_sha,
+                }),
+            })
         }
         ParsedPrTarget::GitLab {
             host,
@@ -726,7 +585,7 @@ pub async fn fetch_pr_review(
                 Err(api_err) => {
                     let mr_url = format!("https://{host}/{proj}/-/merge_requests/{iid}");
                     if let Ok(cli_diff) = fetch_pr_via_cli(root, "gitlab", iid, mr_url) {
-                        return Ok((cli_diff, Vec::new()));
+                        return Ok(cli_diff);
                     }
                     return Err(api_err);
                 }
@@ -779,23 +638,20 @@ pub async fn fetch_pr_review(
                 }
             }
 
-            Ok((
-                GitDiffSummary {
-                    branch: head_branch.clone(),
-                    base_ref: base_branch.clone(),
-                    files,
-                    pr: Some(PrInfo {
-                        provider: "gitlab".to_string(),
-                        number: iid,
-                        title,
-                        url,
-                        base_branch,
-                        head_branch,
-                        head_sha,
-                    }),
-                },
-                Vec::new(),
-            ))
+            Ok(GitDiffSummary {
+                branch: head_branch.clone(),
+                base_ref: base_branch.clone(),
+                files,
+                pr: Some(PrInfo {
+                    provider: "gitlab".to_string(),
+                    number: iid,
+                    title,
+                    url,
+                    base_branch,
+                    head_branch,
+                    head_sha,
+                }),
+            })
         }
     }
 }
@@ -825,31 +681,5 @@ index 111..222 100644
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(files[0].hunks[0].new_start, 10);
         assert_eq!(files[0].hunks[0].lines.len(), 4);
-    }
-
-    #[test]
-    fn saves_resolves_and_deletes_review_comments() {
-        let dir = std::env::temp_dir().join("vcode_review_test_dir");
-        let _ = fs::remove_dir_all(&dir);
-        let list = add_review_comment_in_dir(
-            &dir,
-            "src/main.rs".to_string(),
-            12,
-            Some("fn:main".to_string()),
-            "alice".to_string(),
-            "Check error handling".to_string(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].status, "open");
-        let cid = list[0].id.clone();
-
-        let resolved = toggle_resolve_comment_in_dir(&dir, &cid).unwrap();
-        assert_eq!(resolved[0].status, "resolved");
-
-        let after_del = delete_review_comment_in_dir(&dir, &cid).unwrap();
-        assert!(after_del.is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 }

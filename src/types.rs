@@ -266,17 +266,3 @@ pub struct GitDiffSummary {
     pub files: Vec<FileDiff>,
     pub pr: Option<PrInfo>,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReviewComment {
-    pub id: String,
-    pub file_path: String,
-    pub line: usize,
-    pub node_id: Option<String>,
-    pub author: String,
-    pub body: String,
-    pub status: String,
-    pub created_at: u64,
-    pub remote_id: Option<u64>,
-}

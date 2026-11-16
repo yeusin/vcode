@@ -9,7 +9,7 @@ use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
     DiffStatus, EdgeVisibility, FunctionNode, GitDiffSummary, GroupKind, GroupNode, LodLevel,
-    ProjectGraph, ProjectSettings, RecentProject, ReviewComment, Viewport,
+    ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
@@ -187,7 +187,6 @@ pub fn App() -> impl IntoView {
     // Code Review & PR state
     let review_changed_only = RwSignal::new(false);
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
-    let review_comments = RwSignal::new(Vec::<ReviewComment>::new());
     let git_base_ref = RwSignal::new("HEAD".to_string());
     let pr_input = RwSignal::new(String::new());
     let git_token = RwSignal::new(
@@ -195,8 +194,6 @@ pub fn App() -> impl IntoView {
     );
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
-    let comment_line_input = RwSignal::new(1usize);
-    let comment_body_input = RwSignal::new(String::new());
 
     let layout = Memo::new(move |_| compute_layout(&graph.get()));
     let edge_vis = Memo::new(move |_| EdgeVisibility {
@@ -209,7 +206,6 @@ pub fn App() -> impl IntoView {
     let review_overlay = Memo::new(move |_| {
         let g = graph.get();
         let diff_opt = diff_summary.get();
-        let comments = review_comments.get();
         let is_pr_loaded = diff_opt
             .as_ref()
             .and_then(|d| d.pr.as_ref())
@@ -268,22 +264,12 @@ pub fn App() -> impl IntoView {
             }
         }
 
-        let mut comment_counts: HashMap<String, usize> = HashMap::new();
-        for c in &comments {
-            if c.status == "open" {
-                if let Some(nid) = &c.node_id {
-                    *comment_counts.entry(nid.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-
         ReviewOverlay {
             active: true,
             changed_only: is_pr_loaded || review_changed_only.get(),
             changed_ids,
             blast_radius_ids,
             diff_stats,
-            comment_counts,
         }
     });
 
@@ -304,9 +290,6 @@ pub fn App() -> impl IntoView {
             match tauri_bridge::get_git_diff(&proj, base_opt).await {
                 Ok(d) => diff_summary.set(Some(d)),
                 Err(e) => review_error.set(Some(e)),
-            }
-            if let Ok(comments) = tauri_bridge::load_review_comments(&proj).await {
-                review_comments.set(comments);
             }
             review_busy.set(false);
         });
@@ -952,16 +935,9 @@ pub fn App() -> impl IntoView {
                                         spawn_local(async move {
                                             let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
                                             match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
-                                                Ok((pr_diff, remote_comments)) => {
+                                                Ok(pr_diff) => {
                                                     diff_summary.set(Some(pr_diff));
                                                     review_changed_only.set(true);
-                                                    let mut local = tauri_bridge::load_review_comments(&proj).await.unwrap_or_default();
-                                                    for rc in remote_comments {
-                                                        if !local.iter().any(|c| c.remote_id.is_some() && c.remote_id == rc.remote_id) {
-                                                            local.push(rc);
-                                                        }
-                                                    }
-                                                    review_comments.set(local);
                                                 }
                                                 Err(e) => review_error.set(Some(e)),
                                             }
@@ -1098,11 +1074,7 @@ pub fn App() -> impl IntoView {
                                                         _ => " ",
                                                     };
                                                     view! {
-                                                        <div
-                                                            class=cls
-                                                            title="Click to comment on this line"
-                                                            on:click=move |_| comment_line_input.set(lno)
-                                                        >
+                                                        <div class=cls>
                                                             <span class="diff-ln">{lno}</span>
                                                             <span class="diff-sig">{prefix}</span>
                                                             <span class="diff-txt">{ln.text}</span>
@@ -1113,121 +1085,6 @@ pub fn App() -> impl IntoView {
                                         }).collect_view()}
                                     </div>
                                 }.into_any()
-                            }}
-
-                            <div class="review-section-title">"Comments"</div>
-                            <div class="review-comment-form">
-                                <div class="review-row">
-                                    <label class="review-lbl">"Line"</label>
-                                    <input
-                                        class="review-input review-line-input"
-                                        type="number"
-                                        min="1"
-                                        prop:value=move || comment_line_input.get().to_string()
-                                        on:input=move |ev| {
-                                            if let Ok(n) = event_target_value(&ev).parse::<usize>() {
-                                                comment_line_input.set(n.max(1));
-                                            }
-                                        }
-                                    />
-                                </div>
-                                <textarea
-                                    class="review-textarea"
-                                    rows="2"
-                                    placeholder="Write a review comment..."
-                                    prop:value=move || comment_body_input.get()
-                                    on:input=move |ev| comment_body_input.set(event_target_value(&ev))
-                                />
-                                <div class="review-row">
-                                    <button
-                                        class="btn btn-primary"
-                                        on:click=move |_| {
-                                            let proj = graph.get_untracked().root_path;
-                                            let body = comment_body_input.get_untracked();
-                                            if proj.is_empty() || proj.starts_with("sample://") || body.trim().is_empty() {
-                                                return;
-                                            }
-                                            let sel = selected_id.get_untracked();
-                                            let g = graph.get_untracked();
-                                            let file_path = sel.as_deref().and_then(|sid| {
-                                                g.functions.iter().find(|f| f.id == sid).map(|f| f.file_path.clone())
-                                                    .or_else(|| g.groups.iter().find(|grp| grp.id == sid).and_then(|grp| grp.file_path.clone()))
-                                            }).or_else(|| diff_summary.get_untracked().and_then(|d| d.files.first().map(|f| f.file_path.clone())))
-                                            .unwrap_or_else(|| "project".to_string());
-                                            let rel_path = file_path.strip_prefix(&format!("{proj}/")).unwrap_or(&file_path).to_string();
-                                            let line = comment_line_input.get_untracked();
-                                            spawn_local(async move {
-                                                match tauri_bridge::add_review_comment(&proj, &rel_path, line, sel.as_deref(), "reviewer", &body).await {
-                                                    Ok(list) => {
-                                                        review_comments.set(list);
-                                                        comment_body_input.set(String::new());
-                                                    }
-                                                    Err(e) => review_error.set(Some(e)),
-                                                }
-                                            });
-                                        }
-                                    >
-                                        "Add Comment"
-                                    </button>
-                                </div>
-                            </div>
-
-                            {move || {
-                                review_comments.get().into_iter().map(|c| {
-                                    let cid_res = c.id.clone();
-                                    let cid_del = c.id.clone();
-                                    let nid = c.node_id.clone();
-                                    let is_resolved = c.status == "resolved";
-                                    view! {
-                                        <div
-                                            class=if is_resolved { "review-comment is-resolved" } else { "review-comment" }
-                                            on:click=move |_| {
-                                                if let Some(id) = &nid {
-                                                    selected_id.set(Some(id.clone()));
-                                                    focus_node.run(id.clone());
-                                                }
-                                            }
-                                        >
-                                            <div class="review-comment-hdr">
-                                                <span class="review-comment-loc">{format!("{}:{}", c.file_path, c.line)}</span>
-                                                <span class="review-comment-author">{c.author}</span>
-                                            </div>
-                                            <div class="review-comment-body">{c.body}</div>
-                                            <div class="review-comment-actions">
-                                                <button
-                                                    class="btn btn-ghost"
-                                                    on:click=move |ev| {
-                                                        ev.stop_propagation();
-                                                        let proj = graph.get_untracked().root_path;
-                                                        let id = cid_res.clone();
-                                                        spawn_local(async move {
-                                                            if let Ok(list) = tauri_bridge::toggle_resolve_comment(&proj, &id).await {
-                                                                review_comments.set(list);
-                                                            }
-                                                        });
-                                                    }
-                                                >
-                                                    {if is_resolved { "Reopen" } else { "Resolve" }}
-                                                </button>
-                                                <button
-                                                    class="btn btn-ghost"
-                                                    on:click=move |ev| {
-                                                        ev.stop_propagation();
-                                                        let proj = graph.get_untracked().root_path;
-                                                        let id = cid_del.clone();
-                                                        spawn_local(async move {
-                                                            if let Ok(list) = tauri_bridge::delete_review_comment(&proj, &id).await {
-                                                                review_comments.set(list);
-                                                            }
-                                                        });
-                                                    }
-                                                >
-                                                    "Delete"
-                                                </button>
-                                            </div>
-                                        </div>
-                                    }
-                                }).collect_view()
                             }}
                         </div>
                     </aside>

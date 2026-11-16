@@ -21,7 +21,6 @@ pub struct ReviewOverlay {
     pub changed_ids: HashSet<String>,
     pub blast_radius_ids: HashSet<String>,
     pub diff_stats: HashMap<String, (usize, usize)>,
-    pub comment_counts: HashMap<String, usize>,
 }
 
 #[derive(Clone)]
