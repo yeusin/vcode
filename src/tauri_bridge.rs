@@ -286,3 +286,10 @@ struct CloneRepoArgs<'a> {
 pub async fn clone_github_repo(repo_url: &str, token: Option<&str>) -> Result<String, String> {
     invoke("clone_github_repo", &CloneRepoArgs { repo_url, token }).await
 }
+
+pub async fn get_launch_target() -> Option<String> {
+    invoke::<_, Option<String>>("get_launch_target", &EmptyArgs {})
+        .await
+        .ok()
+        .flatten()
+}

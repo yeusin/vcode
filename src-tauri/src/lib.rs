@@ -600,6 +600,39 @@ async fn clone_github_repo(repo_url: String, token: Option<String>) -> Result<St
     review::clone_github_repo(&repo_url, token).await
 }
 
+fn resolve_cli_target_arg(args: &[String], cwd: &Path) -> Option<String> {
+    let raw = args
+        .iter()
+        .skip(1)
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && !s.starts_with('-'))?;
+    if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("git@") {
+        return Some(raw.to_string());
+    }
+    let p = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        cwd.join(raw)
+    };
+    let dir = if p.is_file() {
+        p.parent().map(Path::to_path_buf).unwrap_or(p)
+    } else {
+        p
+    };
+    if !dir.is_dir() {
+        return None;
+    }
+    let resolved = fs::canonicalize(&dir).unwrap_or(dir);
+    Some(resolved.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn get_launch_target() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let cwd = std::env::current_dir().ok()?;
+    resolve_cli_target_arg(&args, &cwd)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -619,7 +652,8 @@ pub fn run() {
             set_window_title,
             get_git_diff,
             fetch_pr_review,
-            clone_github_repo
+            clone_github_repo,
+            get_launch_target
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -712,6 +746,28 @@ mod tests {
         assert_eq!(
             super::compute_snap_rect(0, 24, 1920, 1056, "left-third").unwrap(),
             (0, 24, 640, 1056)
+        );
+    }
+
+    #[test]
+    fn resolves_cli_target_paths_and_urls() {
+        let cwd = std::env::current_dir().unwrap();
+        let dot = super::resolve_cli_target_arg(
+            &["vcode".to_string(), "-psn_0_1".to_string(), ".".to_string()],
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(std::path::PathBuf::from(dot), fs::canonicalize(&cwd).unwrap());
+
+        let pr_url = "https://github.com/yeusin/vcode/pull/12";
+        assert_eq!(
+            super::resolve_cli_target_arg(&["vcode".to_string(), pr_url.to_string()], &cwd),
+            Some(pr_url.to_string())
+        );
+
+        assert_eq!(
+            super::resolve_cli_target_arg(&["vcode".to_string()], &cwd),
+            None
         );
     }
 }

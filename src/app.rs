@@ -883,12 +883,37 @@ pub fn App() -> impl IntoView {
             if let Some(proj_path) = initial_from_query {
                 open_project(proj_path);
             } else {
-                let recent = load_recent_projects();
-                if let Some(first) = recent.first() {
-                    open_project(first.path.clone());
-                } else {
-                    fit_to_view();
-                }
+                spawn_local(async move {
+                    if let Some(target) = tauri_bridge::get_launch_target().await {
+                        if is_pr_target(&target) {
+                            refresh_pr_review(target);
+                        } else if target.starts_with("http://")
+                            || target.starts_with("https://")
+                            || target.starts_with("git@")
+                        {
+                            loading_label.set(Some(format!("Cloning {target}...")));
+                            analyze_progress.set(None);
+                            let tok = git_token.get_untracked();
+                            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                            match tauri_bridge::clone_github_repo(&target, tok_opt).await {
+                                Ok(path) => open_project(path),
+                                Err(err) => {
+                                    loading_label.set(None);
+                                    error_banner.set(Some(err));
+                                }
+                            }
+                        } else {
+                            open_project(target);
+                        }
+                    } else {
+                        let recent = load_recent_projects();
+                        if let Some(first) = recent.first() {
+                            open_project(first.path.clone());
+                        } else {
+                            fit_to_view();
+                        }
+                    }
+                });
             }
         } else {
             fit_to_view();
