@@ -108,25 +108,28 @@ fn project_settings_file(project_path: &str) -> Result<PathBuf, String> {
 async fn analyze_project(
     app: AppHandle,
     project_path: String,
-) -> Result<analyzer::ProjectGraph, String> {
+) -> Result<tauri::ipc::Response, String> {
     let path = PathBuf::from(&project_path);
     if !path.is_dir() {
         return Err(format!("Selected path is not a directory: {project_path}"));
     }
-    tauri::async_runtime::spawn_blocking(move || {
+    let graph = tauri::async_runtime::spawn_blocking(move || {
         analyzer::analyze_project_with_progress(&path, |progress| {
             let _ = app.emit("analyze-progress", &progress);
         })
     })
     .await
-    .map_err(|e| format!("Analyzer task failed: {e}"))?
+    .map_err(|e| format!("Analyzer task failed: {e}"))??;
+    let bytes = serde_json::to_vec(&graph)
+        .map_err(|e| format!("Failed to serialize project graph: {e}"))?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 #[tauri::command]
 async fn analyze_python_project(
     app: AppHandle,
     project_path: String,
-) -> Result<analyzer::ProjectGraph, String> {
+) -> Result<tauri::ipc::Response, String> {
     analyze_project(app, project_path).await
 }
 

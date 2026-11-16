@@ -37,7 +37,7 @@ pub fn is_tauri_available() -> bool {
     tauri_namespace("core").is_ok()
 }
 
-pub async fn invoke<A: Serialize, R: DeserializeOwned>(cmd: &str, args: &A) -> Result<R, String> {
+async fn invoke_raw<A: Serialize>(cmd: &str, args: &A) -> Result<JsValue, String> {
     let core = tauri_namespace("core")?;
     let invoke_fn = Reflect::get(&core, &JsValue::from_str("invoke"))
         .map_err(|_| "Tauri invoke not found".to_string())?;
@@ -52,7 +52,11 @@ pub async fn invoke<A: Serialize, R: DeserializeOwned>(cmd: &str, args: &A) -> R
     let promise: Promise = promise_val
         .dyn_into()
         .map_err(|_| "Tauri invoke did not return a Promise".to_string())?;
-    let result = JsFuture::from(promise).await.map_err(js_err_msg)?;
+    JsFuture::from(promise).await.map_err(js_err_msg)
+}
+
+pub async fn invoke<A: Serialize, R: DeserializeOwned>(cmd: &str, args: &A) -> Result<R, String> {
+    let result = invoke_raw(cmd, args).await?;
     serde_wasm_bindgen::from_value(result)
         .map_err(|e| format!("Failed to deserialize response for '{cmd}': {e}"))
 }
@@ -138,7 +142,10 @@ pub async fn pick_project_folder() -> Result<Option<String>, String> {
 }
 
 pub async fn analyze_project(project_path: &str) -> Result<ProjectGraph, String> {
-    invoke("analyze_project", &ProjectPathArgs { project_path }).await
+    let raw = invoke_raw("analyze_project", &ProjectPathArgs { project_path }).await?;
+    let bytes = js_sys::Uint8Array::new(&raw).to_vec();
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Failed to parse project graph JSON: {e}"))
 }
 
 pub async fn watch_project(project_path: &str) -> Result<(), String> {
