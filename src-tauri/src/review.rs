@@ -231,7 +231,7 @@ pub fn get_git_diff(project_path: &str, base_ref: Option<String>) -> Result<GitD
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "HEAD".to_string());
 
-    let diff_out = run_git(root, &["diff", "--unified=3", "--no-color", &base])?;
+    let diff_out = run_git(root, &["diff", "--unified=100", "--no-color", &base])?;
     let mut files = parse_unified_diff(root, &diff_out);
 
     // Include untracked files when diffing against working tree HEAD
