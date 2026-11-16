@@ -19,6 +19,8 @@ pub struct ProjectSettings {
     pub hidden_import_group_ids: Vec<String>,
     pub hidden_call_group_ids: Vec<String>,
     pub editor_command: String,
+    #[serde(default)]
+    pub open_in_terminal: bool,
 }
 
 struct ActiveWatcher {
@@ -273,13 +275,146 @@ fn build_editor_invocation(editor_command: &str, file_path: &str) -> Result<(Str
     Ok((program, args))
 }
 
+fn resolve_editor_binary(program: &str) -> String {
+    if program.contains('/') || program.contains('\\') {
+        return program.to_string();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let hp = PathBuf::from(home);
+        for sub in [".local/bin", "bin", ".cargo/bin"] {
+            let candidate = hp.join(sub).join(program);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    for dir in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/snap/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ] {
+        let candidate = Path::new(dir).join(program);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    program.to_string()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_terminal_shell_command(
+    program: &str,
+    args: &[String],
+    project_path: Option<&str>,
+) -> String {
+    let mut cmd_parts = vec![shell_quote(program)];
+    for arg in args {
+        cmd_parts.push(shell_quote(arg));
+    }
+    let exec_line = cmd_parts.join(" ");
+    if let Some(dir) = project_path {
+        let p = Path::new(dir);
+        if p.is_dir() {
+            return format!("cd {} && {}", shell_quote(dir), exec_line);
+        }
+    }
+    exec_line
+}
+
 #[tauri::command]
 fn open_in_editor(
     editor_command: String,
     file_path: String,
     project_path: Option<String>,
+    open_in_terminal: Option<bool>,
 ) -> Result<(), String> {
-    let (program, args) = build_editor_invocation(&editor_command, &file_path)?;
+    let (raw_program, args) = build_editor_invocation(&editor_command, &file_path)?;
+    let program = resolve_editor_binary(&raw_program);
+
+    if open_in_terminal.unwrap_or(false) {
+        #[cfg(target_os = "macos")]
+        {
+            let shell_cmd = build_terminal_shell_command(&program, &args, project_path.as_deref());
+            let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!("tell application \"Terminal\" to do script \"{escaped}\"");
+            return Command::new("osascript")
+                .args(["-e", &script, "-e", "tell application \"Terminal\" to activate"])
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to open Terminal for '{program}': {e}"));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut terms: Vec<String> = Vec::new();
+            if let Some(t) = std::env::var_os("TERMINAL") {
+                let s = t.to_string_lossy().trim().to_string();
+                if !s.is_empty() {
+                    terms.push(s);
+                }
+            }
+            for t in [
+                "x-terminal-emulator",
+                "gnome-terminal",
+                "konsole",
+                "xfce4-terminal",
+                "kitty",
+                "alacritty",
+                "ghostty",
+                "wezterm",
+                "xterm",
+            ] {
+                terms.push(t.to_string());
+            }
+            for term in terms {
+                let mut cmd = Command::new(&term);
+                if let Some(dir) = &project_path {
+                    let p = Path::new(dir);
+                    if p.is_dir() {
+                        cmd.current_dir(p);
+                    }
+                }
+                if term.ends_with("gnome-terminal") || term.ends_with("wezterm") {
+                    if term.ends_with("wezterm") {
+                        cmd.arg("start");
+                    }
+                    cmd.arg("--");
+                } else {
+                    cmd.arg("-e");
+                }
+                cmd.arg(&program).args(&args);
+                if cmd.spawn().is_ok() {
+                    return Ok(());
+                }
+            }
+            return Err(format!("No terminal emulator found to launch '{program}'"));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "start", ""]);
+            cmd.arg(&program).args(&args);
+            if let Some(dir) = project_path {
+                let p = Path::new(&dir);
+                if p.is_dir() {
+                    cmd.current_dir(p);
+                }
+            }
+            return cmd
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("Failed to open terminal for '{program}': {e}"));
+        }
+    }
+
     let mut cmd = Command::new(&program);
     cmd.args(&args);
     if let Some(dir) = project_path {
@@ -387,6 +522,7 @@ mod tests {
             hidden_import_group_ids: vec!["dir:tests".to_string()],
             hidden_call_group_ids: vec!["dir:tests".to_string()],
             editor_command: "code".to_string(),
+            open_in_terminal: true,
         };
         fs::write(&file, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
 
@@ -394,5 +530,15 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded, settings);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn formats_terminal_shell_command() {
+        let cmd = super::build_terminal_shell_command(
+            "/opt/homebrew/bin/nvim",
+            &["/tmp/a b/main.rs".to_string()],
+            None,
+        );
+        assert_eq!(cmd, "'/opt/homebrew/bin/nvim' '/tmp/a b/main.rs'");
     }
 }

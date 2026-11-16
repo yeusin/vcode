@@ -27,6 +27,7 @@ fn format_duration(ms: u64) -> String {
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
+const OPEN_IN_TERMINAL_KEY: &str = "vcode.openInTerminal";
 const PR_REFRESH_PERIODS: &[(&str, u64)] = &[
     ("30s", 30_000),
     ("1m", 60_000),
@@ -198,8 +199,12 @@ pub fn App() -> impl IntoView {
     let collapsed_ids = RwSignal::new(HashSet::<String>::new());
 
     let editor_command = RwSignal::new(load_editor_command());
+    let open_in_terminal = RwSignal::new(
+        tauri_bridge::local_storage_get(OPEN_IN_TERMINAL_KEY).as_deref() == Some("true"),
+    );
     let settings_open = RwSignal::new(false);
     let settings_input = RwSignal::new(load_editor_command());
+    let open_in_terminal_input = RwSignal::new(open_in_terminal.get_untracked());
     let pending_editor_file = RwSignal::new(Option::<String>::None);
 
     // Code Review & PR state
@@ -375,6 +380,7 @@ pub fn App() -> impl IntoView {
             hidden_import_group_ids: Vec::new(),
             hidden_call_group_ids: Vec::new(),
             editor_command: if cmd.trim().is_empty() { None } else { Some(cmd) },
+            open_in_terminal: open_in_terminal.get_untracked(),
         };
         let path = g.root_path.clone();
         spawn_local(async move {
@@ -464,6 +470,11 @@ pub fn App() -> impl IntoView {
                                 save_editor_command(&cmd);
                             }
                         }
+                        open_in_terminal.set(s.open_in_terminal);
+                        tauri_bridge::local_storage_set(
+                            OPEN_IN_TERMINAL_KEY,
+                            if s.open_in_terminal { "true" } else { "false" },
+                        );
                     }
 
                     let recent = push_recent_project(&new_graph.root_path, &new_graph.root_name);
@@ -557,6 +568,7 @@ pub fn App() -> impl IntoView {
         if cmd.trim().is_empty() {
             pending_editor_file.set(Some(file_path));
             settings_input.set(String::new());
+            open_in_terminal_input.set(open_in_terminal.get_untracked());
             token_input.set(git_token.get_untracked());
             settings_open.set(true);
             return;
@@ -567,8 +579,9 @@ pub fn App() -> impl IntoView {
         } else {
             Some(proj)
         };
+        let in_term = open_in_terminal.get_untracked();
         spawn_local(async move {
-            if let Err(err) = tauri_bridge::open_in_editor(&cmd, &file_path, proj_opt.as_deref()).await {
+            if let Err(err) = tauri_bridge::open_in_editor(&cmd, &file_path, proj_opt.as_deref(), in_term).await {
                 error_banner.set(Some(err));
             }
         });
@@ -675,6 +688,7 @@ pub fn App() -> impl IntoView {
                         title="Settings"
                         on:click=move |_| {
                             settings_input.set(editor_command.get_untracked());
+                            open_in_terminal_input.set(open_in_terminal.get_untracked());
                             token_input.set(git_token.get_untracked());
                             pending_editor_file.set(None);
                             settings_open.set(true);
@@ -1140,22 +1154,33 @@ pub fn App() -> impl IntoView {
                             <input
                                 class="modal-input"
                                 type="text"
-                                placeholder="e.g. code, cursor, zed, subl"
+                                placeholder="e.g. code, cursor, zed, subl, nvim"
                                 prop:value=move || settings_input.get()
                                 on:input=move |ev| settings_input.set(event_target_value(&ev))
                             />
                             <div class="modal-presets">
-                                {["code", "cursor", "zed", "subl"].into_iter().map(|preset| {
+                                {["code", "cursor", "zed", "subl", "nvim"].into_iter().map(|preset| {
                                     view! {
                                         <button
                                             class="preset-chip"
-                                            on:click=move |_| settings_input.set(preset.to_string())
+                                            on:click=move |_| {
+                                                settings_input.set(preset.to_string());
+                                                open_in_terminal_input.set(preset == "nvim");
+                                            }
                                         >
                                             {preset}
                                         </button>
                                     }
                                 }).collect_view()}
                             </div>
+                            <label class="modal-checkbox">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || open_in_terminal_input.get()
+                                    on:change=move |ev| open_in_terminal_input.set(event_target_checked(&ev))
+                                />
+                                <span>"Open in terminal (for nvim, vim, helix, etc.)"</span>
+                            </label>
                             <p class="modal-help">
                                 "Tip: use "<code>"{file}"</code>" placeholder if your editor needs custom flags (e.g. "<code>"code -r {file}"</code>")."
                             </p>
@@ -1177,9 +1202,15 @@ pub fn App() -> impl IntoView {
                                 class="btn btn-primary"
                                 on:click=move |_| {
                                     let val = settings_input.get_untracked().trim().to_string();
+                                    let in_term = open_in_terminal_input.get_untracked();
                                     let tok = token_input.get_untracked().trim().to_string();
                                     editor_command.set(val.clone());
                                     save_editor_command(&val);
+                                    open_in_terminal.set(in_term);
+                                    tauri_bridge::local_storage_set(
+                                        OPEN_IN_TERMINAL_KEY,
+                                        if in_term { "true" } else { "false" },
+                                    );
                                     git_token.set(tok.clone());
                                     tauri_bridge::local_storage_set("vcode.gitToken", &tok);
                                     persist_project_settings();

@@ -1027,6 +1027,15 @@ body,
   color: var(--text-muted);
 }
 
+.modal-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .modal-help code {
   color: var(--text-secondary);
   font-family: var(--font-mono);

@@ -95,6 +95,8 @@ pub struct ProjectSettings {
     pub hidden_import_group_ids: Vec<String>,
     pub hidden_call_group_ids: Vec<String>,
     pub editor_command: Option<String>,
+    #[serde(default)]
+    pub open_in_terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

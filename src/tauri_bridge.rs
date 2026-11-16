@@ -135,6 +135,7 @@ struct OpenInEditorArgs<'a> {
     editor_command: &'a str,
     file_path: &'a str,
     project_path: Option<&'a str>,
+    open_in_terminal: bool,
 }
 
 pub async fn pick_project_folder() -> Result<Option<String>, String> {
@@ -174,6 +175,7 @@ pub async fn open_in_editor(
     editor_command: &str,
     file_path: &str,
     project_path: Option<&str>,
+    open_in_terminal: bool,
 ) -> Result<(), String> {
     invoke(
         "open_in_editor",
@@ -181,6 +183,7 @@ pub async fn open_in_editor(
             editor_command,
             file_path,
             project_path,
+            open_in_terminal,
         },
     )
     .await
