@@ -107,7 +107,7 @@ fn minimap_geometry(css_w: f64, css_h: f64, bounds: Rect) -> Option<(f64, f64, f
     let mm_w = 180.0;
     let mm_h = 120.0;
     let mm_x = css_w - mm_w - 14.0;
-    let mm_y = 12.0;
+    let mm_y = 48.0;
     let pad = 8.0;
     let mm_scale = ((mm_w - pad * 2.0) / bounds.width).min((mm_h - pad * 2.0) / bounds.height);
     let off_x = mm_x + (mm_w - bounds.width * mm_scale) / 2.0;
