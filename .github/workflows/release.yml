@@ -32,6 +32,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-${{ matrix.platform }}-${{ matrix.rust_target }}
+          workspaces: |
+            .
+            src-tauri
+
       - name: Parse version from release tag
         id: version
         shell: bash
@@ -75,18 +88,6 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown,${{ matrix.rust_target }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            src-tauri
 
       - name: Install trunk and wasm-bindgen-cli
         uses: taiki-e/install-action@v2
