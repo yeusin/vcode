@@ -1288,13 +1288,22 @@ pub fn App() -> impl IntoView {
                         }}
 
                         <div class="review-scroll">
-                            <div class="review-section-title">"Changed Files"</div>
                             {move || {
                                 let Some(diff) = diff_summary.get() else {
-                                    return view! { <div class="review-empty">"Click Get Diff to inspect changes."</div> }.into_any();
+                                    return view! {
+                                        <>
+                                            <div class="review-section-title">"Changed Files"</div>
+                                            <div class="review-empty">"Click Get Diff to inspect changes."</div>
+                                        </>
+                                    }.into_any();
                                 };
                                 if diff.files.is_empty() {
-                                    return view! { <div class="review-empty">"Working tree is clean."</div> }.into_any();
+                                    return view! {
+                                        <>
+                                            <div class="review-section-title">"Changed Files"</div>
+                                            <div class="review-empty">"Working tree is clean."</div>
+                                        </>
+                                    }.into_any();
                                 }
                                 let matched_groups: Vec<Option<String>> = graph.with(|g| {
                                     diff.files.iter().map(|fd| {
@@ -1306,24 +1315,27 @@ pub fn App() -> impl IntoView {
                                         }).map(|grp| grp.id.clone())
                                     }).collect()
                                 });
-                                diff.files.into_iter().zip(matched_groups).map(|(fd, matched_group)| {
+                                let viewed_map = viewed_files.get();
+                                let mut unviewed_items = Vec::new();
+                                let mut viewed_items = Vec::new();
+                                for (fd, matched_group) in diff.files.into_iter().zip(matched_groups) {
+                                    let fp = file_diff_fingerprint(&fd);
+                                    let is_viewed = viewed_map.get(&fd.file_path).is_some_and(|s| s == &fp);
+                                    if is_viewed {
+                                        viewed_items.push((fd, matched_group, fp, true));
+                                    } else {
+                                        unviewed_items.push((fd, matched_group, fp, false));
+                                    }
+                                }
+                                let make_row = |(fd, matched_group, fp, is_viewed): (FileDiff, Option<String>, String, bool)| {
                                     let modal_key = fd.file_path.clone();
                                     let row_gid = matched_group.clone();
-                                    let fp = file_diff_fingerprint(&fd);
                                     let path_for_cb = fd.file_path.clone();
-                                    let path_for_cls = fd.file_path.clone();
-                                    let path_for_chk = fd.file_path.clone();
-                                    let fp_for_chk = fp.clone();
-                                    let fp_for_cls = fp.clone();
                                     view! {
                                         <div
                                             class=move || {
                                                 let is_sel = row_gid.as_deref().is_some()
                                                     && selected_id.get().as_deref() == row_gid.as_deref();
-                                                let is_viewed = viewed_files
-                                                    .get()
-                                                    .get(&path_for_cls)
-                                                    .is_some_and(|s| s == &fp_for_cls);
                                                 match (is_sel, is_viewed) {
                                                     (true, true) => "review-file-row is-selected is-viewed",
                                                     (true, false) => "review-file-row is-selected",
@@ -1341,13 +1353,8 @@ pub fn App() -> impl IntoView {
                                             <input
                                                 class="review-viewed-cb"
                                                 type="checkbox"
-                                                title="Mark as viewed"
-                                                prop:checked=move || {
-                                                    viewed_files
-                                                        .get()
-                                                        .get(&path_for_chk)
-                                                        .is_some_and(|s| s == &fp_for_chk)
-                                                }
+                                                title=if is_viewed { "Unmark viewed" } else { "Mark as viewed" }
+                                                prop:checked=is_viewed
                                                 on:click=move |ev| ev.stop_propagation()
                                                 on:change=move |ev| {
                                                     toggle_file_viewed(
@@ -1365,7 +1372,29 @@ pub fn App() -> impl IntoView {
                                             </span>
                                         </div>
                                     }
-                                }).collect_view().into_any()
+                                };
+                                let unviewed_len = unviewed_items.len();
+                                let viewed_len = viewed_items.len();
+                                view! {
+                                    <>
+                                        <div class="review-section-title">{format!("Changed Files ({unviewed_len})")}</div>
+                                        {if unviewed_len == 0 {
+                                            view! { <div class="review-empty">"All changed files viewed."</div> }.into_any()
+                                        } else {
+                                            unviewed_items.into_iter().map(make_row).collect_view().into_any()
+                                        }}
+                                        {if viewed_len > 0 {
+                                            view! {
+                                                <>
+                                                    <div class="review-section-title">{format!("Viewed ({viewed_len})")}</div>
+                                                    {viewed_items.into_iter().map(make_row).collect_view()}
+                                                </>
+                                            }.into_any()
+                                        } else {
+                                            view! { <span /> }.into_any()
+                                        }}
+                                    </>
+                                }.into_any()
                             }}
 
                             <div class="review-section-title">"Diff Hunks"</div>
