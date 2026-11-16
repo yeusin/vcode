@@ -3,7 +3,18 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tree_sitter::{Language, Node, Parser};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeProgress {
+    pub phase: String,
+    pub processed: usize,
+    pub total: usize,
+    pub elapsed_ms: u64,
+    pub eta_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lang {
@@ -211,6 +222,16 @@ struct ParsedModuleInfo {
 }
 
 pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
+    analyze_project_with_progress(root_path, |_| {})
+}
+
+pub fn analyze_project_with_progress<F>(
+    root_path: &Path,
+    mut on_progress: F,
+) -> Result<ProjectGraph, String>
+where
+    F: FnMut(AnalyzeProgress),
+{
     let root = root_path
         .canonicalize()
         .map_err(|e| format!("Failed to resolve path {}: {e}", root_path.display()))?;
@@ -223,6 +244,16 @@ pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("project")
         .to_string();
+
+    let scan_start = Instant::now();
+    let mut last_emit = scan_start;
+    on_progress(AnalyzeProgress {
+        phase: "Scanning files...".to_string(),
+        processed: 0,
+        total: 0,
+        elapsed_ms: 0,
+        eta_ms: None,
+    });
 
     let mut source_files: Vec<(PathBuf, Lang)> = Vec::new();
     let mut walker = WalkBuilder::new(&root);
@@ -252,6 +283,16 @@ pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
         if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             if let Some(lang) = Lang::from_path(entry.path()) {
                 source_files.push((entry.path().to_path_buf(), lang));
+                if last_emit.elapsed() >= Duration::from_millis(120) {
+                    last_emit = Instant::now();
+                    on_progress(AnalyzeProgress {
+                        phase: "Scanning files...".to_string(),
+                        processed: source_files.len(),
+                        total: 0,
+                        elapsed_ms: scan_start.elapsed().as_millis() as u64,
+                        eta_ms: None,
+                    });
+                }
             }
         }
     }
@@ -353,7 +394,35 @@ pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
     let mut pending_calls: Vec<PendingCall> = Vec::new();
     let mut parsers: HashMap<u8, Parser> = HashMap::new();
 
-    for (file_path, lang) in source_files {
+    let total_files = source_files.len();
+    let parse_start = Instant::now();
+    let mut last_parse_emit = parse_start;
+    on_progress(AnalyzeProgress {
+        phase: "Parsing files".to_string(),
+        processed: 0,
+        total: total_files,
+        elapsed_ms: 0,
+        eta_ms: None,
+    });
+
+    for (idx, (file_path, lang)) in source_files.into_iter().enumerate() {
+        let processed = idx + 1;
+        if processed == total_files || last_parse_emit.elapsed() >= Duration::from_millis(120) {
+            last_parse_emit = Instant::now();
+            let elapsed_ms = parse_start.elapsed().as_millis() as u64;
+            let eta_ms = if processed >= 10 && elapsed_ms >= 200 && total_files > processed {
+                Some((elapsed_ms as f64 * (total_files - processed) as f64 / processed as f64) as u64)
+            } else {
+                None
+            };
+            on_progress(AnalyzeProgress {
+                phase: "Parsing files".to_string(),
+                processed,
+                total: total_files,
+                elapsed_ms,
+                eta_ms,
+            });
+        }
         let rel_path = match file_path.strip_prefix(&root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
@@ -467,6 +536,14 @@ pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
     }
 
     // Resolve Import & Call Edges
+    on_progress(AnalyzeProgress {
+        phase: "Resolving edges...".to_string(),
+        processed: total_files,
+        total: total_files,
+        elapsed_ms: parse_start.elapsed().as_millis() as u64,
+        eta_ms: Some(0),
+    });
+
     let mut edges: Vec<GraphEdge> = Vec::new();
     let mut seen_imports: HashSet<(String, String)> = HashSet::new();
     let mut seen_calls: HashSet<(String, String)> = HashSet::new();

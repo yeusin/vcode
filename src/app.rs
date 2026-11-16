@@ -9,9 +9,20 @@ use crate::layout::compute_layout;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
-    DiffStatus, EdgeVisibility, FunctionNode, GitDiffSummary, GroupKind, GroupNode, LodLevel,
-    ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    AnalyzeProgress, DiffStatus, EdgeVisibility, FunctionNode, GitDiffSummary, GroupKind,
+    GroupNode, LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
+
+fn format_duration(ms: u64) -> String {
+    let secs = (ms + 500) / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        format!("{mins}m {rem:02}s")
+    }
+}
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
@@ -174,6 +185,7 @@ pub fn App() -> impl IntoView {
     } else {
         None
     });
+    let analyze_progress = RwSignal::new(Option::<AnalyzeProgress>::None);
     let error_banner = RwSignal::new(Option::<String>::None);
     let recent_projects = RwSignal::new(initial_recent);
 
@@ -436,6 +448,7 @@ pub fn App() -> impl IntoView {
             .unwrap_or(&path)
             .to_string();
         loading_label.set(Some(format!("Analyzing {display_name}...")));
+        analyze_progress.set(None);
         error_banner.set(None);
         selected_id.set(None);
         hovered_id.set(None);
@@ -466,12 +479,14 @@ pub fn App() -> impl IntoView {
                     recent_projects.set(recent);
                     graph.set(new_graph);
                     loading_label.set(None);
+                    analyze_progress.set(None);
                     fit_to_view();
                     refresh_local_review();
                     let _ = tauri_bridge::watch_project(&path).await;
                 }
                 Err(err) => {
                     loading_label.set(None);
+                    analyze_progress.set(None);
                     error_banner.set(Some(err));
                     if graph.get_untracked().root_path.is_empty() {
                         graph.set(sample_project());
@@ -488,6 +503,12 @@ pub fn App() -> impl IntoView {
             spawn_local(async move {
                 let _ = tauri_bridge::listen_project_updated(move |updated| {
                     graph.set(updated);
+                })
+                .await;
+            });
+            spawn_local(async move {
+                let _ = tauri_bridge::listen_analyze_progress(move |progress| {
+                    analyze_progress.set(Some(progress));
                 })
                 .await;
             });
@@ -937,7 +958,40 @@ pub fn App() -> impl IntoView {
                 <main class="canvas-stage">
                     {move || {
                         if let Some(label) = loading_label.get() {
-                            view! { <div class="canvas-loading">{label}</div> }.into_any()
+                            let progress = analyze_progress.get();
+                            view! {
+                                <div class="canvas-loading">
+                                    <div>{label}</div>
+                                    {progress.map(|p| {
+                                        let pct = if p.total > 0 {
+                                            ((p.processed * 100) / p.total).min(100)
+                                        } else {
+                                            0
+                                        };
+                                        let detail = if p.total > 0 {
+                                            let eta = p.eta_ms
+                                                .map(|ms| format!(" · ~{} remaining", format_duration(ms)))
+                                                .unwrap_or_default();
+                                            format!("{}: {} / {} ({}%){eta}", p.phase, p.processed, p.total, pct)
+                                        } else {
+                                            format!("{} ({} files found)", p.phase, p.processed)
+                                        };
+                                        view! {
+                                            <div class="analyze-progress-card">
+                                                {(p.total > 0).then(|| view! {
+                                                    <div class="analyze-progress-track">
+                                                        <div
+                                                            class="analyze-progress-fill"
+                                                            style=format!("width: {pct}%")
+                                                        />
+                                                    </div>
+                                                })}
+                                                <div class="analyze-progress-meta">{detail}</div>
+                                            </div>
+                                        }
+                                    })}
+                                </div>
+                            }.into_any()
                         } else {
                             view! {
                                 <CanvasView

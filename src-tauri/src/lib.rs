@@ -105,19 +105,29 @@ fn project_settings_file(project_path: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn analyze_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
+async fn analyze_project(
+    app: AppHandle,
+    project_path: String,
+) -> Result<analyzer::ProjectGraph, String> {
     let path = PathBuf::from(&project_path);
     if !path.is_dir() {
         return Err(format!("Selected path is not a directory: {project_path}"));
     }
-    tauri::async_runtime::spawn_blocking(move || analyzer::analyze_project(&path))
-        .await
-        .map_err(|e| format!("Analyzer task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        analyzer::analyze_project_with_progress(&path, |progress| {
+            let _ = app.emit("analyze-progress", &progress);
+        })
+    })
+    .await
+    .map_err(|e| format!("Analyzer task failed: {e}"))?
 }
 
 #[tauri::command]
-async fn analyze_python_project(project_path: String) -> Result<analyzer::ProjectGraph, String> {
-    analyze_project(project_path).await
+async fn analyze_python_project(
+    app: AppHandle,
+    project_path: String,
+) -> Result<analyzer::ProjectGraph, String> {
+    analyze_project(app, project_path).await
 }
 
 #[tauri::command]

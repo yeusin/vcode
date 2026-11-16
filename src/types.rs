@@ -266,3 +266,13 @@ pub struct GitDiffSummary {
     pub files: Vec<FileDiff>,
     pub pr: Option<PrInfo>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzeProgress {
+    pub phase: String,
+    pub processed: usize,
+    pub total: usize,
+    pub elapsed_ms: u64,
+    pub eta_ms: Option<u64>,
+}

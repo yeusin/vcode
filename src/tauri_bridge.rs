@@ -57,9 +57,10 @@ pub async fn invoke<A: Serialize, R: DeserializeOwned>(cmd: &str, args: &A) -> R
         .map_err(|e| format!("Failed to deserialize response for '{cmd}': {e}"))
 }
 
-pub async fn listen_project_updated<F>(mut on_update: F) -> Result<js_sys::Function, String>
+async fn listen_event<T, F>(event_name: &str, mut on_event: F) -> Result<js_sys::Function, String>
 where
-    F: FnMut(ProjectGraph) + 'static,
+    T: serde::de::DeserializeOwned + 'static,
+    F: FnMut(T) + 'static,
 {
     let event_ns = tauri_namespace("event")?;
     let listen_fn = Reflect::get(&event_ns, &JsValue::from_str("listen"))
@@ -70,8 +71,8 @@ where
 
     let cb = Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
         if let Ok(payload) = Reflect::get(&evt, &JsValue::from_str("payload")) {
-            if let Ok(graph) = serde_wasm_bindgen::from_value::<ProjectGraph>(payload) {
-                on_update(graph);
+            if let Ok(val) = serde_wasm_bindgen::from_value::<T>(payload) {
+                on_event(val);
             }
         }
     });
@@ -79,7 +80,7 @@ where
     let promise_val = func
         .call2(
             &event_ns,
-            &JsValue::from_str("project-updated"),
+            &JsValue::from_str(event_name),
             cb.as_ref().unchecked_ref(),
         )
         .map_err(js_err_msg)?;
@@ -92,6 +93,20 @@ where
     unlisten_val
         .dyn_into::<Function>()
         .map_err(|_| "Unlisten handle is not a function".to_string())
+}
+
+pub async fn listen_project_updated<F>(on_update: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(ProjectGraph) + 'static,
+{
+    listen_event("project-updated", on_update).await
+}
+
+pub async fn listen_analyze_progress<F>(on_progress: F) -> Result<js_sys::Function, String>
+where
+    F: FnMut(crate::types::AnalyzeProgress) + 'static,
+{
+    listen_event("analyze-progress", on_progress).await
 }
 
 #[derive(Serialize)]
