@@ -303,7 +303,14 @@ enum ParsedPrTarget {
 fn parse_remote_repo(project_path: &Path) -> Option<(String, String, String)> {
     let url = run_git(project_path, &["remote", "get-url", "origin"]).ok()?;
     let url = url.trim();
-    // git@github.com:owner/repo.git or https://github.com/owner/repo.git
+    // git@github.com:owner/repo.git, ssh://git@github.com/owner/repo.git, or https://github.com/owner/repo.git
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        let (host, path) = rest.split_once('/')?;
+        let host = host.split(':').next().unwrap_or(host);
+        let clean = path.trim_end_matches(".git").to_string();
+        return Some(("ssh".to_string(), host.to_string(), clean));
+    }
     if let Some(rest) = url.strip_prefix("git@") {
         let (host, path) = rest.split_once(':')?;
         let clean = path.trim_end_matches(".git").to_string();
@@ -391,8 +398,33 @@ fn resolve_pr_target(project_path: &Path, input: &str) -> Result<ParsedPrTarget,
     }
 }
 
+fn find_cli_binary(program: &str) -> std::path::PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_p = std::path::PathBuf::from(home);
+        candidates.push(home_p.join(".local/bin").join(program));
+        candidates.push(home_p.join("bin").join(program));
+    }
+    for dir in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/snap/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ] {
+        candidates.push(Path::new(dir).join(program));
+    }
+    for p in candidates {
+        if p.is_file() {
+            return p;
+        }
+    }
+    std::path::PathBuf::from(program)
+}
+
 fn resolve_cli_token(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let bin = find_cli_binary(program);
+    let out = Command::new(bin).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -428,13 +460,13 @@ fn fetch_pr_via_cli(
     url: String,
 ) -> Result<GitDiffSummary, String> {
     let out = if provider == "github" {
-        Command::new("gh")
+        Command::new(find_cli_binary("gh"))
             .current_dir(root)
             .args(["pr", "diff", &number.to_string()])
             .output()
             .map_err(|e| format!("Failed to run gh: {e}"))?
     } else {
-        Command::new("glab")
+        Command::new(find_cli_binary("glab"))
             .current_dir(root)
             .args(["mr", "diff", &number.to_string()])
             .output()
@@ -497,10 +529,14 @@ pub async fn fetch_pr_review(
                     .map_err(|e| format!("Invalid GitHub JSON: {e}"))?,
                 Err(api_err) => {
                     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{number}");
-                    if let Ok(cli_diff) = fetch_pr_via_cli(root, "github", number, pr_url) {
-                        return Ok(cli_diff);
+                    match fetch_pr_via_cli(root, "github", number, pr_url) {
+                        Ok(cli_diff) => return Ok(cli_diff),
+                        Err(cli_err) => {
+                            return Err(format!(
+                                "{api_err} (gh fallback: {cli_err}; set a token in Settings if this is a private repo)"
+                            ));
+                        }
                     }
-                    return Err(api_err);
                 }
             };
 
@@ -584,10 +620,14 @@ pub async fn fetch_pr_review(
                     .map_err(|e| format!("Invalid GitLab JSON: {e}"))?,
                 Err(api_err) => {
                     let mr_url = format!("https://{host}/{proj}/-/merge_requests/{iid}");
-                    if let Ok(cli_diff) = fetch_pr_via_cli(root, "gitlab", iid, mr_url) {
-                        return Ok(cli_diff);
+                    match fetch_pr_via_cli(root, "gitlab", iid, mr_url) {
+                        Ok(cli_diff) => return Ok(cli_diff),
+                        Err(cli_err) => {
+                            return Err(format!(
+                                "{api_err} (glab fallback: {cli_err}; set a token in Settings if this is a private repo)"
+                            ));
+                        }
                     }
-                    return Err(api_err);
                 }
             };
 
