@@ -1403,6 +1403,11 @@ body,
   border-color: var(--accent-amber);
 }
 
+.review-file-row.is-selected {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: #fb923c;
+}
+
 .review-file-name {
   overflow: hidden;
   text-overflow: ellipsis;

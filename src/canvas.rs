@@ -190,7 +190,7 @@ fn render_canvas(
         let is_blast = review.active && review.blast_radius_ids.contains(&g.node.id);
         let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
 
-        let (fill, mut stroke, radius) = match g.node.kind {
+        let (mut fill, mut stroke, radius) = match g.node.kind {
             GroupKind::Directory => (
                 "rgba(15, 23, 42, 0.55)",
                 if is_selected {
@@ -225,10 +225,18 @@ fn render_canvas(
                 9.0,
             ),
         };
-        if !is_selected && !is_hovered {
-            if is_changed {
+        if is_changed {
+            if is_selected {
+                stroke = "#fb923c";
+                fill = "rgba(245, 158, 11, 0.16)";
+            } else if !is_hovered {
                 stroke = "#f59e0b";
-            } else if is_blast {
+            }
+        } else if is_blast {
+            if is_selected {
+                stroke = "#e879f9";
+                fill = "rgba(168, 85, 247, 0.14)";
+            } else if !is_hovered {
                 stroke = "#a855f7";
             }
         }
@@ -297,7 +305,11 @@ fn render_canvas(
             fn_item.rect.height,
             8.0,
         );
-        ctx.set_fill_style_str(if is_selected {
+        ctx.set_fill_style_str(if is_selected && is_changed {
+            "#2a1b0e"
+        } else if is_selected && is_blast {
+            "#251436"
+        } else if is_selected {
             "#16233b"
         } else if is_hovered {
             "#141f35"
@@ -312,7 +324,11 @@ fn render_canvas(
         } else {
             1.1
         });
-        ctx.set_stroke_style_str(if is_selected {
+        ctx.set_stroke_style_str(if is_selected && is_changed {
+            "#fb923c"
+        } else if is_selected && is_blast {
+            "#e879f9"
+        } else if is_selected {
             "#38bdf8"
         } else if is_changed {
             "#f59e0b"

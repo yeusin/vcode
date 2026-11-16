@@ -1210,9 +1210,18 @@ pub fn App() -> impl IntoView {
                                 });
                                 diff.files.into_iter().zip(matched_groups).map(|(fd, matched_group)| {
                                     let modal_key = fd.file_path.clone();
+                                    let row_gid = matched_group.clone();
                                     view! {
                                         <div
-                                            class="review-file-row"
+                                            class=move || {
+                                                let is_sel = row_gid.as_deref().is_some()
+                                                    && selected_id.get().as_deref() == row_gid.as_deref();
+                                                if is_sel {
+                                                    "review-file-row is-selected"
+                                                } else {
+                                                    "review-file-row"
+                                                }
+                                            }
                                             on:click=move |_| {
                                                 if let Some(gid) = &matched_group {
                                                     focus_node.run(gid.clone());
