@@ -1486,6 +1486,8 @@ pub fn App() -> impl IntoView {
                     let modal_path_chk = fd.file_path.clone();
                     let modal_path_cb = fd.file_path.clone();
                     let modal_fp_chk = modal_fp.clone();
+                    let modal_fp_lbl = modal_fp.clone();
+                    let modal_path_lbl = fd.file_path.clone();
                     Some(view! {
                         <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
                             <div
@@ -1503,25 +1505,6 @@ pub fn App() -> impl IntoView {
                                         </span>
                                     </div>
                                     <div class="diff-modal-actions">
-                                        <label class="diff-viewed-toggle">
-                                            <input
-                                                type="checkbox"
-                                                prop:checked=move || {
-                                                    viewed_files
-                                                        .get()
-                                                        .get(&modal_path_chk)
-                                                        .is_some_and(|s| s == &modal_fp_chk)
-                                                }
-                                                on:change=move |ev| {
-                                                    toggle_file_viewed(
-                                                        modal_path_cb.clone(),
-                                                        modal_fp.clone(),
-                                                        event_target_checked(&ev),
-                                                    );
-                                                }
-                                            />
-                                            <span>"Viewed"</span>
-                                        </label>
                                         <div class="diff-mode-toggle">
                                             <button
                                                 class=move || if !diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
@@ -1621,6 +1604,44 @@ pub fn App() -> impl IntoView {
                                             }
                                         }).collect_view().into_any()
                                     }}
+                                </div>
+                                <div class="diff-modal-footer">
+                                    <button
+                                        class=move || {
+                                            let is_v = viewed_files
+                                                .get()
+                                                .get(&modal_path_chk)
+                                                .is_some_and(|s| s == &modal_fp_chk);
+                                            if is_v {
+                                                "btn diff-viewed-cta is-viewed"
+                                            } else {
+                                                "btn btn-primary diff-viewed-cta"
+                                            }
+                                        }
+                                        on:click=move |_| {
+                                            let currently_viewed = viewed_files
+                                                .get_untracked()
+                                                .get(&modal_path_cb)
+                                                .is_some_and(|s| s == &modal_fp);
+                                            toggle_file_viewed(
+                                                modal_path_cb.clone(),
+                                                modal_fp.clone(),
+                                                !currently_viewed,
+                                            );
+                                        }
+                                    >
+                                        {move || {
+                                            let is_v = viewed_files
+                                                .get()
+                                                .get(&modal_path_lbl)
+                                                .is_some_and(|s| s == &modal_fp_lbl);
+                                            if is_v {
+                                                "✓ Viewed"
+                                            } else {
+                                                "✓ Mark as Viewed"
+                                            }
+                                        }}
+                                    </button>
                                 </div>
                             </div>
                         </div>
