@@ -100,6 +100,21 @@ fn truncate_to_width(ctx: &CanvasRenderingContext2d, text: &str, max_w: f64) -> 
     "…".to_string()
 }
 
+fn minimap_geometry(css_w: f64, css_h: f64, bounds: Rect) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
+    if css_w <= 420.0 || css_h <= 300.0 || bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    let mm_w = 180.0;
+    let mm_h = 120.0;
+    let mm_x = css_w - mm_w - 14.0;
+    let mm_y = 12.0;
+    let pad = 8.0;
+    let mm_scale = ((mm_w - pad * 2.0) / bounds.width).min((mm_h - pad * 2.0) / bounds.height);
+    let off_x = mm_x + (mm_w - bounds.width * mm_scale) / 2.0;
+    let off_y = mm_y + (mm_h - bounds.height * mm_scale) / 2.0;
+    Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y))
+}
+
 fn fmt_edge_count(n: usize) -> String {
     if n > 99 {
         "99+".to_string()
@@ -605,6 +620,59 @@ fn render_canvas(
         }
     }
 
+    // 7. Top-right Overview Minimap
+    if let Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y)) =
+        minimap_geometry(css_w, css_h, layout.bounds)
+    {
+        ctx.save();
+        round_rect(&ctx, mm_x, mm_y, mm_w, mm_h, 8.0);
+        ctx.set_fill_style_str("rgba(15, 23, 42, 0.90)");
+        ctx.fill();
+        ctx.set_line_width(1.0);
+        ctx.set_stroke_style_str("rgba(148, 163, 184, 0.32)");
+        ctx.stroke();
+
+        ctx.save();
+        round_rect(&ctx, mm_x + 1.0, mm_y + 1.0, mm_w - 2.0, mm_h - 2.0, 7.0);
+        ctx.clip();
+
+        for g in &layout.groups {
+            if g.node.kind == GroupKind::Class {
+                continue;
+            }
+            let mw = g.rect.width * mm_scale;
+            let mh = g.rect.height * mm_scale;
+            if mw < 1.5 && mh < 1.5 {
+                continue;
+            }
+            let mx = off_x + (g.rect.x - layout.bounds.x) * mm_scale;
+            let my = off_y + (g.rect.y - layout.bounds.y) * mm_scale;
+            let is_changed = review.active && review.changed_ids.contains(&g.node.id);
+            ctx.set_fill_style_str(if is_changed {
+                "rgba(245, 158, 11, 0.78)"
+            } else if g.node.kind == GroupKind::Directory {
+                "rgba(71, 85, 105, 0.35)"
+            } else {
+                "rgba(129, 140, 248, 0.45)"
+            });
+            ctx.fill_rect(mx, my, mw.max(1.5), mh.max(1.5));
+        }
+
+        // Current viewport indicator
+        let vx = off_x + (world_left - layout.bounds.x) * mm_scale;
+        let vy = off_y + (world_top - layout.bounds.y) * mm_scale;
+        let vw = (world_w * mm_scale).max(6.0);
+        let vh = (world_h * mm_scale).max(6.0);
+        ctx.set_fill_style_str("rgba(56, 189, 248, 0.16)");
+        ctx.fill_rect(vx, vy, vw, vh);
+        ctx.set_line_width(1.5);
+        ctx.set_stroke_style_str("#38bdf8");
+        ctx.stroke_rect(vx, vy, vw, vh);
+
+        ctx.restore();
+        ctx.restore();
+    }
+
     ctx.restore();
 }
 
@@ -1041,11 +1109,28 @@ pub fn CanvasView(
             return;
         }
 
+        // 1b. Check overview minimap click to pan viewport
+        let l = layout.get_untracked();
+        if let Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y)) =
+            minimap_geometry(rect.width(), rect.height(), l.bounds)
+        {
+            if sx >= mm_x && sx <= mm_x + mm_w && sy >= mm_y && sy <= mm_y + mm_h {
+                let wx = l.bounds.x + (sx - off_x) / mm_scale;
+                let wy = l.bounds.y + (sy - off_y) / mm_scale;
+                let css_w = rect.width();
+                let css_h = rect.height();
+                viewport.update(|vp| {
+                    vp.x = css_w / 2.0 - wx * vp.scale;
+                    vp.y = css_h / 2.0 - wy * vp.scale;
+                });
+                return;
+            }
+        }
+
         // 2. Otherwise select world node
         let vp = viewport.get_untracked();
         let wx = (sx - vp.x) / vp.scale;
         let wy = (sy - vp.y) / vp.scale;
-        let l = layout.get_untracked();
         let hit = hit_test_world(wx, wy, &l.groups, &l.functions);
         selected_id.set(hit);
     };
