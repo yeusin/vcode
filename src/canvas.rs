@@ -130,6 +130,14 @@ fn draw_arrow_head(
     ctx.restore();
 }
 
+fn fmt_edge_count(n: usize) -> String {
+    if n > 99 {
+        "99+".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
 fn is_edge_visible(
     edge: &PositionedEdge,
     vis: &EdgeVisibility,
@@ -329,16 +337,26 @@ fn render_canvas(
     dash_arr.push(&wasm_bindgen::JsValue::from_f64(4.0));
     let empty_dash = js_sys::Array::new();
     let mut bg_edge_count = 0usize;
+    let mut connected_in_count = 0usize;
+    let mut connected_out_count = 0usize;
     const MAX_BG_EDGES_PER_FRAME: usize = 1200;
+    const MAX_CONNECTED_EDGES_PER_DIR: usize = 99;
 
     for e in &layout.edges {
         if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
             continue;
         }
-        let connected = focus_id
-            .map(|fid| e.edge.source_id == fid || e.edge.target_id == fid)
-            .unwrap_or(false);
-        if !connected {
+        let is_in = focus_id == Some(e.edge.target_id.as_str());
+        let is_out = focus_id == Some(e.edge.source_id.as_str());
+        let connected = is_in || is_out;
+        if connected {
+            if is_in && connected_in_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                continue;
+            }
+            if is_out && connected_out_count >= MAX_CONNECTED_EDGES_PER_DIR {
+                continue;
+            }
+        } else {
             if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
                 continue;
             }
@@ -357,7 +375,11 @@ fn render_canvas(
         {
             continue;
         }
-        if !connected {
+        if is_in {
+            connected_in_count += 1;
+        } else if is_out {
+            connected_out_count += 1;
+        } else {
             bg_edge_count += 1;
         }
 
@@ -499,8 +521,12 @@ fn render_canvas(
             // Line & caller/callee metadata badge
             let (c_in, c_out) = fn_counts.get(&fn_item.node.id).copied().unwrap_or((0, 0));
             let line_badge = format!(
-                "{}L · L{}-{} · {c_in} in · {c_out} out",
-                fn_item.line_count, fn_item.node.start_line, fn_item.node.end_line
+                "{}L · L{}-{} · {} in · {} out",
+                fn_item.line_count,
+                fn_item.node.start_line,
+                fn_item.node.end_line,
+                fmt_edge_count(c_in),
+                fmt_edge_count(c_out)
             );
             ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
             let badge_w = ctx
@@ -716,6 +742,9 @@ fn render_canvas(
     if lod == LodLevel::Meso {
         ctx.set_font("600 11px 'JetBrains Mono', ui-monospace, monospace");
         for fn_item in &layout.functions {
+            if fn_item.rect.width * scale < 32.0 || fn_item.rect.height * scale < 16.0 {
+                continue;
+            }
             if !rects_intersect(&fn_item.rect, world_left, world_top, world_w, world_h) {
                 continue;
             }
@@ -724,8 +753,11 @@ fn render_canvas(
             let sy = fn_item.rect.y * scale + viewport.y + 6.0;
             let max_w = (fn_item.rect.width * scale - 12.0).max(50.0);
             let full_label = format!(
-                "{} · {}L · {c_in} in · {c_out} out",
-                fn_item.node.name, fn_item.line_count
+                "{} · {}L · {} in · {} out",
+                fn_item.node.name,
+                fn_item.line_count,
+                fmt_edge_count(c_in),
+                fmt_edge_count(c_out)
             );
             let label = truncate_to_width(&ctx, &full_label, max_w - 14.0);
             let tw = ctx.measure_text(&label).map(|m| m.width()).unwrap_or(50.0);
@@ -760,7 +792,11 @@ fn render_canvas(
                 let c_out = callees.len();
                 let in_lbl = if c_in == 1 { "caller" } else { "callers" };
                 let out_lbl = if c_out == 1 { "callee" } else { "callees" };
-                let badge = format!("{c_in} {in_lbl} · {c_out} {out_lbl}");
+                let badge = format!(
+                    "{} {in_lbl} · {} {out_lbl}",
+                    fmt_edge_count(c_in),
+                    fmt_edge_count(c_out)
+                );
 
                 ctx.set_font("600 11px 'Inter', system-ui, sans-serif");
                 let tw = ctx.measure_text(&badge).map(|m| m.width()).unwrap_or(90.0);
@@ -1329,7 +1365,11 @@ pub fn CanvasView(
         let c_out = callees.len();
         let in_lbl = if c_in == 1 { "caller" } else { "callers" };
         let out_lbl = if c_out == 1 { "callee" } else { "callees" };
-        Some(format!("{c_in} {in_lbl} · {c_out} {out_lbl}"))
+        Some(format!(
+            "{} {in_lbl} · {} {out_lbl}",
+            fmt_edge_count(c_in),
+            fmt_edge_count(c_out)
+        ))
     });
 
     // Selected function DOM code overlay in Micro LOD

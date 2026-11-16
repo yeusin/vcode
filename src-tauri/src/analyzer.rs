@@ -581,6 +581,10 @@ where
         .map(|m| (m.module_id.as_str(), m))
         .collect();
 
+    let mut out_call_count: HashMap<String, usize> = HashMap::new();
+    let mut in_call_count: HashMap<String, usize> = HashMap::new();
+    const MAX_CALL_EDGES_PER_FN: usize = 100;
+
     let total_calls = pending_calls.len();
     for (call_idx, call) in pending_calls.into_iter().enumerate() {
         let done_calls = call_idx + 1;
@@ -653,13 +657,19 @@ where
 
         if let Some(target_id) = target_fn_id {
             if target_id != call.fn_id && seen_calls.insert((call.fn_id.clone(), target_id.clone())) {
-                edges.push(GraphEdge {
-                    id: format!("call:{}->{}", call.fn_id, target_id),
-                    kind: "call".to_string(),
-                    source_id: call.fn_id,
-                    target_id,
-                    label: Some(call.callee),
-                });
+                let out_n = out_call_count.get(&call.fn_id).copied().unwrap_or(0);
+                let in_n = in_call_count.get(&target_id).copied().unwrap_or(0);
+                if out_n < MAX_CALL_EDGES_PER_FN && in_n < MAX_CALL_EDGES_PER_FN {
+                    out_call_count.insert(call.fn_id.clone(), out_n + 1);
+                    in_call_count.insert(target_id.clone(), in_n + 1);
+                    edges.push(GraphEdge {
+                        id: format!("call:{}->{}", call.fn_id, target_id),
+                        kind: "call".to_string(),
+                        source_id: call.fn_id,
+                        target_id,
+                        label: Some(call.callee),
+                    });
+                }
             }
         }
     }
