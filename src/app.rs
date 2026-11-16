@@ -1260,30 +1260,36 @@ pub fn App() -> impl IntoView {
                                 view! {
                                     <div class="diff-hunk-box">
                                         <div class="diff-file-hdr">{fd.file_path}</div>
-                                        {fd.hunks.into_iter().map(|h| view! {
-                                            <div class="diff-hunk">
-                                                <div class="diff-hunk-hdr">{format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines)}</div>
-                                                {h.lines.into_iter().map(|ln| {
-                                                    let lno = ln.new_line.or(ln.old_line).unwrap_or(1);
-                                                    let cls = match ln.kind.as_str() {
-                                                        "add" => "diff-line is-add",
-                                                        "del" => "diff-line is-del",
-                                                        _ => "diff-line",
-                                                    };
-                                                    let prefix = match ln.kind.as_str() {
-                                                        "add" => "+",
-                                                        "del" => "-",
-                                                        _ => " ",
-                                                    };
-                                                    view! {
-                                                        <div class=cls>
-                                                            <span class="diff-ln">{lno}</span>
-                                                            <span class="diff-sig">{prefix}</span>
-                                                            <span class="diff-txt">{ln.text}</span>
-                                                        </div>
-                                                    }
-                                                }).collect_view()}
-                                            </div>
+                                        {fd.hunks.into_iter().filter_map(|h| {
+                                            let diff_lines: Vec<_> = h.lines.into_iter().filter(|ln| ln.kind != "context").collect();
+                                            if diff_lines.is_empty() {
+                                                return None;
+                                            }
+                                            Some(view! {
+                                                <div class="diff-hunk">
+                                                    <div class="diff-hunk-hdr">{format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines)}</div>
+                                                    {diff_lines.into_iter().map(|ln| {
+                                                        let lno = ln.new_line.or(ln.old_line).unwrap_or(1);
+                                                        let cls = match ln.kind.as_str() {
+                                                            "add" => "diff-line is-add",
+                                                            "del" => "diff-line is-del",
+                                                            _ => "diff-line",
+                                                        };
+                                                        let prefix = match ln.kind.as_str() {
+                                                            "add" => "+",
+                                                            "del" => "-",
+                                                            _ => " ",
+                                                        };
+                                                        view! {
+                                                            <div class=cls>
+                                                                <span class="diff-ln">{lno}</span>
+                                                                <span class="diff-sig">{prefix}</span>
+                                                                <span class="diff-txt">{ln.text}</span>
+                                                            </div>
+                                                        }
+                                                    }).collect_view()}
+                                                </div>
+                                            })
                                         }).collect_view()}
                                     </div>
                                 }.into_any()
