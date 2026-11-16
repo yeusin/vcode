@@ -1605,6 +1605,13 @@ body,
   overflow-x: visible;
 }
 
+.diff-modal-body .diff-txt {
+  max-width: 120ch;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .diff-split-table {
   display: flex;
   flex-direction: column;
