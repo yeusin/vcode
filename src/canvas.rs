@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
@@ -993,7 +994,7 @@ fn hit_test_world(
 
 #[component]
 pub fn CanvasView(
-    layout: Memo<LayoutResult>,
+    layout: Memo<Arc<LayoutResult>>,
     viewport: RwSignal<Viewport>,
     selected_id: RwSignal<Option<String>>,
     hovered_id: RwSignal<Option<String>>,
@@ -1026,15 +1027,17 @@ pub fn CanvasView(
             }
             out.insert(g.node.id.clone(), anc);
         }
-        out
+        Arc::new(out)
     });
 
     let fn_parent = Memo::new(move |_| {
         let l = layout.get();
-        l.functions
-            .iter()
-            .map(|f| (f.node.id.clone(), f.node.parent_id.clone()))
-            .collect::<HashMap<String, String>>()
+        Arc::new(
+            l.functions
+                .iter()
+                .map(|f| (f.node.id.clone(), f.node.parent_id.clone()))
+                .collect::<HashMap<String, String>>(),
+        )
     });
 
     // ResizeObserver to keep canvas crisp on HiDPI
@@ -1137,7 +1140,7 @@ pub fn CanvasView(
             };
             out.insert(g.node.id.clone(), text);
         }
-        out
+        Arc::new(out)
     });
 
     let fn_counts = Memo::new(move |_| {
@@ -1154,15 +1157,17 @@ pub fn CanvasView(
                 .or_default()
                 .insert(e.edge.source_id.as_str());
         }
-        l.functions
-            .iter()
-            .map(|f| {
-                let fid = f.node.id.as_str();
-                let c_in = in_map.get(fid).map_or(0, HashSet::len);
-                let c_out = out_map.get(fid).map_or(0, HashSet::len);
-                (f.node.id.clone(), (c_in, c_out))
-            })
-            .collect::<HashMap<String, (usize, usize)>>()
+        Arc::new(
+            l.functions
+                .iter()
+                .map(|f| {
+                    let fid = f.node.id.as_str();
+                    let c_in = in_map.get(fid).map_or(0, HashSet::len);
+                    let c_out = out_map.get(fid).map_or(0, HashSet::len);
+                    (f.node.id.clone(), (c_in, c_out))
+                })
+                .collect::<HashMap<String, (usize, usize)>>(),
+        )
     });
 
     // Render on reactive state changes
@@ -1380,7 +1385,7 @@ pub fn CanvasView(
         }
         let sid = selected_id.get()?;
         let l = layout.get();
-        let fn_item = l.functions.into_iter().find(|f| f.node.id == sid)?;
+        let fn_item = l.functions.iter().find(|f| f.node.id == sid)?.clone();
         Some((fn_item, vp))
     });
 

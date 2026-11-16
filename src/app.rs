@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -221,7 +222,7 @@ pub fn App() -> impl IntoView {
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
 
-    let layout = Memo::new(move |_| compute_layout(&graph.get()));
+    let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
     let edge_vis = Memo::new(move |_| EdgeVisibility {
         show_imports: show_imports.get(),
         show_calls: show_calls.get(),
@@ -230,7 +231,6 @@ pub fn App() -> impl IntoView {
     });
 
     let review_overlay = Memo::new(move |_| {
-        let g = graph.get();
         let diff_opt = diff_summary.get();
         let is_pr_loaded = diff_opt
             .as_ref()
@@ -239,56 +239,58 @@ pub fn App() -> impl IntoView {
 
         let mut changed_ids = HashSet::new();
         let mut diff_stats: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut blast_radius_ids = HashSet::new();
 
-        if let Some(diff) = &diff_opt {
-            for fd in &diff.files {
-                for grp in &g.groups {
-                    if grp.kind == GroupKind::Module {
-                        if let Some(fp) = &grp.file_path {
-                            if fp == &fd.abs_path
-                                || fp.ends_with(&format!("/{}", fd.file_path))
-                                || fp == &fd.file_path
-                            {
-                                changed_ids.insert(grp.id.clone());
-                                diff_stats
-                                    .insert(grp.id.clone(), (fd.additions, fd.deletions));
+        graph.with(|g| {
+            if let Some(diff) = &diff_opt {
+                for fd in &diff.files {
+                    for grp in &g.groups {
+                        if grp.kind == GroupKind::Module {
+                            if let Some(fp) = &grp.file_path {
+                                if fp == &fd.abs_path
+                                    || fp.ends_with(&format!("/{}", fd.file_path))
+                                    || fp == &fd.file_path
+                                {
+                                    changed_ids.insert(grp.id.clone());
+                                    diff_stats
+                                        .insert(grp.id.clone(), (fd.additions, fd.deletions));
+                                }
                             }
                         }
                     }
-                }
-                for fnode in &g.functions {
-                    let matches_file = fnode.file_path == fd.abs_path
-                        || fnode.file_path.ends_with(&format!("/{}", fd.file_path))
-                        || fnode.file_path == fd.file_path;
-                    if !matches_file {
-                        continue;
-                    }
-                    let whole_file = matches!(fd.status, DiffStatus::Added | DiffStatus::Deleted);
-                    let hunk_hits = fd.hunks.iter().any(|h| {
-                        h.lines.iter().any(|ln| {
-                            if ln.kind == "context" {
-                                return false;
-                            }
-                            let lno = ln.new_line.or(ln.old_line).unwrap_or(0);
-                            lno >= fnode.start_line && lno <= fnode.end_line
-                        })
-                    });
-                    if whole_file || hunk_hits {
-                        changed_ids.insert(fnode.id.clone());
+                    for fnode in &g.functions {
+                        let matches_file = fnode.file_path == fd.abs_path
+                            || fnode.file_path.ends_with(&format!("/{}", fd.file_path))
+                            || fnode.file_path == fd.file_path;
+                        if !matches_file {
+                            continue;
+                        }
+                        let whole_file = matches!(fd.status, DiffStatus::Added | DiffStatus::Deleted);
+                        let hunk_hits = fd.hunks.iter().any(|h| {
+                            h.lines.iter().any(|ln| {
+                                if ln.kind == "context" {
+                                    return false;
+                                }
+                                let lno = ln.new_line.or(ln.old_line).unwrap_or(0);
+                                lno >= fnode.start_line && lno <= fnode.end_line
+                            })
+                        });
+                        if whole_file || hunk_hits {
+                            changed_ids.insert(fnode.id.clone());
+                        }
                     }
                 }
             }
-        }
 
-        let mut blast_radius_ids = HashSet::new();
-        for e in &g.edges {
-            if changed_ids.contains(&e.source_id) && !changed_ids.contains(&e.target_id) {
-                blast_radius_ids.insert(e.target_id.clone());
+            for e in &g.edges {
+                if changed_ids.contains(&e.source_id) && !changed_ids.contains(&e.target_id) {
+                    blast_radius_ids.insert(e.target_id.clone());
+                }
+                if changed_ids.contains(&e.target_id) && !changed_ids.contains(&e.source_id) {
+                    blast_radius_ids.insert(e.source_id.clone());
+                }
             }
-            if changed_ids.contains(&e.target_id) && !changed_ids.contains(&e.source_id) {
-                blast_radius_ids.insert(e.source_id.clone());
-            }
-        }
+        });
 
         ReviewOverlay {
             active: true,
@@ -602,13 +604,12 @@ pub fn App() -> impl IntoView {
     });
 
     let flat_tree = Memo::new(move |_| {
-        let g = graph.get();
         let q = search_query.get();
         let collapsed = collapsed_ids.get();
-        let tree = build_tree(&g, &q);
+        let tree = graph.with(|g| build_tree(g, &q));
         let mut flat = Vec::new();
         flatten_tree(&tree, &collapsed, &mut flat);
-        flat.into_iter().cloned().collect::<Vec<_>>()
+        flat.into_iter().take(400).cloned().collect::<Vec<_>>()
     });
 
     view! {
