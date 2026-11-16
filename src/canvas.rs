@@ -405,6 +405,13 @@ fn render_canvas(
     ctx.restore();
 
     // 4. Screen-space Group Title Pills + Icon Buttons
+    let mut placed_pills: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let overlaps_placed = |x: f64, y: f64, w: f64, h: f64, placed: &[(f64, f64, f64, f64)]| {
+        placed.iter().any(|&(px, py, pw, ph)| {
+            !(x + w + 4.0 <= px || x >= px + pw + 4.0 || y + h + 2.0 <= py || y >= py + ph + 2.0)
+        })
+    };
+
     for g in &layout.groups {
         if g.rect.width * scale < 36.0 || g.rect.height * scale < 20.0 {
             continue;
@@ -466,6 +473,12 @@ fn render_canvas(
 
         let pill_w = (name_w + meta_w + 18.0 + icon_pad).min(max_pill_w);
         let pill_h = 24.0;
+        let has_editor_btn = g.node.kind == GroupKind::Module && g.node.file_path.is_some();
+        let total_w = pill_w + if has_editor_btn { 28.0 } else { 0.0 };
+        if overlaps_placed(sx, sy, total_w, pill_h, &placed_pills) {
+            continue;
+        }
+        placed_pills.push((sx, sy, total_w, pill_h));
 
         round_rect(&ctx, sx, sy, pill_w, pill_h, 6.0);
         ctx.set_fill_style_str(bg);
@@ -533,6 +546,10 @@ fn render_canvas(
             let label = truncate_to_width(&ctx, &full_label, max_w - 14.0);
             let tw = ctx.measure_text(&label).map(|m| m.width()).unwrap_or(50.0);
             let pw = (tw + 14.0).min(max_w);
+            if overlaps_placed(sx, sy, pw, 20.0, &placed_pills) {
+                continue;
+            }
+            placed_pills.push((sx, sy, pw, 20.0));
             round_rect(&ctx, sx, sy, pw, 20.0, 5.0);
             ctx.set_fill_style_str("rgba(15, 23, 42, 0.92)");
             ctx.fill();
@@ -1094,6 +1111,46 @@ pub fn CanvasView(
         ))
     });
 
+    // Breadcrumb path for hovered/selected node
+    let breadcrumb = Memo::new(move |_| {
+        let Some(target_id) = hovered_id.get().or_else(|| selected_id.get()) else {
+            return Vec::<(String, String)>::new();
+        };
+        let l = layout.get();
+        let group_map: HashMap<&str, (&str, Option<&str>)> = l
+            .groups
+            .iter()
+            .map(|g| (g.node.id.as_str(), (g.node.name.as_str(), g.node.parent_id.as_deref())))
+            .collect();
+
+        let mut chain: Vec<(String, String)> = Vec::new();
+        let mut cur_group: Option<&str> = if let Some(&(name, pid)) = group_map.get(target_id.as_str()) {
+            chain.push((target_id.clone(), name.to_string()));
+            pid
+        } else if let Some(fn_item) = l.functions.iter().find(|f| f.node.id == target_id) {
+            chain.push((fn_item.node.id.clone(), fn_item.node.name.clone()));
+            Some(fn_item.node.parent_id.as_str())
+        } else {
+            None
+        };
+
+        let mut guard = 0usize;
+        while let Some(gid) = cur_group {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if let Some(&(name, pid)) = group_map.get(gid) {
+                chain.push((gid.to_string(), name.to_string()));
+                cur_group = pid;
+            } else {
+                break;
+            }
+        }
+        chain.reverse();
+        chain
+    });
+
     // Selected function DOM code overlay in Micro LOD
     let selected_fn_overlay = Memo::new(move |_| {
         let vp = viewport.get();
@@ -1162,6 +1219,38 @@ pub fn CanvasView(
                         </div>
                     }
                 })
+            }}
+            {move || {
+                let crumbs = breadcrumb.get();
+                if crumbs.is_empty() {
+                    view! { <span /> }.into_any()
+                } else {
+                    let last_idx = crumbs.len().saturating_sub(1);
+                    view! {
+                        <div class="canvas-breadcrumb">
+                            {crumbs.into_iter().enumerate().map(|(idx, (cid, label))| {
+                                view! {
+                                    <>
+                                        {(idx > 0).then(|| view! { <span class="canvas-breadcrumb-sep">"›"</span> })}
+                                        <button
+                                            class=if idx == last_idx {
+                                                "canvas-breadcrumb-item is-current"
+                                            } else {
+                                                "canvas-breadcrumb-item"
+                                            }
+                                            on:click=move |ev| {
+                                                ev.stop_propagation();
+                                                on_focus_node.run(cid.clone());
+                                            }
+                                        >
+                                            {label}
+                                        </button>
+                                    </>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_any()
+                }
             }}
             {move || {
                 hover_badge.get().map(|badge| view! {
