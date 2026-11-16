@@ -24,30 +24,48 @@ enum Lang {
     JavaScript,
     Rust,
     Go,
+    Text,
 }
 
 impl Lang {
     fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "py" => Some(Lang::Python),
-            "ts" => Some(Lang::TypeScript),
-            "tsx" => Some(Lang::Tsx),
-            "js" | "jsx" | "mjs" | "cjs" => Some(Lang::JavaScript),
-            "rs" => Some(Lang::Rust),
-            "go" => Some(Lang::Go),
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            return match ext.to_ascii_lowercase().as_str() {
+                "py" => Some(Lang::Python),
+                "ts" => Some(Lang::TypeScript),
+                "tsx" => Some(Lang::Tsx),
+                "js" | "jsx" | "mjs" | "cjs" => Some(Lang::JavaScript),
+                "rs" => Some(Lang::Rust),
+                "go" => Some(Lang::Go),
+                "json" | "jsonc" | "json5" | "md" | "mdx" | "markdown" | "txt" | "toml"
+                | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "scss" | "sass"
+                | "less" | "sql" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "ini" | "cfg"
+                | "conf" | "env" | "properties" | "csv" | "tsv" | "svg" | "graphql" | "gql"
+                | "proto" | "rst" | "adoc" | "tex" | "vue" | "svelte" | "astro" | "c" | "h"
+                | "cpp" | "hpp" | "cc" | "java" | "kt" | "swift" | "rb" | "php" | "lua"
+                | "r" | "scala" | "ex" | "exs" | "hs" | "zig" | "dart" | "cmake"
+                | "gradle" | "lock" => Some(Lang::Text),
+                _ => None,
+            };
+        }
+        let name = path.file_name()?.to_str()?;
+        match name {
+            "Makefile" | "Dockerfile" | "Containerfile" | "README" | "LICENSE" => {
+                Some(Lang::Text)
+            }
             _ => None,
         }
     }
 
-    fn ts_language(self) -> Language {
+    fn ts_language(self) -> Option<Language> {
         match self {
-            Lang::Python => tree_sitter_python::LANGUAGE.into(),
-            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Lang::Go => tree_sitter_go::LANGUAGE.into(),
+            Lang::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            Lang::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Lang::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Lang::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            Lang::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            Lang::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            Lang::Text => None,
         }
     }
 }
@@ -442,24 +460,6 @@ where
             }
         };
 
-        let lang_key = lang as u8;
-        let parser = parsers.entry(lang_key).or_insert_with(|| {
-            let mut p = Parser::new();
-            let _ = p.set_language(&lang.ts_language());
-            p
-        });
-
-        let tree = match parser.parse(&src, None) {
-            Some(t) => t,
-            None => {
-                parse_errors.push(ParseError {
-                    file_path: rel_posix,
-                    error: "Tree-sitter failed to parse file".to_string(),
-                });
-                continue;
-            }
-        };
-
         let file_name = rel_path
             .file_name()
             .and_then(|s| s.to_str())
@@ -479,6 +479,41 @@ where
         };
 
         let module_id = format!("file:{rel_posix}");
+        let line_count = src.lines().count().max(1);
+
+        let Some(ts_lang) = lang.ts_language() else {
+            groups.push(GroupNode {
+                id: module_id,
+                kind: "module".to_string(),
+                name: file_name,
+                qualified_name: dotted_name,
+                parent_id: Some(parent_dir_id),
+                file_path: Some(rel_posix),
+                is_package: false,
+                docstring: None,
+                line_count,
+            });
+            continue;
+        };
+
+        let lang_key = lang as u8;
+        let parser = parsers.entry(lang_key).or_insert_with(|| {
+            let mut p = Parser::new();
+            let _ = p.set_language(&ts_lang);
+            p
+        });
+
+        let tree = match parser.parse(&src, None) {
+            Some(t) => t,
+            None => {
+                parse_errors.push(ParseError {
+                    file_path: rel_posix,
+                    error: "Tree-sitter failed to parse file".to_string(),
+                });
+                continue;
+            }
+        };
+
         module_by_dotted.insert(dotted_name.clone(), module_id.clone());
         module_by_dotted.insert(rel_no_ext.replace('/', "."), module_id.clone());
         module_by_rel_no_ext.insert(rel_no_ext.clone(), module_id.clone());
@@ -490,7 +525,6 @@ where
         };
         module_by_dir.entry(dir_posix).or_default().push(module_id.clone());
 
-        let line_count = src.lines().count().max(1);
         let root_node = tree.root_node();
 
         let mod_doc = extract_module_docstring(root_node, &src, lang);
@@ -834,6 +868,7 @@ fn extract_module(root: Node, ctx: &mut ExtractContext) {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => extract_ts_js(root, ctx),
         Lang::Rust => extract_rust(root, ctx),
         Lang::Go => extract_go(root, ctx),
+        Lang::Text => {}
     }
 }
 
@@ -1465,7 +1500,7 @@ fn resolve_import_target(
                 }
             }
         }
-        Lang::Python => {}
+        Lang::Python | Lang::Text => {}
     }
     None
 }
@@ -1556,6 +1591,23 @@ mod tests {
         assert!(graph.groups.iter().any(|g| g.id == "file:src/app.py"));
         assert!(!graph.groups.iter().any(|g| g.id == "file:src/schema.gen.py"));
         assert!(!graph.groups.iter().any(|g| g.id == "dir:ignored_dir"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn includes_text_files_like_json_and_markdown() {
+        let tmp = std::env::temp_dir().join(format!("vcode_text_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("docs")).unwrap();
+
+        fs::write(tmp.join("package.json"), "{\n  \"name\": \"demo\"\n}\n").unwrap();
+        fs::write(tmp.join("docs/README.md"), "# Hello\nWorld\n").unwrap();
+
+        let graph = analyze_project(&tmp).unwrap();
+        assert_eq!(graph.stats.total_files, 2);
+        assert!(graph.groups.iter().any(|g| g.id == "file:package.json" && g.line_count == 3));
+        assert!(graph.groups.iter().any(|g| g.id == "file:docs/README.md" && g.line_count == 2));
 
         let _ = fs::remove_dir_all(&tmp);
     }
