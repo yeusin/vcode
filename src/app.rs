@@ -382,12 +382,8 @@ pub fn App() -> impl IntoView {
         });
     };
 
-    let fit_to_view = move || {
-        let l = layout.get_untracked();
-        if l.bounds.width <= 0.0 || l.bounds.height <= 0.0 {
-            return;
-        }
-        let (vw, vh) = web_sys::window()
+    let canvas_viewport_size = || -> (f64, f64) {
+        web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| {
                 d.query_selector(".canvas-viewport")
@@ -399,7 +395,15 @@ pub fn App() -> impl IntoView {
                 let r = el.get_bounding_client_rect();
                 (r.width(), r.height())
             })
-            .unwrap_or((1000.0, 720.0));
+            .unwrap_or((1000.0, 720.0))
+    };
+
+    let fit_to_view = move || {
+        let l = layout.get_untracked();
+        if l.bounds.width <= 0.0 || l.bounds.height <= 0.0 {
+            return;
+        }
+        let (vw, vh) = canvas_viewport_size();
         if vw <= 0.0 || vh <= 0.0 {
             return;
         }
@@ -416,19 +420,19 @@ pub fn App() -> impl IntoView {
         let Some(rect) = l.node_rects.get(&id).copied() else {
             return;
         };
-        let (vw, vh) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.query_selector(".canvas-viewport").ok().flatten())
-            .map(|el| {
-                let r = el.get_bounding_client_rect();
-                (r.width(), r.height())
-            })
-            .unwrap_or((1000.0, 720.0));
-        let scale = ((vw * 0.72) / rect.width)
-            .min((vh * 0.72) / rect.height)
-            .clamp(0.3, 1.15);
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let (vw, vh) = canvas_viewport_size();
+        if vw <= 0.0 || vh <= 0.0 {
+            return;
+        }
+        let scale = ((vw - 48.0) / rect.width)
+            .min((vh - 48.0) / rect.height)
+            .clamp(0.001, 1.15);
         let cx = rect.x + rect.width / 2.0;
         let cy = rect.y + rect.height / 2.0;
+        selected_id.set(Some(id));
         viewport.set(Viewport {
             x: vw / 2.0 - cx * scale,
             y: vh / 2.0 - cy * scale,
