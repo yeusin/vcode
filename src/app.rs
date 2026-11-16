@@ -10,8 +10,8 @@ use crate::layout::compute_layout;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
-    AnalyzeProgress, DiffLine, DiffStatus, FunctionNode, GitDiffSummary, GroupKind, GroupNode,
-    LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    AnalyzeProgress, DiffLine, DiffStatus, FileDiff, FunctionNode, GitDiffSummary, GroupKind,
+    GroupNode, LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
 
 fn format_duration(ms: u64) -> String {
@@ -57,6 +57,22 @@ fn build_split_rows(lines: &[DiffLine]) -> Vec<(Option<DiffLine>, Option<DiffLin
         }
     }
     rows
+}
+
+fn paths_match(node_path: &str, root_path: &str, fd: &FileDiff) -> bool {
+    let norm_node = node_path.replace('\\', "/");
+    let norm_root = root_path.replace('\\', "/");
+    let norm_root = norm_root.trim_end_matches('/');
+    let rel_node = if norm_root.is_empty() {
+        norm_node.as_str()
+    } else {
+        norm_node
+            .strip_prefix(&format!("{norm_root}/"))
+            .unwrap_or(&norm_node)
+    };
+    let norm_fd_rel = fd.file_path.replace('\\', "/");
+    let norm_fd_abs = fd.abs_path.replace('\\', "/");
+    rel_node == norm_fd_rel || norm_node == norm_fd_abs
 }
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
@@ -278,10 +294,7 @@ pub fn App() -> impl IntoView {
                     for grp in &g.groups {
                         if grp.kind == GroupKind::Module {
                             if let Some(fp) = &grp.file_path {
-                                if fp == &fd.abs_path
-                                    || fp.ends_with(&format!("/{}", fd.file_path))
-                                    || fp == &fd.file_path
-                                {
+                                if paths_match(fp, &g.root_path, fd) {
                                     changed_ids.insert(grp.id.clone());
                                     diff_stats
                                         .insert(grp.id.clone(), (fd.additions, fd.deletions));
@@ -290,10 +303,7 @@ pub fn App() -> impl IntoView {
                         }
                     }
                     for fnode in &g.functions {
-                        let matches_file = fnode.file_path == fd.abs_path
-                            || fnode.file_path.ends_with(&format!("/{}", fd.file_path))
-                            || fnode.file_path == fd.file_path;
-                        if !matches_file {
+                        if !paths_match(&fnode.file_path, &g.root_path, fd) {
                             continue;
                         }
                         let whole_file = matches!(fd.status, DiffStatus::Added | DiffStatus::Deleted);
@@ -1190,12 +1200,10 @@ pub fn App() -> impl IntoView {
                                 }
                                 let matched_groups: Vec<Option<String>> = graph.with(|g| {
                                     diff.files.iter().map(|fd| {
-                                        let rel = &fd.file_path;
-                                        let abs = &fd.abs_path;
                                         g.groups.iter().find(|grp| {
                                             grp.kind == GroupKind::Module
                                                 && grp.file_path.as_ref().is_some_and(|fp| {
-                                                    fp == abs || fp.ends_with(&format!("/{rel}")) || fp == rel
+                                                    paths_match(fp, &g.root_path, fd)
                                                 })
                                         }).map(|grp| grp.id.clone())
                                     }).collect()
@@ -1229,8 +1237,8 @@ pub fn App() -> impl IntoView {
                                     return view! { <span /> }.into_any();
                                 };
                                 let sel = selected_id.get();
-                                let target_file = sel.as_deref().and_then(|sid| {
-                                    graph.with(|g| {
+                                let (root_path, target_file) = graph.with(|g| {
+                                    let tf = sel.as_deref().and_then(|sid| {
                                         g.functions
                                             .iter()
                                             .find(|f| f.id == sid)
@@ -1241,15 +1249,15 @@ pub fn App() -> impl IntoView {
                                                     .find(|grp| grp.id == sid)
                                                     .and_then(|grp| grp.file_path.clone())
                                             })
-                                    })
+                                    });
+                                    (g.root_path.clone(), tf)
                                 });
                                 let active_fd = target_file
                                     .and_then(|tf| {
-                                        diff.files.iter().find(|fd| {
-                                            fd.abs_path == tf
-                                                || tf.ends_with(&format!("/{}", fd.file_path))
-                                                || fd.file_path == tf
-                                        }).cloned()
+                                        diff.files
+                                            .iter()
+                                            .find(|fd| paths_match(&tf, &root_path, fd))
+                                            .cloned()
                                     })
                                     .or_else(|| diff.files.first().cloned());
 
@@ -1522,5 +1530,27 @@ pub fn App() -> impl IntoView {
                 </div>
             </Show>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paths_match;
+    use crate::types::{DiffStatus, FileDiff};
+
+    #[test]
+    fn matches_exact_relative_paths_without_basename_collisions() {
+        let fd = FileDiff {
+            file_path: "utils.py".to_string(),
+            abs_path: "/repo/utils.py".to_string(),
+            status: DiffStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            hunks: vec![],
+        };
+        assert!(paths_match("utils.py", "/repo", &fd));
+        assert!(paths_match("/repo/utils.py", "/repo", &fd));
+        assert!(!paths_match("src/utils.py", "/repo", &fd));
+        assert!(!paths_match("/repo/src/utils.py", "/repo", &fd));
     }
 }
