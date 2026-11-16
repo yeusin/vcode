@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use wasm_bindgen::{closure::Closure, JsCast};
 
 use crate::canvas::{CanvasView, ReviewOverlay};
 use crate::layout::compute_layout;
@@ -189,6 +190,7 @@ pub fn App() -> impl IntoView {
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let git_base_ref = RwSignal::new("HEAD".to_string());
     let pr_input = RwSignal::new(String::new());
+    let active_pr_ref = RwSignal::new(Option::<String>::None);
     let git_token = RwSignal::new(
         tauri_bridge::local_storage_get("vcode.gitToken").unwrap_or_default(),
     );
@@ -274,6 +276,7 @@ pub fn App() -> impl IntoView {
     });
 
     let refresh_local_review = move || {
+        active_pr_ref.set(None);
         let proj = graph.get_untracked().root_path;
         if proj.is_empty() || proj.starts_with("sample://") || !tauri_bridge::is_tauri_available() {
             return;
@@ -294,6 +297,50 @@ pub fn App() -> impl IntoView {
             review_busy.set(false);
         });
     };
+
+    let refresh_pr_review = move |pr_val: String| {
+        let proj = graph.get_untracked().root_path;
+        let tok = git_token.get_untracked();
+        if proj.is_empty()
+            || proj.starts_with("sample://")
+            || pr_val.trim().is_empty()
+            || !tauri_bridge::is_tauri_available()
+            || review_busy.get_untracked()
+        {
+            return;
+        }
+        review_busy.set(true);
+        review_error.set(None);
+        spawn_local(async move {
+            let tok_opt = if tok.trim().is_empty() {
+                None
+            } else {
+                Some(tok.as_str())
+            };
+            match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
+                Ok(pr_diff) => {
+                    active_pr_ref.set(Some(pr_val));
+                    diff_summary.set(Some(pr_diff));
+                    review_changed_only.set(true);
+                }
+                Err(e) => review_error.set(Some(e)),
+            }
+            review_busy.set(false);
+        });
+    };
+
+    if let Some(win) = web_sys::window() {
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            if let Some(pr_val) = active_pr_ref.get_untracked() {
+                refresh_pr_review(pr_val);
+            }
+        });
+        let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            30_000,
+        );
+        cb.forget();
+    }
 
     let persist_project_settings = move || {
         let g = graph.get_untracked();
@@ -923,27 +970,7 @@ pub fn App() -> impl IntoView {
                                 <button
                                     class="btn btn-primary"
                                     disabled=move || review_busy.get()
-                                    on:click=move |_| {
-                                        let proj = graph.get_untracked().root_path;
-                                        let pr_val = pr_input.get_untracked();
-                                        let tok = git_token.get_untracked();
-                                        if proj.is_empty() || pr_val.trim().is_empty() {
-                                            return;
-                                        }
-                                        review_busy.set(true);
-                                        review_error.set(None);
-                                        spawn_local(async move {
-                                            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
-                                            match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
-                                                Ok(pr_diff) => {
-                                                    diff_summary.set(Some(pr_diff));
-                                                    review_changed_only.set(true);
-                                                }
-                                                Err(e) => review_error.set(Some(e)),
-                                            }
-                                            review_busy.set(false);
-                                        });
-                                    }
+                                    on:click=move |_| refresh_pr_review(pr_input.get_untracked())
                                 >
                                     "Load PR"
                                 </button>
@@ -975,7 +1002,12 @@ pub fn App() -> impl IntoView {
                                         <div>{format!("Branch: {}  vs  {}", d.branch, d.base_ref)}</div>
                                         {pr_badge.map(|t| view! { <div class="review-pr-title">{t}</div> })}
                                         <div class="review-counts">
-                                            {format!("{} changed files · {} impacted nodes", d.files.len(), review_overlay.get().blast_radius_ids.len())}
+                                            {format!(
+                                                "{} changed files · {} impacted nodes{}",
+                                                d.files.len(),
+                                                review_overlay.get().blast_radius_ids.len(),
+                                                if d.pr.is_some() { " · Auto-refresh 30s" } else { "" }
+                                            )}
                                         </div>
                                     </div>
                                 }
