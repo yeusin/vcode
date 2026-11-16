@@ -248,6 +248,9 @@ fn render_canvas(
 
     // 1. Draw groups in depth order
     for g in &layout.groups {
+        if g.rect.width * scale < 3.0 && g.rect.height * scale < 3.0 {
+            continue;
+        }
         if !rects_intersect(&g.rect, world_left, world_top, world_w, world_h) {
             continue;
         }
@@ -321,9 +324,27 @@ fn render_canvas(
 
     // 2. Draw visible edges
     let focus_id = hovered_id.or(selected_id);
+    let dash_arr = js_sys::Array::new();
+    dash_arr.push(&wasm_bindgen::JsValue::from_f64(6.0));
+    dash_arr.push(&wasm_bindgen::JsValue::from_f64(4.0));
+    let empty_dash = js_sys::Array::new();
+    let mut bg_edge_count = 0usize;
+    const MAX_BG_EDGES_PER_FRAME: usize = 1200;
+
     for e in &layout.edges {
         if !is_edge_visible(e, edge_vis, group_ancestors, fn_parent) {
             continue;
+        }
+        let connected = focus_id
+            .map(|fid| e.edge.source_id == fid || e.edge.target_id == fid)
+            .unwrap_or(false);
+        if !connected {
+            if bg_edge_count >= MAX_BG_EDGES_PER_FRAME {
+                continue;
+            }
+            if (e.x2 - e.x1).hypot(e.y2 - e.y1) * scale < 4.0 {
+                continue;
+            }
         }
         let min_x = e.x1.min(e.x2) - 80.0;
         let max_x = e.x1.max(e.x2) + 80.0;
@@ -336,10 +357,10 @@ fn render_canvas(
         {
             continue;
         }
+        if !connected {
+            bg_edge_count += 1;
+        }
 
-        let connected = focus_id
-            .map(|fid| e.edge.source_id == fid || e.edge.target_id == fid)
-            .unwrap_or(false);
         let dimmed = focus_id.is_some() && !connected;
 
         let color = match e.edge.kind {
@@ -375,28 +396,31 @@ fn render_canvas(
             (e.x1, e.y1 + off * dir, e.x2, e.y2 - off * dir)
         };
 
-        ctx.save();
         ctx.set_stroke_style_str(color);
         ctx.set_line_width(if connected { 2.4 } else { 1.4 });
         if e.edge.kind == EdgeKind::Import {
-            let arr = js_sys::Array::new();
-            arr.push(&wasm_bindgen::JsValue::from_f64(6.0));
-            arr.push(&wasm_bindgen::JsValue::from_f64(4.0));
-            let _ = ctx.set_line_dash(&arr);
+            let _ = ctx.set_line_dash(&dash_arr);
+        } else {
+            let _ = ctx.set_line_dash(&empty_dash);
         }
         ctx.begin_path();
         ctx.move_to(e.x1, e.y1);
         ctx.bezier_curve_to(cx1, cy1, cx2, cy2, e.x2, e.y2);
         ctx.stroke();
-        ctx.restore();
 
         if !dimmed {
             draw_arrow_head(&ctx, cx2, cy2, e.x2, e.y2, if connected { 9.0 } else { 6.5 }, color);
         }
     }
+    let _ = ctx.set_line_dash(&empty_dash);
 
     // 3. Draw functions in world space
     for fn_item in &layout.functions {
+        let sw = fn_item.rect.width * scale;
+        let sh = fn_item.rect.height * scale;
+        if sw < 3.0 || sh < 3.0 {
+            continue;
+        }
         if !rects_intersect(&fn_item.rect, world_left, world_top, world_w, world_h) {
             continue;
         }
@@ -404,6 +428,23 @@ fn render_canvas(
         let is_hovered = hovered_id == Some(fn_item.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&fn_item.node.id);
         let is_blast = review.active && review.blast_radius_ids.contains(&fn_item.node.id);
+
+        if lod != LodLevel::Micro && sw < 16.0 && !is_selected && !is_hovered {
+            ctx.set_fill_style_str(if is_changed {
+                "#f59e0b"
+            } else if is_blast {
+                "#a855f7"
+            } else {
+                "#1e293b"
+            });
+            ctx.fill_rect(
+                fn_item.rect.x,
+                fn_item.rect.y,
+                fn_item.rect.width,
+                fn_item.rect.height,
+            );
+            continue;
+        }
         let dimmed = review.active && review.changed_only && !is_changed && !is_blast;
 
         ctx.save();
@@ -523,6 +564,9 @@ fn render_canvas(
 
     // 4. Screen-space Group Title Pills + Icon Buttons
     for g in &layout.groups {
+        if g.rect.width * scale < 36.0 || g.rect.height * scale < 20.0 {
+            continue;
+        }
         if !rects_intersect(&g.rect, world_left, world_top, world_w, world_h) {
             continue;
         }

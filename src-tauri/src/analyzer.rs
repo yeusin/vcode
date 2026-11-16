@@ -536,12 +536,14 @@ where
     }
 
     // Resolve Import & Call Edges
+    let edge_start = Instant::now();
+    let mut last_edge_emit = edge_start;
     on_progress(AnalyzeProgress {
         phase: "Resolving edges...".to_string(),
         processed: total_files,
         total: total_files,
         elapsed_ms: parse_start.elapsed().as_millis() as u64,
-        eta_ms: Some(0),
+        eta_ms: None,
     });
 
     let mut edges: Vec<GraphEdge> = Vec::new();
@@ -579,7 +581,25 @@ where
         .map(|m| (m.module_id.as_str(), m))
         .collect();
 
-    for call in pending_calls {
+    let total_calls = pending_calls.len();
+    for (call_idx, call) in pending_calls.into_iter().enumerate() {
+        let done_calls = call_idx + 1;
+        if done_calls == total_calls || last_edge_emit.elapsed() >= Duration::from_millis(120) {
+            last_edge_emit = Instant::now();
+            let elapsed_ms = edge_start.elapsed().as_millis() as u64;
+            let eta_ms = if done_calls >= 100 && elapsed_ms >= 200 && total_calls > done_calls {
+                Some((elapsed_ms as f64 * (total_calls - done_calls) as f64 / done_calls as f64) as u64)
+            } else {
+                None
+            };
+            on_progress(AnalyzeProgress {
+                phase: "Resolving edges".to_string(),
+                processed: done_calls,
+                total: total_calls,
+                elapsed_ms,
+                eta_ms,
+            });
+        }
         let mut target_fn_id: Option<String> = None;
 
         if let Some(recv) = &call.receiver {

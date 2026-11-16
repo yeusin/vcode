@@ -477,6 +477,17 @@ pub fn App() -> impl IntoView {
 
                     let recent = push_recent_project(&new_graph.root_path, &new_graph.root_name);
                     recent_projects.set(recent);
+                    if new_graph.groups.len() > 150 || new_graph.functions.len() > 500 {
+                        let collapsed: HashSet<String> = new_graph
+                            .groups
+                            .iter()
+                            .filter(|grp| grp.id != "dir:.")
+                            .map(|grp| grp.id.clone())
+                            .collect();
+                        collapsed_ids.set(collapsed);
+                    } else {
+                        collapsed_ids.set(HashSet::new());
+                    }
                     graph.set(new_graph);
                     loading_label.set(None);
                     analyze_progress.set(None);
@@ -781,7 +792,7 @@ pub fn App() -> impl IntoView {
                                         <div class="sidebar-empty">"No matching items"</div>
                                     }.into_any();
                                 }
-                                entries.into_iter().map(|entry| {
+                                entries.into_iter().take(400).map(|entry| {
                                     let id = entry.id.clone();
                                     let id_row_sel = entry.id.clone();
                                     let id_row_imp = entry.id.clone();
