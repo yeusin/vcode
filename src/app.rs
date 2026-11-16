@@ -1756,7 +1756,13 @@ pub fn App() -> impl IntoView {
                 {move || {
                     let target = diff_modal_file.get()?;
                     let diff = diff_summary.get()?;
-                    let fd = diff.files.into_iter().find(|f| f.file_path == target)?;
+                    let current_idx = diff.files.iter().position(|f| f.file_path == target)?;
+                    let prev_file = current_idx
+                        .checked_sub(1)
+                        .and_then(|i| diff.files.get(i))
+                        .map(|f| f.file_path.clone());
+                    let next_file = diff.files.get(current_idx + 1).map(|f| f.file_path.clone());
+                    let fd = diff.files.into_iter().nth(current_idx)?;
                     let status_label = match fd.status {
                         DiffStatus::Added => "Added",
                         DiffStatus::Modified => "Modified",
@@ -1936,6 +1942,18 @@ pub fn App() -> impl IntoView {
                                 </div>
                                 <div class="diff-modal-footer">
                                     <button
+                                        class="btn btn-ghost diff-nav-btn"
+                                        disabled=prev_file.is_none()
+                                        title="Previous file"
+                                        on:click=move |_| {
+                                            if let Some(path) = prev_file.clone() {
+                                                diff_modal_file.set(Some(path));
+                                            }
+                                        }
+                                    >
+                                        "← Prev File"
+                                    </button>
+                                    <button
                                         class=move || {
                                             let is_v = viewed_files
                                                 .get()
@@ -1970,6 +1988,18 @@ pub fn App() -> impl IntoView {
                                                 "✓ Mark as Viewed"
                                             }
                                         }}
+                                    </button>
+                                    <button
+                                        class="btn btn-ghost diff-nav-btn"
+                                        disabled=next_file.is_none()
+                                        title="Next file"
+                                        on:click=move |_| {
+                                            if let Some(path) = next_file.clone() {
+                                                diff_modal_file.set(Some(path));
+                                            }
+                                        }
+                                    >
+                                        "Next File →"
                                     </button>
                                 </div>
                             </div>
