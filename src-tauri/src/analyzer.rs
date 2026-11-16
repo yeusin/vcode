@@ -29,6 +29,10 @@ enum Lang {
 
 impl Lang {
     fn from_path(path: &Path) -> Option<Self> {
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.eq_ignore_ascii_case(".DS_Store") || name == "Thumbs.db" {
+            return None;
+        }
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             return match ext.to_ascii_lowercase().as_str() {
                 "py" => Some(Lang::Python),
@@ -37,24 +41,18 @@ impl Lang {
                 "js" | "jsx" | "mjs" | "cjs" => Some(Lang::JavaScript),
                 "rs" => Some(Lang::Rust),
                 "go" => Some(Lang::Go),
-                "json" | "jsonc" | "json5" | "md" | "mdx" | "markdown" | "txt" | "toml"
-                | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "scss" | "sass"
-                | "less" | "sql" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "ini" | "cfg"
-                | "conf" | "env" | "properties" | "csv" | "tsv" | "svg" | "graphql" | "gql"
-                | "proto" | "rst" | "adoc" | "tex" | "vue" | "svelte" | "astro" | "c" | "h"
-                | "cpp" | "hpp" | "cc" | "java" | "kt" | "swift" | "rb" | "php" | "lua"
-                | "r" | "scala" | "ex" | "exs" | "hs" | "zig" | "dart" | "cmake"
-                | "gradle" | "lock" => Some(Lang::Text),
-                _ => None,
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "icns" | "tiff"
+                | "tif" | "avif" | "pdf" | "zip" | "tar" | "gz" | "tgz" | "xz" | "bz2"
+                | "7z" | "rar" | "exe" | "dll" | "so" | "dylib" | "a" | "lib" | "o"
+                | "obj" | "pdb" | "wasm" | "ttf" | "otf" | "woff" | "woff2" | "eot"
+                | "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "mp4" | "mov" | "avi"
+                | "mkv" | "webm" | "pyc" | "pyo" | "pyd" | "class" | "jar" | "war"
+                | "db" | "sqlite" | "sqlite3" | "bin" | "dat" | "dmg" | "pkg" | "deb"
+                | "rpm" | "msi" | "appimage" => None,
+                _ => Some(Lang::Text),
             };
         }
-        let name = path.file_name()?.to_str()?;
-        match name {
-            "Makefile" | "Dockerfile" | "Containerfile" | "README" | "LICENSE" => {
-                Some(Lang::Text)
-            }
-            _ => None,
-        }
+        Some(Lang::Text)
     }
 
     fn ts_language(self) -> Option<Language> {
@@ -450,12 +448,19 @@ where
         let parent_dir_id = ensure_dir_chain(parent_dir, &mut groups, &mut group_ids);
 
         let src = match fs::read_to_string(&file_path) {
-            Ok(s) => s,
+            Ok(s) => {
+                if lang == Lang::Text && s.contains('\0') {
+                    continue;
+                }
+                s
+            }
             Err(e) => {
-                parse_errors.push(ParseError {
-                    file_path: rel_posix,
-                    error: e.to_string(),
-                });
+                if lang != Lang::Text {
+                    parse_errors.push(ParseError {
+                        file_path: rel_posix,
+                        error: e.to_string(),
+                    });
+                }
                 continue;
             }
         };
@@ -1586,9 +1591,10 @@ mod tests {
         fs::write(tmp.join("ignored_dir/secret.py"), "def hidden():\n    pass\n").unwrap();
 
         let graph = analyze_project(&tmp).unwrap();
-        assert_eq!(graph.stats.total_files, 1);
+        assert_eq!(graph.stats.total_files, 2);
         assert_eq!(graph.stats.total_functions, 1);
         assert!(graph.groups.iter().any(|g| g.id == "file:src/app.py"));
+        assert!(graph.groups.iter().any(|g| g.id == "file:.gitignore"));
         assert!(!graph.groups.iter().any(|g| g.id == "file:src/schema.gen.py"));
         assert!(!graph.groups.iter().any(|g| g.id == "dir:ignored_dir"));
 
@@ -1603,11 +1609,13 @@ mod tests {
 
         fs::write(tmp.join("package.json"), "{\n  \"name\": \"demo\"\n}\n").unwrap();
         fs::write(tmp.join("docs/README.md"), "# Hello\nWorld\n").unwrap();
+        fs::write(tmp.join("docs/notes.customext"), "line 1\n").unwrap();
 
         let graph = analyze_project(&tmp).unwrap();
-        assert_eq!(graph.stats.total_files, 2);
+        assert_eq!(graph.stats.total_files, 3);
         assert!(graph.groups.iter().any(|g| g.id == "file:package.json" && g.line_count == 3));
         assert!(graph.groups.iter().any(|g| g.id == "file:docs/README.md" && g.line_count == 2));
+        assert!(graph.groups.iter().any(|g| g.id == "file:docs/notes.customext" && g.line_count == 1));
 
         let _ = fs::remove_dir_all(&tmp);
     }
