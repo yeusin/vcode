@@ -238,15 +238,6 @@ const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
 const OPEN_IN_TERMINAL_KEY: &str = "vcode.openInTerminal";
 const DIFF_SPLIT_MODE_KEY: &str = "vcode.diffSplitMode";
-const PR_REFRESH_PERIODS: &[(&str, u64)] = &[
-    ("30s", 30_000),
-    ("1m", 60_000),
-    ("3m", 180_000),
-    ("5m", 300_000),
-    ("15m", 900_000),
-    ("30m", 1_800_000),
-    ("1h", 3_600_000),
-];
 
 fn load_recent_projects() -> Vec<RecentProject> {
     tauri_bridge::local_storage_get(RECENT_PROJECTS_KEY)
@@ -442,8 +433,6 @@ pub fn App() -> impl IntoView {
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let git_base_ref = RwSignal::new("HEAD".to_string());
     let active_pr_ref = RwSignal::new(Option::<String>::None);
-    let pr_refresh_ms = RwSignal::new(Option::<u64>::None);
-    let last_pr_refresh_ms = RwSignal::new(0.0_f64);
     let git_token = RwSignal::new(
         tauri_bridge::local_storage_get("vcode.gitToken").unwrap_or_default(),
     );
@@ -598,7 +587,6 @@ pub fn App() -> impl IntoView {
         }
         review_busy.set(true);
         review_error.set(None);
-        last_pr_refresh_ms.set(js_sys::Date::now());
         spawn_local(async move {
             let tok_opt = if tok.trim().is_empty() {
                 None
@@ -693,27 +681,9 @@ pub fn App() -> impl IntoView {
                     review_error.set(Some(e));
                 }
             }
-            last_pr_refresh_ms.set(js_sys::Date::now());
             review_busy.set(false);
         });
     };
-
-    if let Some(win) = web_sys::window() {
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            if let (Some(pr_val), Some(period_ms)) =
-                (active_pr_ref.get_untracked(), pr_refresh_ms.get_untracked())
-            {
-                if js_sys::Date::now() - last_pr_refresh_ms.get_untracked() >= period_ms as f64 {
-                    refresh_pr_review(pr_val);
-                }
-            }
-        });
-        let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
-            cb.as_ref().unchecked_ref(),
-            1_000,
-        );
-        cb.forget();
-    }
 
     let persist_project_settings = move || {
         let g = graph.get_untracked();
@@ -1571,32 +1541,21 @@ pub fn App() -> impl IntoView {
                                     "Accepts "<code>"HEAD"</code>" or a branch/ref (e.g. "<code>"main"</code>", "<code>"origin/main"</code>")."
                                 </div>
                             </Show>
-                            <div class="review-refresh-row">
-                                <span class="review-lbl">"Auto-refresh PR"</span>
-                                {PR_REFRESH_PERIODS.iter().map(|&(label, ms)| {
-                                    view! {
-                                        <button
-                                            class=move || {
-                                                if pr_refresh_ms.get() == Some(ms) {
-                                                    "btn btn-primary review-period-btn"
-                                                } else {
-                                                    "btn btn-ghost review-period-btn"
-                                                }
+                            <Show when=move || active_pr_ref.get().is_some()>
+                                <div class="review-refresh-row">
+                                    <button
+                                        class="btn btn-primary"
+                                        disabled=move || review_busy.get()
+                                        on:click=move |_| {
+                                            if let Some(pr_val) = active_pr_ref.get_untracked() {
+                                                refresh_pr_review(pr_val);
                                             }
-                                            on:click=move |_| {
-                                                if pr_refresh_ms.get_untracked() == Some(ms) {
-                                                    pr_refresh_ms.set(None);
-                                                } else {
-                                                    last_pr_refresh_ms.set(js_sys::Date::now());
-                                                    pr_refresh_ms.set(Some(ms));
-                                                }
-                                            }
-                                        >
-                                            {label}
-                                        </button>
-                                    }
-                                }).collect_view()}
-                            </div>
+                                        }
+                                    >
+                                        {move || if review_busy.get() { "Refreshing PR..." } else { "Refresh PR" }}
+                                    </button>
+                                </div>
+                            </Show>
                         </div>
 
                         {move || {
@@ -1648,20 +1607,7 @@ pub fn App() -> impl IntoView {
                                             <span class="review-meta-val">{branch_label}</span>
                                         </div>
                                         <div class="review-counts">
-                                            {move || {
-                                                let auto_label = if d.pr.is_some() {
-                                                    pr_refresh_ms.get().and_then(|ms| {
-                                                        PR_REFRESH_PERIODS.iter().find(|&&(_, p)| p == ms).map(|&(lbl, _)| format!(" · Auto-refresh {lbl}"))
-                                                    }).unwrap_or_default()
-                                                } else {
-                                                    String::new()
-                                                };
-                                                format!(
-                                                    "{} changed files{}",
-                                                    d.files.len(),
-                                                    auto_label
-                                                )
-                                            }}
+                                            {format!("{} changed files", d.files.len())}
                                         </div>
                                     </div>
                                 }
