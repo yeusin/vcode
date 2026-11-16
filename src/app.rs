@@ -83,6 +83,58 @@ fn is_pr_target(input: &str) -> bool {
         || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
 }
 
+fn file_diff_fingerprint(fd: &FileDiff) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    };
+    feed(fd.file_path.as_bytes());
+    let status_b = match fd.status {
+        DiffStatus::Added => b"A",
+        DiffStatus::Modified => b"M",
+        DiffStatus::Deleted => b"D",
+    };
+    feed(status_b);
+    feed(&fd.additions.to_le_bytes());
+    feed(&fd.deletions.to_le_bytes());
+    for h in &fd.hunks {
+        feed(&h.old_start.to_le_bytes());
+        feed(&h.new_start.to_le_bytes());
+        for ln in &h.lines {
+            if ln.kind != "context" {
+                feed(ln.kind.as_bytes());
+                feed(ln.text.as_bytes());
+            }
+        }
+    }
+    format!("{hash:016x}")
+}
+
+fn viewed_storage_key(root_path: &str, diff: &GitDiffSummary) -> String {
+    if let Some(pr) = &diff.pr {
+        format!("vcode.viewed::{root_path}::pr::{}::{}", pr.provider, pr.number)
+    } else {
+        format!("vcode.viewed::{root_path}::git::{}", diff.base_ref)
+    }
+}
+
+fn load_viewed_map(key: &str) -> HashMap<String, String> {
+    tauri_bridge::local_storage_get(key)
+        .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_viewed_map(key: &str, map: &HashMap<String, String>) {
+    if let Ok(json) = serde_json::to_string(map) {
+        tauri_bridge::local_storage_set(key, &json);
+    }
+}
+
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
 const OPEN_IN_TERMINAL_KEY: &str = "vcode.openInTerminal";
@@ -281,6 +333,7 @@ pub fn App() -> impl IntoView {
     let review_error = RwSignal::new(Option::<String>::None);
     let diff_modal_file = RwSignal::new(Option::<String>::None);
     let diff_split_mode = RwSignal::new(false);
+    let viewed_files = RwSignal::new(HashMap::<String, String>::new());
 
     let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
 
@@ -553,6 +606,47 @@ pub fn App() -> impl IntoView {
             }
         });
     };
+
+    let toggle_file_viewed = move |file_path: String, fp: String, checked: bool| {
+        viewed_files.update(|map| {
+            if checked {
+                map.insert(file_path, fp);
+            } else {
+                map.remove(&file_path);
+            }
+            if let Some(diff) = diff_summary.get_untracked() {
+                let root = graph.with_untracked(|g| g.root_path.clone());
+                if !root.is_empty() {
+                    save_viewed_map(&viewed_storage_key(&root, &diff), map);
+                }
+            }
+        });
+    };
+
+    // Sync viewed files with current diff and clear any file whose diff changed
+    Effect::new(move |_| {
+        let Some(diff) = diff_summary.get() else {
+            viewed_files.set(HashMap::new());
+            return;
+        };
+        let root = graph.with_untracked(|g| g.root_path.clone());
+        if root.is_empty() {
+            return;
+        }
+        let key = viewed_storage_key(&root, &diff);
+        let stored = load_viewed_map(&key);
+        let mut pruned = HashMap::new();
+        for fd in &diff.files {
+            let fp = file_diff_fingerprint(fd);
+            if stored.get(&fd.file_path).is_some_and(|s| s == &fp) {
+                pruned.insert(fd.file_path.clone(), fp);
+            }
+        }
+        if pruned != stored {
+            save_viewed_map(&key, &pruned);
+        }
+        viewed_files.set(pruned);
+    });
 
     // Startup: auto-open last project + subscribe to live project-updated events
     Effect::new(move |_| {
@@ -1215,15 +1309,26 @@ pub fn App() -> impl IntoView {
                                 diff.files.into_iter().zip(matched_groups).map(|(fd, matched_group)| {
                                     let modal_key = fd.file_path.clone();
                                     let row_gid = matched_group.clone();
+                                    let fp = file_diff_fingerprint(&fd);
+                                    let path_for_cb = fd.file_path.clone();
+                                    let path_for_cls = fd.file_path.clone();
+                                    let path_for_chk = fd.file_path.clone();
+                                    let fp_for_chk = fp.clone();
+                                    let fp_for_cls = fp.clone();
                                     view! {
                                         <div
                                             class=move || {
                                                 let is_sel = row_gid.as_deref().is_some()
                                                     && selected_id.get().as_deref() == row_gid.as_deref();
-                                                if is_sel {
-                                                    "review-file-row is-selected"
-                                                } else {
-                                                    "review-file-row"
+                                                let is_viewed = viewed_files
+                                                    .get()
+                                                    .get(&path_for_cls)
+                                                    .is_some_and(|s| s == &fp_for_cls);
+                                                match (is_sel, is_viewed) {
+                                                    (true, true) => "review-file-row is-selected is-viewed",
+                                                    (true, false) => "review-file-row is-selected",
+                                                    (false, true) => "review-file-row is-viewed",
+                                                    (false, false) => "review-file-row",
                                                 }
                                             }
                                             on:click=move |_| {
@@ -1233,6 +1338,25 @@ pub fn App() -> impl IntoView {
                                                 diff_modal_file.set(Some(modal_key.clone()));
                                             }
                                         >
+                                            <input
+                                                class="review-viewed-cb"
+                                                type="checkbox"
+                                                title="Mark as viewed"
+                                                prop:checked=move || {
+                                                    viewed_files
+                                                        .get()
+                                                        .get(&path_for_chk)
+                                                        .is_some_and(|s| s == &fp_for_chk)
+                                                }
+                                                on:click=move |ev| ev.stop_propagation()
+                                                on:change=move |ev| {
+                                                    toggle_file_viewed(
+                                                        path_for_cb.clone(),
+                                                        fp.clone(),
+                                                        event_target_checked(&ev),
+                                                    );
+                                                }
+                                            />
                                             <span class="review-file-name">{fd.file_path}</span>
                                             <span class="review-diff-stat">
                                                 <span class="diff-add">{format!("+{}", fd.additions)}</span>
@@ -1329,6 +1453,10 @@ pub fn App() -> impl IntoView {
                         DiffStatus::Modified => "Modified",
                         DiffStatus::Deleted => "Deleted",
                     };
+                    let modal_fp = file_diff_fingerprint(&fd);
+                    let modal_path_chk = fd.file_path.clone();
+                    let modal_path_cb = fd.file_path.clone();
+                    let modal_fp_chk = modal_fp.clone();
                     Some(view! {
                         <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
                             <div
@@ -1346,6 +1474,25 @@ pub fn App() -> impl IntoView {
                                         </span>
                                     </div>
                                     <div class="diff-modal-actions">
+                                        <label class="diff-viewed-toggle">
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=move || {
+                                                    viewed_files
+                                                        .get()
+                                                        .get(&modal_path_chk)
+                                                        .is_some_and(|s| s == &modal_fp_chk)
+                                                }
+                                                on:change=move |ev| {
+                                                    toggle_file_viewed(
+                                                        modal_path_cb.clone(),
+                                                        modal_fp.clone(),
+                                                        event_target_checked(&ev),
+                                                    );
+                                                }
+                                            />
+                                            <span>"Viewed"</span>
+                                        </label>
                                         <div class="diff-mode-toggle">
                                             <button
                                                 class=move || if !diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
@@ -1548,8 +1695,8 @@ pub fn App() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::paths_match;
-    use crate::types::{DiffStatus, FileDiff};
+    use super::{file_diff_fingerprint, paths_match};
+    use crate::types::{DiffHunk, DiffLine, DiffStatus, FileDiff};
 
     #[test]
     fn matches_exact_relative_paths_without_basename_collisions() {
@@ -1565,5 +1712,38 @@ mod tests {
         assert!(paths_match("/repo/utils.py", "/repo", &fd));
         assert!(!paths_match("src/utils.py", "/repo", &fd));
         assert!(!paths_match("/repo/src/utils.py", "/repo", &fd));
+    }
+
+    #[test]
+    fn diff_fingerprint_changes_when_new_changes_are_added() {
+        let base = FileDiff {
+            file_path: "src/app.rs".to_string(),
+            abs_path: "/repo/src/app.rs".to_string(),
+            status: DiffStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec![DiffLine {
+                    kind: "add".to_string(),
+                    old_line: None,
+                    new_line: Some(2),
+                    text: "let x = 1;".to_string(),
+                }],
+            }],
+        };
+        let mut updated = base.clone();
+        updated.additions = 2;
+        updated.hunks[0].lines.push(DiffLine {
+            kind: "add".to_string(),
+            old_line: None,
+            new_line: Some(3),
+            text: "let y = 2;".to_string(),
+        });
+        assert_eq!(file_diff_fingerprint(&base), file_diff_fingerprint(&base));
+        assert_ne!(file_diff_fingerprint(&base), file_diff_fingerprint(&updated));
     }
 }
