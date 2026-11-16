@@ -205,6 +205,7 @@ pub fn App() -> impl IntoView {
     let git_token = RwSignal::new(
         tauri_bridge::local_storage_get("vcode.gitToken").unwrap_or_default(),
     );
+    let token_input = RwSignal::new(git_token.get_untracked());
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
 
@@ -533,6 +534,7 @@ pub fn App() -> impl IntoView {
         if cmd.trim().is_empty() {
             pending_editor_file.set(Some(file_path));
             settings_input.set(String::new());
+            token_input.set(git_token.get_untracked());
             settings_open.set(true);
             return;
         }
@@ -687,6 +689,7 @@ pub fn App() -> impl IntoView {
                         title="Settings"
                         on:click=move |_| {
                             settings_input.set(editor_command.get_untracked());
+                            token_input.set(git_token.get_untracked());
                             pending_editor_file.set(None);
                             settings_open.set(true);
                         }
@@ -1018,17 +1021,6 @@ pub fn App() -> impl IntoView {
                                     }
                                 }).collect_view()}
                             </div>
-                            <input
-                                class="review-input"
-                                type="password"
-                                placeholder="Token (optional — auto-uses gh/glab or SSH)"
-                                prop:value=move || git_token.get()
-                                on:input=move |ev| {
-                                    let v = event_target_value(&ev);
-                                    git_token.set(v.clone());
-                                    tauri_bridge::local_storage_set("vcode.gitToken", &v);
-                                }
-                            />
                         </div>
 
                         {move || {
@@ -1181,7 +1173,7 @@ pub fn App() -> impl IntoView {
                         on:click=move |ev| ev.stop_propagation()
                     >
                         <div class="modal-header">
-                            <span>"Editor Settings"</span>
+                            <span>"Settings"</span>
                             <button class="btn btn-ghost" on:click=move |_| settings_open.set(false)>"✕"</button>
                         </div>
                         <div class="modal-body">
@@ -1208,6 +1200,17 @@ pub fn App() -> impl IntoView {
                             <p class="modal-help">
                                 "Tip: use "<code>"{file}"</code>" placeholder if your editor needs custom flags (e.g. "<code>"code -r {file}"</code>")."
                             </p>
+                            <label class="modal-label">"GitHub / GitLab Token (optional)"</label>
+                            <input
+                                class="modal-input"
+                                type="password"
+                                placeholder="Leave blank to auto-use gh/glab or SSH"
+                                prop:value=move || token_input.get()
+                                on:input=move |ev| token_input.set(event_target_value(&ev))
+                            />
+                            <p class="modal-help">
+                                "Only needed for private repos when "<code>"gh"</code>"/"<code>"glab"</code>" CLI or SSH isn't configured."
+                            </p>
                         </div>
                         <div class="modal-footer">
                             <button class="btn btn-ghost" on:click=move |_| settings_open.set(false)>"Cancel"</button>
@@ -1215,8 +1218,11 @@ pub fn App() -> impl IntoView {
                                 class="btn btn-primary"
                                 on:click=move |_| {
                                     let val = settings_input.get_untracked().trim().to_string();
+                                    let tok = token_input.get_untracked().trim().to_string();
                                     editor_command.set(val.clone());
                                     save_editor_command(&val);
+                                    git_token.set(tok.clone());
+                                    tauri_bridge::local_storage_set("vcode.gitToken", &tok);
                                     persist_project_settings();
                                     settings_open.set(false);
                                     if !val.is_empty() {
