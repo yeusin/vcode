@@ -1531,7 +1531,10 @@ body,
 }
 
 .diff-modal-body {
-  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 12px;
   display: flex;
   flex-direction: column;
@@ -1541,9 +1544,16 @@ body,
 }
 
 .diff-modal-hunk {
+  flex-shrink: 0;
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
   overflow: hidden;
+}
+
+.diff-modal-body .diff-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
 }
 
 .diff-split-table {
@@ -1553,15 +1563,16 @@ body,
 
 .diff-split-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 
 .diff-split-cell {
+  min-width: 0;
   display: flex;
   gap: 6px;
   padding: 1px 8px;
-  white-space: pre;
-  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   border-right: 1px solid var(--border-subtle);
 }
 
