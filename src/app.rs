@@ -560,6 +560,11 @@ pub fn App() -> impl IntoView {
             spawn_local(async move {
                 let _ = tauri_bridge::listen_project_updated(move |updated| {
                     graph.set(updated);
+                    if active_pr_ref.get_untracked().is_none()
+                        && !is_pr_target(&git_base_ref.get_untracked())
+                    {
+                        refresh_local_review();
+                    }
                 })
                 .await;
             });
