@@ -104,6 +104,8 @@ pub struct ProjectSettings {
 pub struct RecentProject {
     pub path: String,
     pub name: String,
+    #[serde(default)]
+    pub pr_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -239,6 +241,10 @@ pub struct PrInfo {
     pub base_branch: String,
     pub head_branch: String,
     pub head_sha: String,
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub checkout_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

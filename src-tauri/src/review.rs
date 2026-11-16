@@ -51,6 +51,10 @@ pub struct PrInfo {
     pub base_branch: String,
     pub head_branch: String,
     pub head_sha: String,
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub checkout_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +334,7 @@ pub fn get_git_diff(project_path: &str, base_ref: Option<String>) -> Result<GitD
     })
 }
 
+#[derive(Clone)]
 enum ParsedPrTarget {
     GitHub {
         owner: String,
@@ -441,6 +446,121 @@ fn resolve_pr_target(project_path: &Path, input: &str) -> Result<ParsedPrTarget,
     }
 }
 
+impl ParsedPrTarget {
+    fn repo_name(&self) -> String {
+        match self {
+            ParsedPrTarget::GitHub { repo, .. } => repo.clone(),
+            ParsedPrTarget::GitLab { project_path, .. } => project_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(project_path)
+                .to_string(),
+        }
+    }
+
+    fn checkout_slug(&self) -> String {
+        let raw = match self {
+            ParsedPrTarget::GitHub { owner, repo, number } => format!("{owner}-{repo}-pr-{number}"),
+            ParsedPrTarget::GitLab { project_path, iid, .. } => format!("{project_path}-mr-{iid}"),
+        };
+        raw.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect()
+    }
+
+    fn pr_ref(&self) -> String {
+        match self {
+            ParsedPrTarget::GitHub { number, .. } => format!("refs/pull/{number}/head"),
+            ParsedPrTarget::GitLab { iid, .. } => format!("refs/merge-requests/{iid}/head"),
+        }
+    }
+
+    fn https_clone_url(&self) -> String {
+        match self {
+            ParsedPrTarget::GitHub { owner, repo, .. } => {
+                format!("https://github.com/{owner}/{repo}.git")
+            }
+            ParsedPrTarget::GitLab { host, project_path, .. } => {
+                format!("https://{host}/{project_path}.git")
+            }
+        }
+    }
+
+    fn matches_remote(&self, remote_path: &str) -> bool {
+        match self {
+            ParsedPrTarget::GitHub { owner, repo, .. } => {
+                remote_path.eq_ignore_ascii_case(&format!("{owner}/{repo}"))
+            }
+            ParsedPrTarget::GitLab { project_path, .. } => {
+                remote_path.eq_ignore_ascii_case(project_path)
+            }
+        }
+    }
+}
+
+fn with_https_token(url: &str, token: Option<&str>, is_gitlab: bool) -> String {
+    let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) else {
+        return url.to_string();
+    };
+    let Some(rest) = url.strip_prefix("https://") else {
+        return url.to_string();
+    };
+    let user = if is_gitlab { "oauth2" } else { "x-access-token" };
+    format!("https://{user}:{tok}@{rest}")
+}
+
+fn checkout_pr_to_temp_dir(
+    source_repo: &Path,
+    target: &ParsedPrTarget,
+    head_branch: Option<&str>,
+    token: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let checkout_dir = std::env::temp_dir()
+        .join("vcode-pr")
+        .join(target.checkout_slug());
+    fs::create_dir_all(&checkout_dir)
+        .map_err(|e| format!("Failed to create PR temp directory: {e}"))?;
+
+    let local_origin = if source_repo.exists() {
+        parse_remote_repo(source_repo).and_then(|(_, _, remote_path)| {
+            if target.matches_remote(&remote_path) {
+                run_git(source_repo, &["remote", "get-url", "origin"])
+                    .ok()
+                    .map(|u| u.trim().to_string())
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let clone_url = local_origin.unwrap_or_else(|| target.https_clone_url());
+    let is_gitlab = matches!(target, ParsedPrTarget::GitLab { .. });
+    let fetch_url = with_https_token(&clone_url, token, is_gitlab);
+
+    if !checkout_dir.join(".git").exists() {
+        run_git(&checkout_dir, &["init"])?;
+        run_git(&checkout_dir, &["remote", "add", "origin", &clone_url])?;
+    } else {
+        let _ = run_git(&checkout_dir, &["remote", "set-url", "origin", &clone_url]);
+    }
+
+    let pr_ref = target.pr_ref();
+    if let Err(err) = run_git(&checkout_dir, &["fetch", "--depth", "1", &fetch_url, &pr_ref]) {
+        if let Some(hb) = head_branch.map(str::trim).filter(|s| !s.is_empty()) {
+            run_git(&checkout_dir, &["fetch", "--depth", "1", &fetch_url, hb])
+                .map_err(|e2| format!("Failed to fetch PR ref ({err}; branch fallback: {e2})"))?;
+        } else {
+            return Err(format!("Failed to fetch PR ref: {err}"));
+        }
+    }
+
+    run_git(&checkout_dir, &["checkout", "-f", "FETCH_HEAD"])?;
+    let _ = run_git(&checkout_dir, &["clean", "-fd"]);
+    Ok(checkout_dir)
+}
+
 fn find_cli_binary(program: &str) -> std::path::PathBuf {
     let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -479,16 +599,23 @@ fn resolve_cli_token(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+fn resolve_github_token(explicit: Option<String>) -> Option<String> {
+    if let Some(t) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Some(t);
+    }
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("GH_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| resolve_cli_token("gh", &["auth", "token"]))
+}
+
 fn resolve_token(target: &ParsedPrTarget, explicit: Option<String>) -> Option<String> {
     if let Some(t) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         return Some(t);
     }
     match target {
-        ParsedPrTarget::GitHub { .. } => std::env::var("GITHUB_TOKEN")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("GH_TOKEN").ok().filter(|s| !s.trim().is_empty()))
-            .or_else(|| resolve_cli_token("gh", &["auth", "token"])),
+        ParsedPrTarget::GitHub { .. } => resolve_github_token(None),
         ParsedPrTarget::GitLab { .. } => std::env::var("GITLAB_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -496,11 +623,78 @@ fn resolve_token(target: &ParsedPrTarget, explicit: Option<String>) -> Option<St
     }
 }
 
+pub fn parse_github_repo_url(input: &str) -> Result<(String, String, String), String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Enter a GitHub repository URL or owner/repo".to_string());
+    }
+    let path_part = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+    {
+        rest
+    } else if !trimmed.contains("://") && !trimmed.contains('@') {
+        trimmed
+    } else {
+        return Err("Enter a valid GitHub repository URL (e.g. https://github.com/owner/repo)".to_string());
+    };
+
+    let mut segs = path_part.split('/').filter(|s| !s.is_empty());
+    let owner = segs
+        .next()
+        .ok_or_else(|| "Missing repository owner".to_string())?;
+    let repo_raw = segs
+        .next()
+        .ok_or_else(|| "Missing repository name".to_string())?;
+    let repo = repo_raw.strip_suffix(".git").unwrap_or(repo_raw);
+    if owner.is_empty() || repo.is_empty() {
+        return Err("Invalid GitHub repository URL".to_string());
+    }
+    let clone_url = format!("https://github.com/{owner}/{repo}.git");
+    Ok((owner.to_string(), repo.to_string(), clone_url))
+}
+
+pub async fn clone_github_repo(repo_url: &str, token: Option<String>) -> Result<String, String> {
+    let (owner, repo, clone_url) = parse_github_repo_url(repo_url)?;
+    let tok = resolve_github_token(token);
+    let slug: String = format!("{owner}-{repo}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+
+    let repo_dir = tauri::async_runtime::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+        let dir = std::env::temp_dir().join("vcode-repos").join(&slug);
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create temp repo directory: {e}"))?;
+        let fetch_url = with_https_token(&clone_url, tok.as_deref(), false);
+
+        if !dir.join(".git").exists() {
+            run_git(&dir, &["init"])?;
+            run_git(&dir, &["remote", "add", "origin", &clone_url])?;
+        } else {
+            let _ = run_git(&dir, &["remote", "set-url", "origin", &clone_url]);
+        }
+        run_git(&dir, &["fetch", "--depth", "1", &fetch_url, "HEAD"])?;
+        run_git(&dir, &["checkout", "-f", "FETCH_HEAD"])?;
+        let _ = run_git(&dir, &["clean", "-fd"]);
+        Ok(dir)
+    })
+    .await
+    .map_err(|e| format!("Clone task failed: {e}"))??;
+
+    Ok(repo_dir.to_string_lossy().into_owned())
+}
+
 fn fetch_pr_via_cli(
     root: &Path,
+    target: &ParsedPrTarget,
     provider: &str,
     number: u64,
     url: String,
+    token: Option<&str>,
 ) -> Result<GitDiffSummary, String> {
     let out = if provider == "github" {
         Command::new(find_cli_binary("gh"))
@@ -518,8 +712,9 @@ fn fetch_pr_via_cli(
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
+    let checkout_dir = checkout_pr_to_temp_dir(root, target, None, token)?;
     let diff_out = String::from_utf8_lossy(&out.stdout).into_owned();
-    let files = parse_unified_diff(root, &diff_out);
+    let files = parse_unified_diff(&checkout_dir, &diff_out);
     Ok(GitDiffSummary {
         branch: format!("pr-{number}"),
         base_ref: "base".to_string(),
@@ -532,6 +727,8 @@ fn fetch_pr_via_cli(
             base_branch: "base".to_string(),
             head_branch: format!("pr-{number}"),
             head_sha: String::new(),
+            repo_name: target.repo_name(),
+            checkout_path: Some(checkout_dir.to_string_lossy().into_owned()),
         }),
     })
 }
@@ -550,6 +747,7 @@ pub async fn fetch_pr_review(
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;
 
+    let target_clone = target.clone();
     match target {
         ParsedPrTarget::GitHub {
             owner,
@@ -572,7 +770,7 @@ pub async fn fetch_pr_review(
                     .map_err(|e| format!("Invalid GitHub JSON: {e}"))?,
                 Err(api_err) => {
                     let pr_url = format!("https://github.com/{owner}/{repo}/pull/{number}");
-                    match fetch_pr_via_cli(root, "github", number, pr_url) {
+                    match fetch_pr_via_cli(root, &target_clone, "github", number, pr_url, tok.as_deref()) {
                         Ok(cli_diff) => return Ok(cli_diff),
                         Err(cli_err) => {
                             return Err(format!(
@@ -603,6 +801,21 @@ pub async fn fetch_pr_review(
                 .await
                 .map_err(|e| format!("Invalid GitHub files JSON: {e}"))?;
 
+            let checkout_root = root.to_path_buf();
+            let checkout_hb = head_branch.clone();
+            let checkout_tok = tok.clone();
+            let checkout_target = target_clone.clone();
+            let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
+                checkout_pr_to_temp_dir(
+                    &checkout_root,
+                    &checkout_target,
+                    Some(&checkout_hb),
+                    checkout_tok.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("PR checkout task failed: {e}"))??;
+
             let mut files = Vec::new();
             for f in files_json {
                 let rel = f["filename"].as_str().unwrap_or("").to_string();
@@ -616,7 +829,7 @@ pub async fn fetch_pr_review(
                 let additions = f["additions"].as_u64().map(|n| n as usize).unwrap_or(p_add);
                 let deletions = f["deletions"].as_u64().map(|n| n as usize).unwrap_or(p_del);
                 files.push(FileDiff {
-                    abs_path: root.join(&rel).to_string_lossy().into_owned(),
+                    abs_path: checkout_dir.join(&rel).to_string_lossy().into_owned(),
                     file_path: rel,
                     status,
                     additions,
@@ -637,6 +850,8 @@ pub async fn fetch_pr_review(
                     base_branch,
                     head_branch,
                     head_sha,
+                    repo_name: target_clone.repo_name(),
+                    checkout_path: Some(checkout_dir.to_string_lossy().into_owned()),
                 }),
             })
         }
@@ -663,7 +878,7 @@ pub async fn fetch_pr_review(
                     .map_err(|e| format!("Invalid GitLab JSON: {e}"))?,
                 Err(api_err) => {
                     let mr_url = format!("https://{host}/{proj}/-/merge_requests/{iid}");
-                    match fetch_pr_via_cli(root, "gitlab", iid, mr_url) {
+                    match fetch_pr_via_cli(root, &target_clone, "gitlab", iid, mr_url, tok.as_deref()) {
                         Ok(cli_diff) => return Ok(cli_diff),
                         Err(cli_err) => {
                             return Err(format!(
@@ -697,6 +912,21 @@ pub async fn fetch_pr_review(
                 .await
                 .map_err(|e| format!("Invalid GitLab changes JSON: {e}"))?;
 
+            let checkout_root = root.to_path_buf();
+            let checkout_hb = head_branch.clone();
+            let checkout_tok = tok.clone();
+            let checkout_target = target_clone.clone();
+            let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
+                checkout_pr_to_temp_dir(
+                    &checkout_root,
+                    &checkout_target,
+                    Some(&checkout_hb),
+                    checkout_tok.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("PR checkout task failed: {e}"))??;
+
             let mut files = Vec::new();
             if let Some(arr) = ch_json["changes"].as_array() {
                 for c in arr {
@@ -711,7 +941,7 @@ pub async fn fetch_pr_review(
                     let patch = c["diff"].as_str().unwrap_or("");
                     let (hunks, additions, deletions) = parse_hunks_from_patch(patch);
                     files.push(FileDiff {
-                        abs_path: root.join(&rel).to_string_lossy().into_owned(),
+                        abs_path: checkout_dir.join(&rel).to_string_lossy().into_owned(),
                         file_path: rel,
                         status,
                         additions,
@@ -733,6 +963,8 @@ pub async fn fetch_pr_review(
                     base_branch,
                     head_branch,
                     head_sha,
+                    repo_name: target_clone.repo_name(),
+                    checkout_path: Some(checkout_dir.to_string_lossy().into_owned()),
                 }),
             })
         }
@@ -777,5 +1009,62 @@ index 111..222 100644
         assert_eq!(dels, 0);
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].lines.len(), MAX_DIFF_LINES_PER_FILE + 1);
+    }
+
+    #[test]
+    fn formats_pr_checkout_slug_repo_name_and_https_token() {
+        let gh = ParsedPrTarget::GitHub {
+            owner: "yeusin".to_string(),
+            repo: "vcode".to_string(),
+            number: 42,
+        };
+        assert_eq!(gh.repo_name(), "vcode");
+        assert_eq!(gh.checkout_slug(), "yeusin-vcode-pr-42");
+        assert_eq!(gh.pr_ref(), "refs/pull/42/head");
+        assert_eq!(
+            with_https_token("https://github.com/yeusin/vcode.git", Some("tok"), false),
+            "https://x-access-token:tok@github.com/yeusin/vcode.git"
+        );
+
+        let gl = ParsedPrTarget::GitLab {
+            host: "gitlab.com".to_string(),
+            project_path: "org/sub/my-app".to_string(),
+            iid: 7,
+        };
+        assert_eq!(gl.repo_name(), "my-app");
+        assert_eq!(gl.checkout_slug(), "org-sub-my-app-mr-7");
+        assert_eq!(gl.pr_ref(), "refs/merge-requests/7/head");
+        assert_eq!(
+            with_https_token("https://gitlab.com/org/sub/my-app.git", Some("tok"), true),
+            "https://oauth2:tok@gitlab.com/org/sub/my-app.git"
+        );
+    }
+
+    #[test]
+    fn parses_github_repo_urls_and_shorthand() {
+        assert_eq!(
+            parse_github_repo_url("https://github.com/yeusin/vcode").unwrap(),
+            (
+                "yeusin".to_string(),
+                "vcode".to_string(),
+                "https://github.com/yeusin/vcode.git".to_string()
+            )
+        );
+        assert_eq!(
+            parse_github_repo_url("git@github.com:yeusin/vcode.git").unwrap(),
+            (
+                "yeusin".to_string(),
+                "vcode".to_string(),
+                "https://github.com/yeusin/vcode.git".to_string()
+            )
+        );
+        assert_eq!(
+            parse_github_repo_url("yeusin/vcode").unwrap(),
+            (
+                "yeusin".to_string(),
+                "vcode".to_string(),
+                "https://github.com/yeusin/vcode.git".to_string()
+            )
+        );
     }
 }

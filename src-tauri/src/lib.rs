@@ -583,6 +583,11 @@ async fn fetch_pr_review(
     review::fetch_pr_review(&project_path, &pr_url_or_number, token).await
 }
 
+#[tauri::command]
+async fn clone_github_repo(repo_url: String, token: Option<String>) -> Result<String, String> {
+    review::clone_github_repo(&repo_url, token).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -601,7 +606,8 @@ pub fn run() {
             snap_window,
             set_window_title,
             get_git_diff,
-            fetch_pr_review
+            fetch_pr_review,
+            clone_github_repo
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

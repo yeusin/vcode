@@ -275,3 +275,14 @@ pub async fn fetch_pr_review(
     )
     .await
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloneRepoArgs<'a> {
+    repo_url: &'a str,
+    token: Option<&'a str>,
+}
+
+pub async fn clone_github_repo(repo_url: &str, token: Option<&str>) -> Result<String, String> {
+    invoke("clone_github_repo", &CloneRepoArgs { repo_url, token }).await
+}
