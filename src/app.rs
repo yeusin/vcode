@@ -262,7 +262,6 @@ pub fn App() -> impl IntoView {
     let review_changed_only = RwSignal::new(false);
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let git_base_ref = RwSignal::new("HEAD".to_string());
-    let pr_input = RwSignal::new(String::new());
     let active_pr_ref = RwSignal::new(Option::<String>::None);
     let pr_refresh_ms = RwSignal::new(Option::<u64>::None);
     let last_pr_refresh_ms = RwSignal::new(0.0_f64);
@@ -1087,10 +1086,12 @@ pub fn App() -> impl IntoView {
                                 <input
                                     class="review-input"
                                     type="text"
-                                    placeholder="Base ref (HEAD, main...)"
+                                    placeholder="Branch / ref (HEAD, main) or PR URL / #num"
                                     prop:value=move || git_base_ref.get()
                                     on:input=move |ev| git_base_ref.set(event_target_value(&ev))
                                 />
+                            </div>
+                            <div class="review-row">
                                 <button
                                     class="btn btn-ghost"
                                     disabled=move || review_busy.get()
@@ -1098,19 +1099,10 @@ pub fn App() -> impl IntoView {
                                 >
                                     "Git Diff"
                                 </button>
-                            </div>
-                            <div class="review-row">
-                                <input
-                                    class="review-input"
-                                    type="text"
-                                    placeholder="GitHub/GitLab PR URL or #num"
-                                    prop:value=move || pr_input.get()
-                                    on:input=move |ev| pr_input.set(event_target_value(&ev))
-                                />
                                 <button
                                     class="btn btn-primary"
                                     disabled=move || review_busy.get()
-                                    on:click=move |_| refresh_pr_review(pr_input.get_untracked())
+                                    on:click=move |_| refresh_pr_review(git_base_ref.get_untracked())
                                 >
                                     "Load PR"
                                 </button>
