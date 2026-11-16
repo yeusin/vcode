@@ -607,6 +607,7 @@ pub fn App() -> impl IntoView {
             };
             match tauri_bridge::fetch_pr_review(&proj, &pr_val, tok_opt).await {
                 Ok(pr_diff) => {
+                    let prev_diff = diff_summary.get_untracked();
                     if let Some(pr) = &pr_diff.pr {
                         let pr_label = if pr.repo_name.trim().is_empty() {
                             format!("PR #{}", pr.number)
@@ -615,53 +616,61 @@ pub fn App() -> impl IntoView {
                         };
                         if let Some(checkout_dir) = pr.checkout_path.clone() {
                             let switched = graph.with_untracked(|g| g.root_path != checkout_dir);
-                            if switched || is_initial_load {
-                                loading_label.set(Some(format!("Analyzing {pr_label}...")));
-                            }
-                            if switched {
-                                selected_id.set(None);
-                                hovered_id.set(None);
-                            }
-                            match tauri_bridge::analyze_project(&checkout_dir).await {
-                                Ok(new_graph) => {
-                                    let saved_pr_ref = if pr.url.trim().is_empty() {
-                                        pr_val.clone()
-                                    } else {
-                                        pr.url.clone()
-                                    };
-                                    let recent = push_recent_project(
-                                        &checkout_dir,
-                                        &pr_label,
-                                        Some(&saved_pr_ref),
-                                    );
-                                    recent_projects.set(recent);
-                                    let _ = tauri_bridge::set_window_title(&format!(
-                                        "VCode — {pr_label}"
-                                    ))
-                                    .await;
-                                    if switched {
-                                        if new_graph.groups.len() > 150
-                                            || new_graph.functions.len() > 500
-                                        {
-                                            let collapsed: HashSet<String> = new_graph
-                                                .groups
-                                                .iter()
-                                                .filter(|grp| grp.id != "dir:.")
-                                                .map(|grp| grp.id.clone())
-                                                .collect();
-                                            collapsed_ids.set(collapsed);
+                            let sha_unchanged = !switched
+                                && !pr.head_sha.is_empty()
+                                && prev_diff
+                                    .as_ref()
+                                    .and_then(|d| d.pr.as_ref())
+                                    .is_some_and(|p| p.head_sha == pr.head_sha);
+                            if !sha_unchanged {
+                                if switched || is_initial_load {
+                                    loading_label.set(Some(format!("Analyzing {pr_label}...")));
+                                }
+                                if switched {
+                                    selected_id.set(None);
+                                    hovered_id.set(None);
+                                }
+                                match tauri_bridge::analyze_project(&checkout_dir).await {
+                                    Ok(new_graph) => {
+                                        let saved_pr_ref = if pr.url.trim().is_empty() {
+                                            pr_val.clone()
                                         } else {
-                                            collapsed_ids.set(HashSet::new());
+                                            pr.url.clone()
+                                        };
+                                        let recent = push_recent_project(
+                                            &checkout_dir,
+                                            &pr_label,
+                                            Some(&saved_pr_ref),
+                                        );
+                                        recent_projects.set(recent);
+                                        let _ = tauri_bridge::set_window_title(&format!(
+                                            "VCode — {pr_label}"
+                                        ))
+                                        .await;
+                                        if switched {
+                                            if new_graph.groups.len() > 150
+                                                || new_graph.functions.len() > 500
+                                            {
+                                                let collapsed: HashSet<String> = new_graph
+                                                    .groups
+                                                    .iter()
+                                                    .filter(|grp| grp.id != "dir:.")
+                                                    .map(|grp| grp.id.clone())
+                                                    .collect();
+                                                collapsed_ids.set(collapsed);
+                                            } else {
+                                                collapsed_ids.set(HashSet::new());
+                                            }
+                                        }
+                                        graph.set(new_graph);
+                                        if switched {
+                                            fit_to_view();
+                                            let _ = tauri_bridge::watch_project(&checkout_dir).await;
                                         }
                                     }
-                                    graph.set(new_graph);
-                                    if switched {
-                                        fit_to_view();
-                                        let _ = tauri_bridge::watch_project(&checkout_dir).await;
+                                    Err(err) => {
+                                        error_banner.set(Some(err));
                                     }
-                                }
-                                Err(err) => {
-                                    error_banner.set(Some(err));
                                 }
                             }
                         }
@@ -671,7 +680,9 @@ pub fn App() -> impl IntoView {
                         analyze_progress.set(None);
                     }
                     active_pr_ref.set(Some(pr_val));
-                    diff_summary.set(Some(pr_diff));
+                    if prev_diff.as_ref() != Some(&pr_diff) {
+                        diff_summary.set(Some(pr_diff));
+                    }
                     review_changed_only.set(true);
                 }
                 Err(e) => {

@@ -513,6 +513,7 @@ fn checkout_pr_to_temp_dir(
     source_repo: &Path,
     target: &ParsedPrTarget,
     head_branch: Option<&str>,
+    expected_head_sha: Option<&str>,
     token: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let checkout_dir = std::env::temp_dir()
@@ -520,6 +521,16 @@ fn checkout_pr_to_temp_dir(
         .join(target.checkout_slug());
     fs::create_dir_all(&checkout_dir)
         .map_err(|e| format!("Failed to create PR temp directory: {e}"))?;
+
+    if checkout_dir.join(".git").exists() {
+        if let Some(sha) = expected_head_sha.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(local_sha) = run_git(&checkout_dir, &["rev-parse", "HEAD"]) {
+                if local_sha.trim().eq_ignore_ascii_case(sha) {
+                    return Ok(checkout_dir);
+                }
+            }
+        }
+    }
 
     let local_origin = if source_repo.exists() {
         parse_remote_repo(source_repo).and_then(|(_, _, remote_path)| {
@@ -712,7 +723,7 @@ fn fetch_pr_via_cli(
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    let checkout_dir = checkout_pr_to_temp_dir(root, target, None, token)?;
+    let checkout_dir = checkout_pr_to_temp_dir(root, target, None, None, token)?;
     let diff_out = String::from_utf8_lossy(&out.stdout).into_owned();
     let files = parse_unified_diff(&checkout_dir, &diff_out);
     Ok(GitDiffSummary {
@@ -803,6 +814,7 @@ pub async fn fetch_pr_review(
 
             let checkout_root = root.to_path_buf();
             let checkout_hb = head_branch.clone();
+            let checkout_sha = head_sha.clone();
             let checkout_tok = tok.clone();
             let checkout_target = target_clone.clone();
             let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
@@ -810,6 +822,7 @@ pub async fn fetch_pr_review(
                     &checkout_root,
                     &checkout_target,
                     Some(&checkout_hb),
+                    Some(&checkout_sha),
                     checkout_tok.as_deref(),
                 )
             })
@@ -914,6 +927,7 @@ pub async fn fetch_pr_review(
 
             let checkout_root = root.to_path_buf();
             let checkout_hb = head_branch.clone();
+            let checkout_sha = head_sha.clone();
             let checkout_tok = tok.clone();
             let checkout_target = target_clone.clone();
             let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
@@ -921,6 +935,7 @@ pub async fn fetch_pr_review(
                     &checkout_root,
                     &checkout_target,
                     Some(&checkout_hb),
+                    Some(&checkout_sha),
                     checkout_tok.as_deref(),
                 )
             })
