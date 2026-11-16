@@ -75,6 +75,14 @@ fn paths_match(node_path: &str, root_path: &str, fd: &FileDiff) -> bool {
     rel_node == norm_fd_rel || norm_node == norm_fd_abs
 }
 
+fn is_pr_target(input: &str) -> bool {
+    let t = input.trim();
+    t.contains("/pull/")
+        || t.contains("/-/merge_requests/")
+        || t.starts_with('#')
+        || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+}
+
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
 const OPEN_IN_TERMINAL_KEY: &str = "vcode.openInTerminal";
@@ -1089,22 +1097,30 @@ pub fn App() -> impl IntoView {
                                     placeholder="Branch / ref (HEAD, main) or PR URL / #num"
                                     prop:value=move || git_base_ref.get()
                                     on:input=move |ev| git_base_ref.set(event_target_value(&ev))
+                                    on:keydown=move |ev| {
+                                        if ev.key() == "Enter" {
+                                            let val = git_base_ref.get_untracked();
+                                            if is_pr_target(&val) {
+                                                refresh_pr_review(val);
+                                            } else {
+                                                refresh_local_review();
+                                            }
+                                        }
+                                    }
                                 />
-                            </div>
-                            <div class="review-row">
-                                <button
-                                    class="btn btn-ghost"
-                                    disabled=move || review_busy.get()
-                                    on:click=move |_| refresh_local_review()
-                                >
-                                    "Git Diff"
-                                </button>
                                 <button
                                     class="btn btn-primary"
                                     disabled=move || review_busy.get()
-                                    on:click=move |_| refresh_pr_review(git_base_ref.get_untracked())
+                                    on:click=move |_| {
+                                        let val = git_base_ref.get_untracked();
+                                        if is_pr_target(&val) {
+                                            refresh_pr_review(val);
+                                        } else {
+                                            refresh_local_review();
+                                        }
+                                    }
                                 >
-                                    "Load PR"
+                                    "Get Diff"
                                 </button>
                             </div>
                             <div class="review-refresh-row">
@@ -1173,7 +1189,7 @@ pub fn App() -> impl IntoView {
                             <div class="review-section-title">"Changed Files"</div>
                             {move || {
                                 let Some(diff) = diff_summary.get() else {
-                                    return view! { <div class="review-empty">"Click Git Diff or Load PR to inspect changes."</div> }.into_any();
+                                    return view! { <div class="review-empty">"Click Get Diff to inspect changes."</div> }.into_any();
                                 };
                                 if diff.files.is_empty() {
                                     return view! { <div class="review-empty">"Working tree is clean."</div> }.into_any();
