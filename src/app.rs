@@ -138,6 +138,7 @@ fn save_viewed_map(key: &str, map: &HashMap<String, String>) {
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
 const EDITOR_COMMAND_KEY: &str = "vcode.editorCommand";
 const OPEN_IN_TERMINAL_KEY: &str = "vcode.openInTerminal";
+const DIFF_SPLIT_MODE_KEY: &str = "vcode.diffSplitMode";
 const PR_REFRESH_PERIODS: &[(&str, u64)] = &[
     ("30s", 30_000),
     ("1m", 60_000),
@@ -332,7 +333,9 @@ pub fn App() -> impl IntoView {
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
     let diff_modal_file = RwSignal::new(Option::<String>::None);
-    let diff_split_mode = RwSignal::new(false);
+    let diff_split_mode = RwSignal::new(
+        tauri_bridge::local_storage_get(DIFF_SPLIT_MODE_KEY).as_deref() == Some("true"),
+    );
     let viewed_files = RwSignal::new(HashMap::<String, String>::new());
 
     let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
@@ -1508,13 +1511,19 @@ pub fn App() -> impl IntoView {
                                         <div class="diff-mode-toggle">
                                             <button
                                                 class=move || if !diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
-                                                on:click=move |_| diff_split_mode.set(false)
+                                                on:click=move |_| {
+                                                    diff_split_mode.set(false);
+                                                    tauri_bridge::local_storage_set(DIFF_SPLIT_MODE_KEY, "false");
+                                                }
                                             >
                                                 "Unified"
                                             </button>
                                             <button
                                                 class=move || if diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
-                                                on:click=move |_| diff_split_mode.set(true)
+                                                on:click=move |_| {
+                                                    diff_split_mode.set(true);
+                                                    tauri_bridge::local_storage_set(DIFF_SPLIT_MODE_KEY, "true");
+                                                }
                                             >
                                                 "Split"
                                             </button>
