@@ -1494,7 +1494,7 @@ pub fn App() -> impl IntoView {
                     Some(view! {
                         <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
                             <div
-                                class="diff-modal-card"
+                                class=move || if diff_split_mode.get() { "diff-modal-card is-split" } else { "diff-modal-card" }
                                 on:click=move |ev| ev.stop_propagation()
                             >
                                 <div class="modal-header">

@@ -1532,6 +1532,10 @@ body,
   overflow: hidden;
 }
 
+.diff-modal-card.is-split {
+  width: min(1920px, 96vw);
+}
+
 .diff-modal-title {
   flex: 1;
   display: flex;
