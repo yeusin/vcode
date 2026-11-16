@@ -138,7 +138,7 @@ async fn analyze_python_project(
 }
 
 #[tauri::command]
-fn watch_project(
+async fn watch_project(
     window: WebviewWindow,
     state: State<'_, WatcherState>,
     project_path: String,
@@ -149,37 +149,45 @@ fn watch_project(
     }
     let win_label = window.label().to_string();
 
-    let mut guard = state
-        .active
-        .lock()
-        .map_err(|_| "Watcher mutex poisoned".to_string())?;
-    if let Some(prev) = guard.remove(&win_label) {
-        let _ = prev.stop_tx.send(());
+    {
+        let mut guard = state
+            .active
+            .lock()
+            .map_err(|_| "Watcher mutex poisoned".to_string())?;
+        if let Some(prev) = guard.remove(&win_label) {
+            let _ = prev.stop_tx.send(());
+        }
     }
 
     let (dirty_tx, dirty_rx) = mpsc::channel::<()>();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let dirty_flag = Arc::new(dirty_tx);
 
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        if let Ok(event) = res {
-            if event.kind.is_access() {
-                return;
+    let root_for_watch = root.clone();
+    let watcher = tauri::async_runtime::spawn_blocking(move || -> Result<notify::RecommendedWatcher, String> {
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                if event.kind.is_access() {
+                    return;
+                }
+                let relevant = event
+                    .paths
+                    .iter()
+                    .any(|p| analyzer::is_watched_path(p) || p.is_dir());
+                if relevant {
+                    let _ = dirty_flag.send(());
+                }
             }
-            let relevant = event
-                .paths
-                .iter()
-                .any(|p| analyzer::is_watched_path(p) || p.is_dir());
-            if relevant {
-                let _ = dirty_flag.send(());
-            }
-        }
-    })
-    .map_err(|e| format!("Failed to initialize file watcher: {e}"))?;
+        })
+        .map_err(|e| format!("Failed to initialize file watcher: {e}"))?;
 
-    watcher
-        .watch(&root, RecursiveMode::Recursive)
-        .map_err(|e| format!("Failed to watch {}: {e}", root.display()))?;
+        watcher
+            .watch(&root_for_watch, RecursiveMode::Recursive)
+            .map_err(|e| format!("Failed to watch {}: {e}", root_for_watch.display()))?;
+        Ok(watcher)
+    })
+    .await
+    .map_err(|e| format!("Watcher setup task failed: {e}"))??;
 
     let win_for_thread = window.clone();
     std::thread::spawn(move || {
@@ -206,6 +214,10 @@ fn watch_project(
         }
     });
 
+    let mut guard = state
+        .active
+        .lock()
+        .map_err(|_| "Watcher mutex poisoned".to_string())?;
     guard.insert(
         win_label,
         ActiveWatcher {

@@ -651,22 +651,24 @@ pub fn App() -> impl IntoView {
                                             }
                                         }
                                         graph.set(new_graph);
+                                        loading_label.set(None);
+                                        analyze_progress.set(None);
                                         if switched {
                                             fit_to_view();
                                             let _ = tauri_bridge::watch_project(&checkout_dir).await;
                                         }
                                     }
                                     Err(err) => {
+                                        loading_label.set(None);
+                                        analyze_progress.set(None);
                                         error_banner.set(Some(err));
                                     }
                                 }
                             }
                         }
                     }
-                    if is_initial_load {
-                        loading_label.set(None);
-                        analyze_progress.set(None);
-                    }
+                    loading_label.set(None);
+                    analyze_progress.set(None);
                     active_pr_ref.set(Some(pr_val));
                     if prev_diff.as_ref() != Some(&pr_diff) {
                         diff_summary.set(Some(pr_diff));
@@ -674,10 +676,8 @@ pub fn App() -> impl IntoView {
                     review_changed_only.set(true);
                 }
                 Err(e) => {
-                    if is_initial_load {
-                        loading_label.set(None);
-                        analyze_progress.set(None);
-                    }
+                    loading_label.set(None);
+                    analyze_progress.set(None);
                     review_error.set(Some(e));
                 }
             }
