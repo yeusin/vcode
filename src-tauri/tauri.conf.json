@@ -16,8 +16,8 @@
         "title": "VCode — Code Visualizer",
         "width": 1400,
         "height": 900,
-        "minWidth": 900,
-        "minHeight": 600
+        "minWidth": 420,
+        "minHeight": 320
       }
     ],
     "security": {

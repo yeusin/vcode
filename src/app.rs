@@ -203,6 +203,7 @@ pub fn App() -> impl IntoView {
         tauri_bridge::local_storage_get(OPEN_IN_TERMINAL_KEY).as_deref() == Some("true"),
     );
     let settings_open = RwSignal::new(false);
+    let snap_menu_open = RwSignal::new(false);
     let settings_input = RwSignal::new(load_editor_command());
     let open_in_terminal_input = RwSignal::new(open_in_terminal.get_untracked());
     let pending_editor_file = RwSignal::new(Option::<String>::None);
@@ -479,6 +480,7 @@ pub fn App() -> impl IntoView {
 
                     let recent = push_recent_project(&new_graph.root_path, &new_graph.root_name);
                     recent_projects.set(recent);
+                    let _ = tauri_bridge::set_window_title(&format!("VCode — {}", new_graph.root_name)).await;
                     if new_graph.groups.len() > 150 || new_graph.functions.len() > 500 {
                         let collapsed: HashSet<String> = new_graph
                             .groups
@@ -525,11 +527,26 @@ pub fn App() -> impl IntoView {
                 })
                 .await;
             });
-            let recent = load_recent_projects();
-            if let Some(first) = recent.first() {
-                open_project(first.path.clone());
+            let initial_from_query = web_sys::window()
+                .and_then(|w| w.location().search().ok())
+                .and_then(|search| {
+                    search
+                        .trim_start_matches('?')
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("project="))
+                        .and_then(|enc| js_sys::decode_uri_component(enc).ok())
+                        .and_then(|v| v.as_string())
+                        .filter(|s| !s.trim().is_empty())
+                });
+            if let Some(proj_path) = initial_from_query {
+                open_project(proj_path);
             } else {
-                fit_to_view();
+                let recent = load_recent_projects();
+                if let Some(first) = recent.first() {
+                    open_project(first.path.clone());
+                } else {
+                    fit_to_view();
+                }
             }
         } else {
             fit_to_view();
@@ -614,16 +631,39 @@ pub fn App() -> impl IntoView {
                     <button class="btn btn-primary" on:click=handle_open_folder>
                         "Open Project"
                     </button>
+                    <button
+                        class="btn btn-ghost"
+                        title="Open a new project window"
+                        on:click=move |_| {
+                            if !tauri_bridge::is_tauri_available() {
+                                return;
+                            }
+                            spawn_local(async move {
+                                let _ = tauri_bridge::open_new_window(None).await;
+                            });
+                        }
+                    >
+                        "+ Window"
+                    </button>
                     <div class="recent-chips">
                         {move || {
                             recent_projects.get().into_iter().map(|rp| {
                                 let p = rp.path.clone();
-                                let title = rp.path.clone();
+                                let title = format!("{} (Ctrl/Cmd+Click to open in new window)", rp.path);
                                 view! {
                                     <button
                                         class="recent-chip"
                                         title=title
-                                        on:click=move |_| open_project(p.clone())
+                                        on:click=move |ev| {
+                                            if (ev.ctrl_key() || ev.meta_key()) && tauri_bridge::is_tauri_available() {
+                                                let path = p.clone();
+                                                spawn_local(async move {
+                                                    let _ = tauri_bridge::open_new_window(Some(&path)).await;
+                                                });
+                                            } else {
+                                                open_project(p.clone());
+                                            }
+                                        }
                                     >
                                         {rp.name}
                                     </button>
@@ -682,6 +722,50 @@ pub fn App() -> impl IntoView {
                         <button class="btn btn-ghost" on:click=move |_| fit_to_view()>
                             "Fit"
                         </button>
+                    </div>
+                    <div class="snap-menu-wrap">
+                        <button
+                            class="btn btn-ghost"
+                            title="Snap and align window"
+                            on:click=move |_| snap_menu_open.update(|v| *v = !*v)
+                        >
+                            "Snap"
+                        </button>
+                        <Show when=move || snap_menu_open.get()>
+                            <div class="snap-popover">
+                                <div class="snap-grid">
+                                    {[
+                                        ("left", "◧ Left ½"),
+                                        ("right", "◨ Right ½"),
+                                        ("top", "⬒ Top ½"),
+                                        ("bottom", "⬓ Bottom ½"),
+                                        ("top-left", "◰ Top-Left ¼"),
+                                        ("top-right", "◱ Top-Right ¼"),
+                                        ("bottom-left", "◲ Bot-Left ¼"),
+                                        ("bottom-right", "◳ Bot-Right ¼"),
+                                        ("left-third", "Left ⅓"),
+                                        ("center-third", "Mid ⅓"),
+                                        ("right-third", "Right ⅓"),
+                                        ("center", "Center"),
+                                        ("maximize", "Full"),
+                                    ].into_iter().map(|(preset, label)| {
+                                        view! {
+                                            <button
+                                                class="snap-item"
+                                                on:click=move |_| {
+                                                    snap_menu_open.set(false);
+                                                    spawn_local(async move {
+                                                        let _ = tauri_bridge::snap_window(preset).await;
+                                                    });
+                                                }
+                                            >
+                                                {label}
+                                            </button>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            </div>
+                        </Show>
                     </div>
                     <button
                         class="btn btn-ghost"

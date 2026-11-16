@@ -189,6 +189,36 @@ pub async fn open_in_editor(
     .await
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWindowArgs<'a> {
+    project_path: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapWindowArgs<'a> {
+    preset: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowTitleArgs<'a> {
+    title: &'a str,
+}
+
+pub async fn open_new_window(project_path: Option<&str>) -> Result<(), String> {
+    invoke("open_new_window", &OpenWindowArgs { project_path }).await
+}
+
+pub async fn snap_window(preset: &str) -> Result<(), String> {
+    invoke("snap_window", &SnapWindowArgs { preset }).await
+}
+
+pub async fn set_window_title(title: &str) -> Result<(), String> {
+    invoke("set_window_title", &WindowTitleArgs { title }).await
+}
+
 pub fn local_storage_get(key: &str) -> Option<String> {
     web_sys::window()
         .and_then(|w| w.local_storage().ok().flatten())

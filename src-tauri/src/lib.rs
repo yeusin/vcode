@@ -3,13 +3,15 @@ mod review;
 
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -29,13 +31,13 @@ struct ActiveWatcher {
 }
 
 struct WatcherState {
-    active: Mutex<Option<ActiveWatcher>>,
+    active: Mutex<HashMap<String, ActiveWatcher>>,
 }
 
 impl Default for WatcherState {
     fn default() -> Self {
         Self {
-            active: Mutex::new(None),
+            active: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -108,7 +110,7 @@ fn project_settings_file(project_path: &str) -> Result<PathBuf, String> {
 
 #[tauri::command]
 async fn analyze_project(
-    app: AppHandle,
+    window: WebviewWindow,
     project_path: String,
 ) -> Result<tauri::ipc::Response, String> {
     let path = PathBuf::from(&project_path);
@@ -117,7 +119,7 @@ async fn analyze_project(
     }
     let graph = tauri::async_runtime::spawn_blocking(move || {
         analyzer::analyze_project_with_progress(&path, |progress| {
-            let _ = app.emit("analyze-progress", &progress);
+            let _ = window.emit("analyze-progress", &progress);
         })
     })
     .await
@@ -129,15 +131,15 @@ async fn analyze_project(
 
 #[tauri::command]
 async fn analyze_python_project(
-    app: AppHandle,
+    window: WebviewWindow,
     project_path: String,
 ) -> Result<tauri::ipc::Response, String> {
-    analyze_project(app, project_path).await
+    analyze_project(window, project_path).await
 }
 
 #[tauri::command]
 fn watch_project(
-    app: AppHandle,
+    window: WebviewWindow,
     state: State<'_, WatcherState>,
     project_path: String,
 ) -> Result<(), String> {
@@ -145,12 +147,13 @@ fn watch_project(
     if !root.is_dir() {
         return Err(format!("Not a directory: {project_path}"));
     }
+    let win_label = window.label().to_string();
 
     let mut guard = state
         .active
         .lock()
         .map_err(|_| "Watcher mutex poisoned".to_string())?;
-    if let Some(prev) = guard.take() {
+    if let Some(prev) = guard.remove(&win_label) {
         let _ = prev.stop_tx.send(());
     }
 
@@ -178,6 +181,7 @@ fn watch_project(
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| format!("Failed to watch {}: {e}", root.display()))?;
 
+    let win_for_thread = window.clone();
     std::thread::spawn(move || {
         let debounce = Duration::from_millis(300);
         loop {
@@ -193,7 +197,7 @@ fn watch_project(
                         break;
                     }
                     if let Ok(graph) = analyzer::analyze_project(&root) {
-                        let _ = app.emit("project-updated", graph);
+                        let _ = win_for_thread.emit("project-updated", graph);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -202,21 +206,24 @@ fn watch_project(
         }
     });
 
-    *guard = Some(ActiveWatcher {
-        _watcher: watcher,
-        stop_tx,
-    });
+    guard.insert(
+        win_label,
+        ActiveWatcher {
+            _watcher: watcher,
+            stop_tx,
+        },
+    );
 
     Ok(())
 }
 
 #[tauri::command]
-fn unwatch_project(state: State<'_, WatcherState>) -> Result<(), String> {
+fn unwatch_project(window: WebviewWindow, state: State<'_, WatcherState>) -> Result<(), String> {
     let mut guard = state
         .active
         .lock()
         .map_err(|_| "Watcher mutex poisoned".to_string())?;
-    if let Some(prev) = guard.take() {
+    if let Some(prev) = guard.remove(window.label()) {
         let _ = prev.stop_tx.send(());
     }
     Ok(())
@@ -445,6 +452,120 @@ async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>, St
     .map_err(|e| format!("Failed to open folder dialog: {e}"))?
 }
 
+static NEXT_WINDOW_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn compute_snap_rect(
+    ax: i32,
+    ay: i32,
+    aw: u32,
+    ah: u32,
+    preset: &str,
+) -> Result<(i32, i32, u32, u32), String> {
+    let w = aw as i32;
+    let h = ah as i32;
+    let half_w = (w / 2).max(1) as u32;
+    let half_h = (h / 2).max(1) as u32;
+    let third_w = (w / 3).max(1) as u32;
+
+    match preset {
+        "left" => Ok((ax, ay, half_w, ah)),
+        "right" => Ok((ax + w / 2, ay, aw - (w / 2) as u32, ah)),
+        "top" => Ok((ax, ay, aw, half_h)),
+        "bottom" => Ok((ax, ay + h / 2, aw, ah - (h / 2) as u32)),
+        "top-left" => Ok((ax, ay, half_w, half_h)),
+        "top-right" => Ok((ax + w / 2, ay, aw - (w / 2) as u32, half_h)),
+        "bottom-left" => Ok((ax, ay + h / 2, half_w, ah - (h / 2) as u32)),
+        "bottom-right" => Ok((
+            ax + w / 2,
+            ay + h / 2,
+            aw - (w / 2) as u32,
+            ah - (h / 2) as u32,
+        )),
+        "left-third" => Ok((ax, ay, third_w, ah)),
+        "center-third" => Ok((ax + w / 3, ay, third_w, ah)),
+        "right-third" => Ok((ax + (w * 2) / 3, ay, aw - ((w * 2) / 3) as u32, ah)),
+        "center" => {
+            let cw = ((aw as f64) * 0.75).round() as u32;
+            let ch = ((ah as f64) * 0.80).round() as u32;
+            let cx = ax + ((aw - cw) / 2) as i32;
+            let cy = ay + ((ah - ch) / 2) as i32;
+            Ok((cx, cy, cw, ch))
+        }
+        "maximize" => Ok((ax, ay, aw, ah)),
+        _ => Err(format!("Unknown snap preset: {preset}")),
+    }
+}
+
+#[tauri::command]
+fn open_new_window(app: AppHandle, project_path: Option<String>) -> Result<(), String> {
+    let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed);
+    let label = format!("vcode-{id}");
+    let (url, title) = match project_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("VCode");
+            (
+                WebviewUrl::App(format!("index.html?project={}", percent_encode_query(p)).into()),
+                format!("VCode — {name}"),
+            )
+        }
+        None => (
+            WebviewUrl::App("index.html".into()),
+            "VCode — Code Visualizer".to_string(),
+        ),
+    };
+
+    WebviewWindowBuilder::new(&app, label, url)
+        .title(title)
+        .inner_size(1400.0, 900.0)
+        .min_inner_size(420.0, 320.0)
+        .build()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open new window: {e}"))
+}
+
+#[tauri::command]
+fn snap_window(window: WebviewWindow, preset: String) -> Result<(), String> {
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| format!("Failed to query monitor: {e}"))?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .ok_or_else(|| "No monitor detected".to_string())?;
+    let wa = monitor.work_area();
+    let (x, y, w, h) = compute_snap_rect(wa.position.x, wa.position.y, wa.size.width, wa.size.height, &preset)?;
+
+    let _ = window.unmaximize();
+    window
+        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .map_err(|e| format!("Failed to position window: {e}"))?;
+    window
+        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(w, h)))
+        .map_err(|e| format!("Failed to resize window: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_window_title(window: WebviewWindow, title: String) -> Result<(), String> {
+    window
+        .set_title(&title)
+        .map_err(|e| format!("Failed to set window title: {e}"))
+}
+
 #[tauri::command]
 fn get_git_diff(
     project_path: String,
@@ -476,9 +597,23 @@ pub fn run() {
             save_project_settings,
             open_in_editor,
             pick_project_folder,
+            open_new_window,
+            snap_window,
+            set_window_title,
             get_git_diff,
             fetch_pr_review
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<WatcherState>() {
+                    if let Ok(mut guard) = state.active.lock() {
+                        if let Some(prev) = guard.remove(window.label()) {
+                            let _ = prev.stop_tx.send(());
+                        }
+                    }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -540,5 +675,25 @@ mod tests {
             None,
         );
         assert_eq!(cmd, "'/opt/homebrew/bin/nvim' '/tmp/a b/main.rs'");
+    }
+
+    #[test]
+    fn computes_snap_rects_for_halves_and_quarters() {
+        assert_eq!(
+            super::compute_snap_rect(0, 24, 1920, 1056, "left").unwrap(),
+            (0, 24, 960, 1056)
+        );
+        assert_eq!(
+            super::compute_snap_rect(0, 24, 1920, 1056, "right").unwrap(),
+            (960, 24, 960, 1056)
+        );
+        assert_eq!(
+            super::compute_snap_rect(0, 24, 1920, 1056, "bottom-right").unwrap(),
+            (960, 552, 960, 528)
+        );
+        assert_eq!(
+            super::compute_snap_rect(0, 24, 1920, 1056, "left-third").unwrap(),
+            (0, 24, 640, 1056)
+        );
     }
 }
