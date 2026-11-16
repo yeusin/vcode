@@ -10,8 +10,8 @@ use crate::layout::compute_layout;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
-    AnalyzeProgress, DiffStatus, FunctionNode, GitDiffSummary, GroupKind, GroupNode, LodLevel,
-    ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    AnalyzeProgress, DiffLine, DiffStatus, FunctionNode, GitDiffSummary, GroupKind, GroupNode,
+    LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
 
 fn format_duration(ms: u64) -> String {
@@ -23,6 +23,40 @@ fn format_duration(ms: u64) -> String {
         let rem = secs % 60;
         format!("{mins}m {rem:02}s")
     }
+}
+
+fn build_split_rows(lines: &[DiffLine]) -> Vec<(Option<DiffLine>, Option<DiffLine>)> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        match lines[i].kind.as_str() {
+            "del" => {
+                let del_start = i;
+                while i < lines.len() && lines[i].kind == "del" {
+                    i += 1;
+                }
+                let add_start = i;
+                while i < lines.len() && lines[i].kind == "add" {
+                    i += 1;
+                }
+                let dels = &lines[del_start..add_start];
+                let adds = &lines[add_start..i];
+                let n = dels.len().max(adds.len());
+                for k in 0..n {
+                    rows.push((dels.get(k).cloned(), adds.get(k).cloned()));
+                }
+            }
+            "add" => {
+                rows.push((None, Some(lines[i].clone())));
+                i += 1;
+            }
+            _ => {
+                rows.push((Some(lines[i].clone()), Some(lines[i].clone())));
+                i += 1;
+            }
+        }
+    }
+    rows
 }
 
 const RECENT_PROJECTS_KEY: &str = "vcode.recentProjects";
@@ -222,6 +256,8 @@ pub fn App() -> impl IntoView {
     let token_input = RwSignal::new(git_token.get_untracked());
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
+    let diff_modal_file = RwSignal::new(Option::<String>::None);
+    let diff_split_mode = RwSignal::new(false);
 
     let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
 
@@ -1124,24 +1160,28 @@ pub fn App() -> impl IntoView {
                                 if diff.files.is_empty() {
                                     return view! { <div class="review-empty">"Working tree is clean."</div> }.into_any();
                                 }
-                                let g = graph.get();
-                                diff.files.into_iter().map(|fd| {
-                                    let rel = fd.file_path.clone();
-                                    let abs = fd.abs_path.clone();
-                                    let matched_group = g.groups.iter().find(|grp| {
-                                        grp.kind == GroupKind::Module
-                                            && grp.file_path.as_ref().is_some_and(|fp| {
-                                                fp == &abs || fp.ends_with(&format!("/{rel}")) || fp == &rel
-                                            })
-                                    }).map(|grp| grp.id.clone());
+                                let matched_groups: Vec<Option<String>> = graph.with(|g| {
+                                    diff.files.iter().map(|fd| {
+                                        let rel = &fd.file_path;
+                                        let abs = &fd.abs_path;
+                                        g.groups.iter().find(|grp| {
+                                            grp.kind == GroupKind::Module
+                                                && grp.file_path.as_ref().is_some_and(|fp| {
+                                                    fp == abs || fp.ends_with(&format!("/{rel}")) || fp == rel
+                                                })
+                                        }).map(|grp| grp.id.clone())
+                                    }).collect()
+                                });
+                                diff.files.into_iter().zip(matched_groups).map(|(fd, matched_group)| {
+                                    let modal_key = fd.file_path.clone();
                                     view! {
                                         <div
                                             class="review-file-row"
                                             on:click=move |_| {
                                                 if let Some(gid) = &matched_group {
-                                                    selected_id.set(Some(gid.clone()));
                                                     focus_node.run(gid.clone());
                                                 }
+                                                diff_modal_file.set(Some(modal_key.clone()));
                                             }
                                         >
                                             <span class="review-file-name">{fd.file_path}</span>
@@ -1161,18 +1201,19 @@ pub fn App() -> impl IntoView {
                                     return view! { <span /> }.into_any();
                                 };
                                 let sel = selected_id.get();
-                                let g = graph.get();
                                 let target_file = sel.as_deref().and_then(|sid| {
-                                    g.functions
-                                        .iter()
-                                        .find(|f| f.id == sid)
-                                        .map(|f| f.file_path.clone())
-                                        .or_else(|| {
-                                            g.groups
-                                                .iter()
-                                                .find(|grp| grp.id == sid)
-                                                .and_then(|grp| grp.file_path.clone())
-                                        })
+                                    graph.with(|g| {
+                                        g.functions
+                                            .iter()
+                                            .find(|f| f.id == sid)
+                                            .map(|f| f.file_path.clone())
+                                            .or_else(|| {
+                                                g.groups
+                                                    .iter()
+                                                    .find(|grp| grp.id == sid)
+                                                    .and_then(|grp| grp.file_path.clone())
+                                            })
+                                    })
                                 });
                                 let active_fd = target_file
                                     .and_then(|tf| {
@@ -1222,6 +1263,139 @@ pub fn App() -> impl IntoView {
                         </div>
                     </aside>
             </div>
+
+            <Show when=move || diff_modal_file.get().is_some()>
+                {move || {
+                    let target = diff_modal_file.get()?;
+                    let diff = diff_summary.get()?;
+                    let fd = diff.files.into_iter().find(|f| f.file_path == target)?;
+                    let status_label = match fd.status {
+                        DiffStatus::Added => "Added",
+                        DiffStatus::Modified => "Modified",
+                        DiffStatus::Deleted => "Deleted",
+                    };
+                    Some(view! {
+                        <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
+                            <div
+                                class="diff-modal-card"
+                                on:click=move |ev| ev.stop_propagation()
+                            >
+                                <div class="modal-header">
+                                    <div class="diff-modal-title">
+                                        <span class="diff-status-badge">{status_label}</span>
+                                        <span class="diff-modal-path">{fd.file_path.clone()}</span>
+                                        <span class="review-diff-stat">
+                                            <span class="diff-add">{format!("+{}", fd.additions)}</span>
+                                            " "
+                                            <span class="diff-del">{format!("-{}", fd.deletions)}</span>
+                                        </span>
+                                    </div>
+                                    <div class="diff-modal-actions">
+                                        <div class="diff-mode-toggle">
+                                            <button
+                                                class=move || if !diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
+                                                on:click=move |_| diff_split_mode.set(false)
+                                            >
+                                                "Unified"
+                                            </button>
+                                            <button
+                                                class=move || if diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
+                                                on:click=move |_| diff_split_mode.set(true)
+                                            >
+                                                "Split"
+                                            </button>
+                                        </div>
+                                        <button class="btn btn-ghost" on:click=move |_| diff_modal_file.set(None)>"✕"</button>
+                                    </div>
+                                </div>
+                                <div class="diff-modal-body">
+                                    {if fd.hunks.is_empty() {
+                                        view! { <div class="review-empty">"No diff hunks available for this file."</div> }.into_any()
+                                    } else {
+                                        fd.hunks.into_iter().map(|h| {
+                                            let hdr = format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines);
+                                            let h_lines = h.lines;
+                                            view! {
+                                                <div class="diff-modal-hunk">
+                                                    <div class="diff-hunk-hdr">{hdr}</div>
+                                                    {move || {
+                                                        if diff_split_mode.get() {
+                                                            let rows = build_split_rows(&h_lines);
+                                                            view! {
+                                                                <div class="diff-split-table">
+                                                                    {rows.into_iter().map(|(left, right)| {
+                                                                        let l_cls = match left.as_ref().map(|x| x.kind.as_str()) {
+                                                                            Some("del") => "diff-split-cell is-del",
+                                                                            Some(_) => "diff-split-cell",
+                                                                            None => "diff-split-cell is-empty",
+                                                                        };
+                                                                        let r_cls = match right.as_ref().map(|x| x.kind.as_str()) {
+                                                                            Some("add") => "diff-split-cell is-add",
+                                                                            Some(_) => "diff-split-cell",
+                                                                            None => "diff-split-cell is-empty",
+                                                                        };
+                                                                        let l_num = left.as_ref().and_then(|x| x.old_line).map(|n| n.to_string()).unwrap_or_default();
+                                                                        let l_sig = left.as_ref().map(|x| if x.kind == "del" { "-" } else { " " }).unwrap_or("");
+                                                                        let l_txt = left.map(|x| x.text).unwrap_or_default();
+                                                                        let r_num = right.as_ref().and_then(|x| x.new_line).map(|n| n.to_string()).unwrap_or_default();
+                                                                        let r_sig = right.as_ref().map(|x| if x.kind == "add" { "+" } else { " " }).unwrap_or("");
+                                                                        let r_txt = right.map(|x| x.text).unwrap_or_default();
+                                                                        view! {
+                                                                            <div class="diff-split-row">
+                                                                                <div class=l_cls>
+                                                                                    <span class="diff-ln">{l_num}</span>
+                                                                                    <span class="diff-sig">{l_sig}</span>
+                                                                                    <span class="diff-txt">{l_txt}</span>
+                                                                                </div>
+                                                                                <div class=r_cls>
+                                                                                    <span class="diff-ln">{r_num}</span>
+                                                                                    <span class="diff-sig">{r_sig}</span>
+                                                                                    <span class="diff-txt">{r_txt}</span>
+                                                                                </div>
+                                                                            </div>
+                                                                        }
+                                                                    }).collect_view()}
+                                                                </div>
+                                                            }.into_any()
+                                                        } else {
+                                                            view! {
+                                                                <div>
+                                                                    {h_lines.iter().cloned().map(|ln| {
+                                                                        let cls = match ln.kind.as_str() {
+                                                                            "add" => "diff-line is-add",
+                                                                            "del" => "diff-line is-del",
+                                                                            _ => "diff-line",
+                                                                        };
+                                                                        let prefix = match ln.kind.as_str() {
+                                                                            "add" => "+",
+                                                                            "del" => "-",
+                                                                            _ => " ",
+                                                                        };
+                                                                        let old_ln = ln.old_line.map(|n| n.to_string()).unwrap_or_default();
+                                                                        let new_ln = ln.new_line.map(|n| n.to_string()).unwrap_or_default();
+                                                                        view! {
+                                                                            <div class=cls>
+                                                                                <span class="diff-ln">{old_ln}</span>
+                                                                                <span class="diff-ln">{new_ln}</span>
+                                                                                <span class="diff-sig">{prefix}</span>
+                                                                                <span class="diff-txt">{ln.text}</span>
+                                                                            </div>
+                                                                        }
+                                                                    }).collect_view()}
+                                                                </div>
+                                                            }.into_any()
+                                                        }
+                                                    }}
+                                                </div>
+                                            }
+                                        }).collect_view().into_any()
+                                    }}
+                                </div>
+                            </div>
+                        </div>
+                    })
+                }}
+            </Show>
 
             <Show when=move || settings_open.get()>
                 <div class="modal-backdrop" on:click=move |_| settings_open.set(false)>
