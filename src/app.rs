@@ -602,6 +602,34 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Auto-scroll diff popup to the first changed line
+    Effect::new(move |_| {
+        let Some(_) = diff_modal_file.get() else {
+            return;
+        };
+        let _mode = diff_split_mode.get();
+        if let Some(win) = web_sys::window() {
+            let cb = Closure::once_into_js(move || {
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    if let (Ok(Some(body)), Ok(Some(first_diff))) = (
+                        doc.query_selector(".diff-modal-body"),
+                        doc.query_selector(".diff-modal-body .is-add, .diff-modal-body .is-del"),
+                    ) {
+                        let body_rect = body.get_bounding_client_rect();
+                        let diff_rect = first_diff.get_bounding_client_rect();
+                        let target_top = (diff_rect.top() - body_rect.top() + body.scroll_top() as f64 - 120.0)
+                            .max(0.0);
+                        body.set_scroll_top(target_top.round() as i32);
+                    }
+                }
+            });
+            let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.unchecked_ref(),
+                0,
+            );
+        }
+    });
+
     let handle_open_folder = move |_| {
         if !tauri_bridge::is_tauri_available() {
             error_banner.set(Some("Folder picker requires the Tauri desktop app.".to_string()));
