@@ -1335,6 +1335,17 @@ body,
   color: var(--text-secondary);
 }
 
+.review-help {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.review-help code {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
 .review-error {
   margin: 8px 12px 0;
   padding: 6px 8px;

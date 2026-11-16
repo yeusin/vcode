@@ -1123,6 +1123,9 @@ pub fn App() -> impl IntoView {
                                     "Get Diff"
                                 </button>
                             </div>
+                            <div class="review-help">
+                                "Accepts "<code>"HEAD"</code>", a branch/ref (e.g. "<code>"main"</code>"), or a PR URL / "<code>"#number"</code>"."
+                            </div>
                             <div class="review-refresh-row">
                                 <span class="review-lbl">"Auto-refresh PR"</span>
                                 {PR_REFRESH_PERIODS.iter().map(|&(label, ms)| {
