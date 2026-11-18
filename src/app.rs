@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -7,14 +7,56 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::{closure::Closure, JsCast};
 
-use crate::canvas::{CanvasView, ReviewOverlay};
-use crate::layout::compute_layout;
+use crate::canvas::{CanvasView, ReviewFilterMode, ReviewOverlay};
+use crate::layout::compute_layout_with_collapsed;
 use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
     AnalyzeProgress, DiffLine, DiffStatus, FileDiff, FunctionNode, GitDiffSummary, GroupKind,
-    GroupNode, LodLevel, ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    GroupNode, LodLevel, PrListItem, ProjectGraph, ProjectSettings, RecentProject, Viewport,
 };
+
+fn jump_diff_hunk(delta: isize) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(Some(body)) = doc.query_selector(".diff-modal-body") else {
+        return;
+    };
+    let Ok(hunks) = body.query_selector_all(".diff-modal-hunk") else {
+        return;
+    };
+    if hunks.length() == 0 {
+        return;
+    }
+    let body_rect = body.get_bounding_client_rect();
+    let scroll_top = body.scroll_top() as f64;
+    let mut tops = Vec::with_capacity(hunks.length() as usize);
+    for i in 0..hunks.length() {
+        if let Some(node) = hunks.item(i) {
+            if let Ok(el) = node.dyn_into::<web_sys::Element>() {
+                let top = el.get_bounding_client_rect().top() - body_rect.top() + scroll_top;
+                tops.push(top);
+            }
+        }
+    }
+    if tops.is_empty() {
+        return;
+    }
+    let target_top = if delta > 0 {
+        tops.iter()
+            .copied()
+            .find(|&t| t > scroll_top + 12.0)
+            .unwrap_or_else(|| *tops.last().unwrap_or(&0.0))
+    } else {
+        tops.iter()
+            .rev()
+            .copied()
+            .find(|&t| t < scroll_top - 12.0)
+            .unwrap_or_else(|| *tops.first().unwrap_or(&0.0))
+    };
+    body.set_scroll_top((target_top - 8.0).max(0.0).round() as i32);
+}
 
 fn ease_out_cubic(t: f64) -> f64 {
     let clamped = t.clamp(0.0, 1.0);
@@ -429,7 +471,7 @@ pub fn App() -> impl IntoView {
     let pending_editor_file = RwSignal::new(Option::<String>::None);
 
     // Code Review & PR state
-    let review_changed_only = RwSignal::new(false);
+    let review_filter_mode = RwSignal::new(ReviewFilterMode::All);
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let git_base_ref = RwSignal::new("HEAD".to_string());
     let active_pr_ref = RwSignal::new(Option::<String>::None);
@@ -439,14 +481,112 @@ pub fn App() -> impl IntoView {
     let token_input = RwSignal::new(git_token.get_untracked());
     let review_busy = RwSignal::new(false);
     let review_error = RwSignal::new(Option::<String>::None);
+    let repo_prs = RwSignal::new(Vec::<PrListItem>::new());
+    let repo_prs_busy = RwSignal::new(false);
+    let repo_prs_error = RwSignal::new(Option::<String>::None);
+    let pr_list_filter = RwSignal::new("involved".to_string());
+    let pr_list_scope = RwSignal::new("all_repos".to_string());
+    let pr_modal_open = RwSignal::new(false);
+    let pr_search_query = RwSignal::new(String::new());
     let diff_modal_file = RwSignal::new(Option::<String>::None);
     let diff_gutter_markers = RwSignal::new(Vec::<DiffGutterMarker>::new());
     let diff_split_mode = RwSignal::new(
         tauri_bridge::local_storage_get(DIFF_SPLIT_MODE_KEY).as_deref() == Some("true"),
     );
     let viewed_files = RwSignal::new(HashMap::<String, String>::new());
+    let canvas_collapsed_ids = RwSignal::new(HashSet::<String>::new());
+    let trace_source_id = RwSignal::new(Option::<String>::None);
+    let palette_open = RwSignal::new(false);
+    let palette_query = RwSignal::new(String::new());
+    let palette_cursor = RwSignal::new(0usize);
+    let expanded_hunks = RwSignal::new(HashSet::<usize>::new());
+    let update_available = RwSignal::new(Option::<(String, String)>::None);
+    let theme_mode = RwSignal::new(
+        tauri_bridge::local_storage_get("vcode.theme").unwrap_or_else(|| "dark".to_string()),
+    );
+    let code_font_size = RwSignal::new(
+        tauri_bridge::local_storage_get("vcode.fontSize")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(12)
+            .clamp(10, 18),
+    );
 
-    let layout = Memo::new(move |_| Arc::new(graph.with(|g| compute_layout(g))));
+    Effect::new(move |_| {
+        let _ = diff_modal_file.get();
+        expanded_hunks.set(HashSet::new());
+    });
+
+    if tauri_bridge::is_tauri_available() {
+        spawn_local(async move {
+            if let Some(info) = tauri_bridge::check_latest_release().await {
+                update_available.set(Some(info));
+            }
+        });
+    }
+
+    let layout = Memo::new(move |_| {
+        let col = canvas_collapsed_ids.get();
+        Arc::new(graph.with(|g| compute_layout_with_collapsed(g, &col)))
+    });
+
+    let trace_path_ids = Memo::new(move |_| {
+        let mut path_set = HashSet::new();
+        let Some(src) = trace_source_id.get() else {
+            return path_set;
+        };
+        let Some(dst) = selected_id.get() else {
+            path_set.insert(src);
+            return path_set;
+        };
+        if src == dst {
+            path_set.insert(src);
+            return path_set;
+        }
+        graph.with(|g| {
+            let mut adj_dir: HashMap<&str, Vec<&str>> = HashMap::new();
+            let mut adj_undir: HashMap<&str, Vec<&str>> = HashMap::new();
+            for e in &g.edges {
+                adj_dir.entry(e.source_id.as_str()).or_default().push(e.target_id.as_str());
+                adj_undir.entry(e.source_id.as_str()).or_default().push(e.target_id.as_str());
+                adj_undir.entry(e.target_id.as_str()).or_default().push(e.source_id.as_str());
+            }
+            let bfs = |adj: &HashMap<&str, Vec<&str>>| -> Option<Vec<String>> {
+                let mut q = VecDeque::new();
+                let mut prev: HashMap<&str, &str> = HashMap::new();
+                let mut vis = HashSet::new();
+                vis.insert(src.as_str());
+                q.push_back(src.as_str());
+                while let Some(cur) = q.pop_front() {
+                    if cur == dst.as_str() {
+                        let mut out = vec![cur.to_string()];
+                        let mut p = cur;
+                        while let Some(&parent) = prev.get(p) {
+                            out.push(parent.to_string());
+                            p = parent;
+                        }
+                        return Some(out);
+                    }
+                    if let Some(nbrs) = adj.get(cur) {
+                        for &n in nbrs {
+                            if vis.insert(n) {
+                                prev.insert(n, cur);
+                                q.push_back(n);
+                            }
+                        }
+                    }
+                }
+                None
+            };
+            if let Some(nodes) = bfs(&adj_dir).or_else(|| bfs(&adj_undir)) {
+                for n in nodes {
+                    path_set.insert(n);
+                }
+            } else {
+                path_set.insert(src);
+            }
+        });
+        path_set
+    });
 
     let review_overlay = Memo::new(move |_| {
         let diff_opt = diff_summary.get();
@@ -456,6 +596,7 @@ pub fn App() -> impl IntoView {
             .is_some();
 
         let mut changed_ids = HashSet::new();
+        let mut impact_ids = HashSet::new();
         let mut diff_stats: HashMap<String, (usize, usize)> = HashMap::new();
 
         graph.with(|g| {
@@ -491,16 +632,89 @@ pub fn App() -> impl IntoView {
                         }
                     }
                 }
+                for edge in &g.edges {
+                    if changed_ids.contains(&edge.source_id) && !changed_ids.contains(&edge.target_id) {
+                        impact_ids.insert(edge.target_id.clone());
+                    }
+                    if changed_ids.contains(&edge.target_id) && !changed_ids.contains(&edge.source_id) {
+                        impact_ids.insert(edge.source_id.clone());
+                    }
+                }
+                let mut parent_map: HashMap<&str, Option<&str>> = HashMap::new();
+                for grp in &g.groups {
+                    parent_map.insert(grp.id.as_str(), grp.parent_id.as_deref());
+                }
+                for fnode in &g.functions {
+                    parent_map.insert(fnode.id.as_str(), Some(fnode.parent_id.as_str()));
+                }
+                let seeds: Vec<String> = impact_ids.iter().cloned().collect();
+                for id in seeds {
+                    let mut cur = parent_map.get(id.as_str()).copied().flatten();
+                    while let Some(pid) = cur {
+                        if !changed_ids.contains(pid) {
+                            impact_ids.insert(pid.to_string());
+                        }
+                        cur = parent_map.get(pid).copied().flatten();
+                    }
+                }
             }
         });
 
+        let selected_mode = review_filter_mode.get();
+        let filter_mode = if is_pr_loaded && selected_mode == ReviewFilterMode::All {
+            ReviewFilterMode::ChangedOnly
+        } else {
+            selected_mode
+        };
+
         ReviewOverlay {
             active: true,
-            changed_only: is_pr_loaded || review_changed_only.get(),
+            changed_only: filter_mode != ReviewFilterMode::All,
+            filter_mode,
             changed_ids,
+            impact_ids,
             diff_stats,
         }
     });
+
+    let load_repo_prs = move || {
+        if !tauri_bridge::is_tauri_available() {
+            return;
+        }
+        let scope = pr_list_scope.get_untracked();
+        let proj = graph.get_untracked().root_path;
+        if scope == "current_repo" && (proj.is_empty() || proj.starts_with("sample://")) {
+            repo_prs.set(Vec::new());
+            repo_prs_error.set(Some("Open a local git repository to list its PRs.".to_string()));
+            return;
+        }
+        repo_prs_busy.set(true);
+        repo_prs_error.set(None);
+        let tok = git_token.get_untracked();
+        spawn_local(async move {
+            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+            let res = if scope == "all_repos" {
+                tauri_bridge::list_involved_prs_all_repos(tok_opt).await
+            } else {
+                tauri_bridge::list_repo_prs(&proj, tok_opt).await
+            };
+            match res {
+                Ok(list) => {
+                    let has_involved = list.iter().any(|p| p.is_involved || p.is_author || p.is_reviewer || p.is_assigned);
+                    if !has_involved && !list.is_empty() {
+                        pr_list_filter.set("all".to_string());
+                    }
+                    repo_prs.set(list);
+                }
+                Err(e) => repo_prs_error.set(Some(e)),
+            }
+            repo_prs_busy.set(false);
+        });
+    };
+
+    if tauri_bridge::is_tauri_available() {
+        load_repo_prs();
+    }
 
     let refresh_local_review = move || {
         active_pr_ref.set(None);
@@ -673,7 +887,7 @@ pub fn App() -> impl IntoView {
                     if prev_diff.as_ref() != Some(&pr_diff) {
                         diff_summary.set(Some(pr_diff));
                     }
-                    review_changed_only.set(true);
+                    review_filter_mode.set(ReviewFilterMode::ChangedOnly);
                 }
                 Err(e) => {
                     loading_label.set(None);
@@ -793,6 +1007,7 @@ pub fn App() -> impl IntoView {
                         git_base_ref.set("HEAD".to_string());
                     }
                     refresh_local_review();
+                    load_repo_prs();
                     let _ = tauri_bridge::watch_project(&path).await;
                 }
                 Err(err) => {
@@ -823,6 +1038,135 @@ pub fn App() -> impl IntoView {
             }
         });
     };
+
+    let mark_viewed_and_next = move |file_path: String, fp: String| {
+        toggle_file_viewed(file_path.clone(), fp, true);
+        let next_unviewed = diff_summary.get_untracked().and_then(|diff| {
+            let viewed = viewed_files.get_untracked();
+            let cur_idx = diff
+                .files
+                .iter()
+                .position(|f| f.file_path == file_path)
+                .unwrap_or(0);
+            diff.files
+                .iter()
+                .skip(cur_idx + 1)
+                .chain(diff.files.iter().take(cur_idx))
+                .find(|f| {
+                    let ffp = file_diff_fingerprint(f);
+                    viewed.get(&f.file_path).is_none_or(|s| s != &ffp)
+                })
+                .map(|f| f.file_path.clone())
+        });
+        diff_modal_file.set(next_unviewed);
+    };
+
+    // Keyboard shortcuts for command palette and diff modal navigation
+    if let Some(win) = web_sys::window() {
+        let on_keydown = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |ev: web_sys::KeyboardEvent| {
+                let key = ev.key();
+                if (ev.meta_key() || ev.ctrl_key()) && (key == "k" || key == "K") {
+                    ev.prevent_default();
+                    let next = !palette_open.get_untracked();
+                    palette_open.set(next);
+                    if next {
+                        palette_query.set(String::new());
+                        palette_cursor.set(0);
+                    }
+                    return;
+                }
+                if palette_open.get_untracked() && key == "Escape" {
+                    ev.prevent_default();
+                    palette_open.set(false);
+                    return;
+                }
+                if pr_modal_open.get_untracked() && key == "Escape" {
+                    ev.prevent_default();
+                    pr_modal_open.set(false);
+                    return;
+                }
+                let Some(current_file) = diff_modal_file.get_untracked() else {
+                    return;
+                };
+                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                    if let Some(active) = doc.active_element() {
+                        let tag = active.tag_name();
+                        if tag == "INPUT" || tag == "TEXTAREA" || tag == "SELECT" {
+                            return;
+                        }
+                    }
+                }
+                let key = ev.key();
+                match key.as_str() {
+                    "Escape" => {
+                        ev.prevent_default();
+                        diff_modal_file.set(None);
+                    }
+                    "ArrowLeft" | "[" => {
+                        ev.prevent_default();
+                        if let Some(diff) = diff_summary.get_untracked() {
+                            if let Some(idx) =
+                                diff.files.iter().position(|f| f.file_path == current_file)
+                            {
+                                if let Some(prev) = idx.checked_sub(1).and_then(|i| diff.files.get(i))
+                                {
+                                    diff_modal_file.set(Some(prev.file_path.clone()));
+                                }
+                            }
+                        }
+                    }
+                    "ArrowRight" | "]" => {
+                        ev.prevent_default();
+                        if let Some(diff) = diff_summary.get_untracked() {
+                            if let Some(idx) =
+                                diff.files.iter().position(|f| f.file_path == current_file)
+                            {
+                                if let Some(next) = diff.files.get(idx + 1) {
+                                    diff_modal_file.set(Some(next.file_path.clone()));
+                                }
+                            }
+                        }
+                    }
+                    "v" | "V" => {
+                        ev.prevent_default();
+                        if let Some(diff) = diff_summary.get_untracked() {
+                            if let Some(fd) =
+                                diff.files.iter().find(|f| f.file_path == current_file)
+                            {
+                                let fp = file_diff_fingerprint(fd);
+                                let is_v = viewed_files
+                                    .get_untracked()
+                                    .get(&current_file)
+                                    .is_some_and(|s| s == &fp);
+                                toggle_file_viewed(current_file, fp, !is_v);
+                            }
+                        }
+                    }
+                    "m" | "M" => {
+                        ev.prevent_default();
+                        let next_mode = !diff_split_mode.get_untracked();
+                        diff_split_mode.set(next_mode);
+                        tauri_bridge::local_storage_set(
+                            DIFF_SPLIT_MODE_KEY,
+                            if next_mode { "true" } else { "false" },
+                        );
+                    }
+                    "n" | "N" | "j" => {
+                        ev.prevent_default();
+                        jump_diff_hunk(1);
+                    }
+                    "p" | "P" | "k" => {
+                        ev.prevent_default();
+                        jump_diff_hunk(-1);
+                    }
+                    _ => {}
+                }
+            },
+        );
+        let _ = win.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref());
+        on_keydown.forget();
+    }
 
     // Sync viewed files with current diff and clear any file whose diff changed
     Effect::new(move |_| {
@@ -859,6 +1203,7 @@ pub fn App() -> impl IntoView {
                         && !is_pr_target(&git_base_ref.get_untracked())
                     {
                         refresh_local_review();
+                    load_repo_prs();
                     }
                 })
                 .await;
@@ -1091,7 +1436,12 @@ pub fn App() -> impl IntoView {
     });
 
     view! {
-        <div class="app-shell" on:click=move |_| open_menu_open.set(false)>
+        <div
+            class="app-shell"
+            data-theme=move || theme_mode.get()
+            style=move || format!("--code-font-size: {}px;", code_font_size.get())
+            on:click=move |_| open_menu_open.set(false)
+        >
             <header class="toolbar">
                 <div class="toolbar-left">
                     <button
@@ -1105,51 +1455,29 @@ pub fn App() -> impl IntoView {
                         <span class="brand-logo">"VCode"</span>
                         <span class="brand-project">{move || graph.get().root_name}</span>
                     </div>
-                    <div class="open-menu-wrap" on:click=move |ev| ev.stop_propagation()>
-                        <button
-                            class="btn btn-primary"
-                            on:click=move |_| open_menu_open.update(|v| *v = !*v)
-                        >
-                            "Open Project ▾"
-                        </button>
-                        <Show when=move || open_menu_open.get()>
-                            <div class="open-menu-popover">
-                                <button
-                                    class="open-menu-item"
-                                    on:click=move |_| {
-                                        open_menu_open.set(false);
-                                        handle_open_folder();
-                                    }
-                                >
-                                    "Local / Cloned Directory..."
-                                </button>
-                                <button
-                                    class="open-menu-item"
-                                    on:click=move |_| {
-                                        open_menu_open.set(false);
-                                        open_url_input.set(String::new());
-                                        open_url_error.set(None);
-                                        open_url_modal.set(true);
-                                    }
-                                >
-                                    "From GitHub / PR URL..."
-                                </button>
-                            </div>
-                        </Show>
-                    </div>
                     <button
-                        class="btn btn-ghost"
-                        title="Open a new project window"
+                        class="btn btn-primary"
+                        title="Open a local directory"
+                        on:click=move |_| handle_open_folder()
+                    >
+                        "Open Dir"
+                    </button>
+                    <button
+                        class="btn btn-ghost pr-inbox-btn"
+                        title="Browse open Pull Requests across repositories"
                         on:click=move |_| {
-                            if !tauri_bridge::is_tauri_available() {
-                                return;
+                            pr_search_query.set(String::new());
+                            pr_modal_open.set(true);
+                            if repo_prs.get_untracked().is_empty() && !repo_prs_busy.get_untracked() {
+                                load_repo_prs();
                             }
-                            spawn_local(async move {
-                                let _ = tauri_bridge::open_new_window(None).await;
-                            });
                         }
                     >
-                        "+ Window"
+                        <span>"Open PRs"</span>
+                        {move || {
+                            let n = repo_prs.get().len();
+                            (n > 0).then(|| view! { <span class="pr-list-count">{n}</span> })
+                        }}
                     </button>
                     <div class="recent-chips">
                         {move || {
@@ -1186,20 +1514,36 @@ pub fn App() -> impl IntoView {
                     <button
                         class=move || {
                             let pr_loaded = diff_summary.get().and_then(|d| d.pr).is_some();
-                            if pr_loaded || review_changed_only.get() {
+                            let mode = review_filter_mode.get();
+                            let active = pr_loaded || mode != ReviewFilterMode::All;
+                            if active {
                                 "toggle-pill impact-pill is-active"
                             } else {
                                 "toggle-pill impact-pill"
                             }
                         }
-                        title="Dim unchanged code and highlight modified files/functions (always on when a PR is loaded)"
+                        title="Cycle review graph filter: All → Changed Only → 1-Hop Impact"
                         on:click=move |_| {
-                            if diff_summary.get_untracked().and_then(|d| d.pr).is_none() {
-                                review_changed_only.update(|v| *v = !*v);
-                            }
+                            let pr_loaded = diff_summary.get_untracked().and_then(|d| d.pr).is_some();
+                            review_filter_mode.update(|m| {
+                                *m = match (*m, pr_loaded) {
+                                    (ReviewFilterMode::All, false) => ReviewFilterMode::ChangedOnly,
+                                    (ReviewFilterMode::All, true) => ReviewFilterMode::BlastRadius,
+                                    (ReviewFilterMode::ChangedOnly, _) => ReviewFilterMode::BlastRadius,
+                                    (ReviewFilterMode::BlastRadius, false) => ReviewFilterMode::All,
+                                    (ReviewFilterMode::BlastRadius, true) => ReviewFilterMode::ChangedOnly,
+                                };
+                            });
                         }
                     >
-                        "Changed Only"
+                        {move || {
+                            let pr_loaded = diff_summary.get().and_then(|d| d.pr).is_some();
+                            match (review_filter_mode.get(), pr_loaded) {
+                                (ReviewFilterMode::All, true) | (ReviewFilterMode::ChangedOnly, _) => "Changed Only",
+                                (ReviewFilterMode::BlastRadius, _) => "1-Hop Impact",
+                                (ReviewFilterMode::All, false) => "All Code",
+                            }
+                        }}
                     </button>
                     <div class="divider" />
                     <span class=move || {
@@ -1232,16 +1576,43 @@ pub fn App() -> impl IntoView {
                             "Fit"
                         </button>
                     </div>
+                    <button
+                        class="btn btn-ghost"
+                        title="Settings"
+                        on:click=move |_| {
+                            settings_input.set(editor_command.get_untracked());
+                            open_in_terminal_input.set(open_in_terminal.get_untracked());
+                            token_input.set(git_token.get_untracked());
+                            pending_editor_file.set(None);
+                            settings_open.set(true);
+                        }
+                    >
+                        "⚙"
+                    </button>
                     <div class="snap-menu-wrap">
                         <button
                             class="btn btn-ghost"
-                            title="Snap and align window"
+                            title="Window actions & snap presets"
                             on:click=move |_| snap_menu_open.update(|v| *v = !*v)
                         >
-                            "Snap"
+                            "Window ▾"
                         </button>
                         <Show when=move || snap_menu_open.get()>
                             <div class="snap-popover">
+                                <button
+                                    class="snap-item window-new-item"
+                                    on:click=move |_| {
+                                        snap_menu_open.set(false);
+                                        if !tauri_bridge::is_tauri_available() {
+                                            return;
+                                        }
+                                        spawn_local(async move {
+                                            let _ = tauri_bridge::open_new_window(None).await;
+                                        });
+                                    }
+                                >
+                                    "+ New Window"
+                                </button>
                                 <div class="snap-grid">
                                     {[
                                         ("left", "◧ Left ½"),
@@ -1276,19 +1647,6 @@ pub fn App() -> impl IntoView {
                             </div>
                         </Show>
                     </div>
-                    <button
-                        class="btn btn-ghost"
-                        title="Settings"
-                        on:click=move |_| {
-                            settings_input.set(editor_command.get_untracked());
-                            open_in_terminal_input.set(open_in_terminal.get_untracked());
-                            token_input.set(git_token.get_untracked());
-                            pending_editor_file.set(None);
-                            settings_open.set(true);
-                        }
-                    >
-                        "⚙"
-                    </button>
                 </div>
             </header>
 
@@ -1297,6 +1655,18 @@ pub fn App() -> impl IntoView {
                     <div class="error-banner">
                         <span>{err}</span>
                         <button class="btn btn-ghost" on:click=move |_| error_banner.set(None)>"✕"</button>
+                    </div>
+                })
+            }}
+
+            {move || {
+                update_available.get().map(|(tag, url)| view! {
+                    <div class="update-banner">
+                        <span>
+                            {format!("New release {tag} is available — ")}
+                            <a href=url target="_blank" rel="noreferrer">"Download"</a>
+                        </span>
+                        <button class="btn btn-ghost" on:click=move |_| update_available.set(None)>"✕"</button>
                     </div>
                 })
             }}
@@ -1447,6 +1817,114 @@ pub fn App() -> impl IntoView {
                         </div>
 
                         {move || {
+                            let Some(sel_id) = selected_id.get() else {
+                                return view! { <span /> }.into_any();
+                            };
+                            let (title, is_group, is_collapsed, callers, callees) = graph.with(|g| {
+                                let mut name_map: HashMap<&str, String> = HashMap::new();
+                                for grp in &g.groups {
+                                    name_map.insert(grp.id.as_str(), grp.name.clone());
+                                }
+                                for fn_n in &g.functions {
+                                    name_map.insert(fn_n.id.as_str(), fn_n.name.clone());
+                                }
+                                let is_grp = g.groups.iter().any(|grp| grp.id == sel_id);
+                                let is_col = canvas_collapsed_ids.get().contains(&sel_id);
+                                let mut in_list: Vec<(String, String)> = Vec::new();
+                                let mut out_list: Vec<(String, String)> = Vec::new();
+                                let mut seen_in = HashSet::new();
+                                let mut seen_out = HashSet::new();
+                                for e in &g.edges {
+                                    if e.target_id == sel_id && seen_in.insert(e.source_id.clone()) {
+                                        let lbl = name_map.get(e.source_id.as_str()).cloned().unwrap_or_else(|| e.source_id.clone());
+                                        in_list.push((e.source_id.clone(), lbl));
+                                    }
+                                    if e.source_id == sel_id && seen_out.insert(e.target_id.clone()) {
+                                        let lbl = name_map.get(e.target_id.as_str()).cloned().unwrap_or_else(|| e.target_id.clone());
+                                        out_list.push((e.target_id.clone(), lbl));
+                                    }
+                                }
+                                let t = name_map.get(sel_id.as_str()).cloned().unwrap_or_else(|| sel_id.clone());
+                                (t, is_grp, is_col, in_list, out_list)
+                            });
+                            let sel_for_col = sel_id.clone();
+                            let sel_for_trace = sel_id.clone();
+                            let is_trace_src = trace_source_id.get().as_deref() == Some(sel_id.as_str());
+                            view! {
+                                <div class="inspector-card">
+                                    <div class="inspector-hdr">
+                                        <span class="inspector-title" title=title.clone()>{title.clone()}</span>
+                                        <div class="inspector-actions">
+                                            {is_group.then(|| {
+                                                let id_c = sel_for_col.clone();
+                                                view! {
+                                                    <button
+                                                        class="btn btn-ghost inspector-btn"
+                                                        title="Collapse or expand group on canvas"
+                                                        on:click=move |_| {
+                                                            canvas_collapsed_ids.update(|s| {
+                                                                if s.contains(&id_c) {
+                                                                    s.remove(&id_c);
+                                                                } else {
+                                                                    s.insert(id_c.clone());
+                                                                }
+                                                            });
+                                                        }
+                                                    >
+                                                        {if is_collapsed { "Expand" } else { "Collapse" }}
+                                                    </button>
+                                                }
+                                            })}
+                                            <button
+                                                class=if is_trace_src { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
+                                                title="Start tracing call path from this node; select another node to highlight path"
+                                                on:click=move |_| {
+                                                    if trace_source_id.get_untracked().as_deref() == Some(sel_for_trace.as_str()) {
+                                                        trace_source_id.set(None);
+                                                    } else {
+                                                        trace_source_id.set(Some(sel_for_trace.clone()));
+                                                    }
+                                                }
+                                            >
+                                                {if is_trace_src { "Tracing…" } else { "Trace Path" }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div class="inspector-cols">
+                                        <div class="inspector-list">
+                                            <div class="inspector-sub">{format!("Callers ({})", callers.len())}</div>
+                                            {if callers.is_empty() {
+                                                view! { <div class="inspector-empty">"None"</div> }.into_any()
+                                            } else {
+                                                callers.into_iter().take(12).map(|(cid, clbl)| {
+                                                    view! {
+                                                        <button class="inspector-link" on:click=move |_| focus_node.run(cid.clone())>
+                                                            {clbl}
+                                                        </button>
+                                                    }
+                                                }).collect_view().into_any()
+                                            }}
+                                        </div>
+                                        <div class="inspector-list">
+                                            <div class="inspector-sub">{format!("Callees ({})", callees.len())}</div>
+                                            {if callees.is_empty() {
+                                                view! { <div class="inspector-empty">"None"</div> }.into_any()
+                                            } else {
+                                                callees.into_iter().take(12).map(|(cid, clbl)| {
+                                                    view! {
+                                                        <button class="inspector-link" on:click=move |_| focus_node.run(cid.clone())>
+                                                            {clbl}
+                                                        </button>
+                                                    }
+                                                }).collect_view().into_any()
+                                            }}
+                                        </div>
+                                    </div>
+                                </div>
+                            }.into_any()
+                        }}
+
+                        {move || {
                             let errs = graph.get().parse_errors;
                             if errs.is_empty() {
                                 view! { <span /> }.into_any()
@@ -1508,15 +1986,72 @@ pub fn App() -> impl IntoView {
                             }.into_any()
                         } else {
                             view! {
-                                <CanvasView
-                                    layout=layout
-                                    viewport=viewport
-                                    selected_id=selected_id
-                                    hovered_id=hovered_id
-                                    review_overlay=review_overlay
-                                    on_open_in_editor=handle_open_in_editor
-                                    on_focus_node=focus_node
-                                />
+                                <>
+                                    {move || {
+                                        let sel = selected_id.get();
+                                        let tracing = trace_source_id.get();
+                                        if sel.is_none() && tracing.is_none() {
+                                            return view! { <span /> }.into_any();
+                                        }
+                                        let crumbs: Vec<(String, String)> = sel.as_ref().map(|sid| {
+                                            graph.with(|g| {
+                                                let grp_map: HashMap<&str, &GroupNode> = g.groups.iter().map(|grp| (grp.id.as_str(), grp)).collect();
+                                                let mut chain = Vec::new();
+                                                let mut cur_parent: Option<String> = if let Some(fn_n) = g.functions.iter().find(|f| &f.id == sid) {
+                                                    chain.push((fn_n.id.clone(), fn_n.name.clone()));
+                                                    Some(fn_n.parent_id.clone())
+                                                } else if let Some(grp) = grp_map.get(sid.as_str()) {
+                                                    chain.push((grp.id.clone(), grp.name.clone()));
+                                                    grp.parent_id.clone()
+                                                } else {
+                                                    None
+                                                };
+                                                while let Some(pid) = cur_parent {
+                                                    if let Some(grp) = grp_map.get(pid.as_str()) {
+                                                        chain.push((grp.id.clone(), grp.name.clone()));
+                                                        cur_parent = grp.parent_id.clone();
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                                chain.reverse();
+                                                chain
+                                            })
+                                        }).unwrap_or_default();
+                                        view! {
+                                            <div class="breadcrumb-bar">
+                                                {crumbs.into_iter().enumerate().map(|(i, (cid, clbl))| {
+                                                    view! {
+                                                        <>
+                                                            {(i > 0).then(|| view! { <span class="breadcrumb-sep">"›"</span> })}
+                                                            <button class="breadcrumb-item" on:click=move |_| focus_node.run(cid.clone())>
+                                                                {clbl}
+                                                            </button>
+                                                        </>
+                                                    }
+                                                }).collect_view()}
+                                                {tracing.is_some().then(|| view! {
+                                                    <button
+                                                        class="breadcrumb-clear-trace"
+                                                        on:click=move |_| trace_source_id.set(None)
+                                                    >
+                                                        "Clear Trace ✕"
+                                                    </button>
+                                                })}
+                                            </div>
+                                        }.into_any()
+                                    }}
+                                    <CanvasView
+                                        layout=layout
+                                        viewport=viewport
+                                        selected_id=selected_id
+                                        hovered_id=hovered_id
+                                        review_overlay=review_overlay
+                                        trace_path_ids=trace_path_ids
+                                        on_open_in_editor=handle_open_in_editor
+                                        on_focus_node=focus_node
+                                    />
+                                </>
                             }.into_any()
                         }
                     }}
@@ -1543,6 +2078,7 @@ pub fn App() -> impl IntoView {
                                                     review_error.set(Some("Use Open Project ▾ → From GitHub / PR URL... to open a PR.".to_string()));
                                                 } else {
                                                     refresh_local_review();
+                    load_repo_prs();
                                                 }
                                             }
                                         }
@@ -1556,6 +2092,7 @@ pub fn App() -> impl IntoView {
                                                 review_error.set(Some("Use Open Project ▾ → From GitHub / PR URL... to open a PR.".to_string()));
                                             } else {
                                                 refresh_local_review();
+                    load_repo_prs();
                                             }
                                         }
                                     >
@@ -1774,6 +2311,8 @@ pub fn App() -> impl IntoView {
                     let modal_fp_chk = modal_fp.clone();
                     let modal_fp_lbl = modal_fp.clone();
                     let modal_path_lbl = fd.file_path.clone();
+                    let modal_fp_next = modal_fp.clone();
+                    let modal_path_next = fd.file_path.clone();
                     Some(view! {
                         <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
                             <div
@@ -1791,6 +2330,22 @@ pub fn App() -> impl IntoView {
                                         </span>
                                     </div>
                                     <div class="diff-modal-actions">
+                                        <div class="diff-hunk-nav">
+                                            <button
+                                                class="btn btn-ghost diff-mode-btn"
+                                                title="Previous hunk (p / k)"
+                                                on:click=move |_| jump_diff_hunk(-1)
+                                            >
+                                                "▲ Hunk"
+                                            </button>
+                                            <button
+                                                class="btn btn-ghost diff-mode-btn"
+                                                title="Next hunk (n / j)"
+                                                on:click=move |_| jump_diff_hunk(1)
+                                            >
+                                                "▼ Hunk"
+                                            </button>
+                                        </div>
                                         <div class="diff-mode-toggle">
                                             <button
                                                 class=move || if !diff_split_mode.get() { "btn btn-primary diff-mode-btn" } else { "btn btn-ghost diff-mode-btn" }
@@ -1819,15 +2374,23 @@ pub fn App() -> impl IntoView {
                                     {if fd.hunks.is_empty() {
                                         view! { <div class="review-empty">"No diff hunks available for this file."</div> }.into_any()
                                     } else {
-                                        fd.hunks.into_iter().map(|h| {
+                                        fd.hunks.into_iter().enumerate().map(|(hunk_idx, h)| {
                                             let hdr = format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines);
                                             let h_lines = h.lines;
+                                            let total_lines = h_lines.len();
                                             view! {
                                                 <div class="diff-modal-hunk">
                                                     <div class="diff-hunk-hdr">{hdr}</div>
                                                     {move || {
-                                                        if diff_split_mode.get() {
-                                                            let rows = build_split_rows(&h_lines);
+                                                        let is_expanded = total_lines <= 80 || expanded_hunks.get().contains(&hunk_idx);
+                                                        let visible_lines: Vec<DiffLine> = if is_expanded {
+                                                            h_lines.clone()
+                                                        } else {
+                                                            h_lines.iter().take(40).cloned().collect()
+                                                        };
+                                                        let hidden = total_lines.saturating_sub(visible_lines.len());
+                                                        let content = if diff_split_mode.get() {
+                                                            let rows = build_split_rows(&visible_lines);
                                                             view! {
                                                                 <div class="diff-split-table">
                                                                     {rows.into_iter().map(|(left, right)| {
@@ -1867,7 +2430,7 @@ pub fn App() -> impl IntoView {
                                                         } else {
                                                             view! {
                                                                 <div>
-                                                                    {h_lines.iter().cloned().map(|ln| {
+                                                                    {visible_lines.into_iter().map(|ln| {
                                                                         let cls = match ln.kind.as_str() {
                                                                             "add" => "diff-line is-add",
                                                                             "del" => "diff-line is-del",
@@ -1891,6 +2454,21 @@ pub fn App() -> impl IntoView {
                                                                     }).collect_view()}
                                                                 </div>
                                                             }.into_any()
+                                                        };
+                                                        view! {
+                                                            <>
+                                                                {content}
+                                                                {(hidden > 0).then(|| view! {
+                                                                    <button
+                                                                        class="diff-expand-btn"
+                                                                        on:click=move |_| {
+                                                                            expanded_hunks.update(|s| { s.insert(hunk_idx); });
+                                                                        }
+                                                                    >
+                                                                        {format!("Show all {total_lines} lines ({hidden} more hidden)")}
+                                                                    </button>
+                                                                })}
+                                                            </>
                                                         }
                                                     }}
                                                 </div>
@@ -1953,42 +2531,57 @@ pub fn App() -> impl IntoView {
                                     >
                                         "← Prev File"
                                     </button>
-                                    <button
-                                        class=move || {
-                                            let is_v = viewed_files
-                                                .get()
-                                                .get(&modal_path_chk)
-                                                .is_some_and(|s| s == &modal_fp_chk);
-                                            if is_v {
-                                                "btn diff-viewed-cta is-viewed"
-                                            } else {
-                                                "btn btn-primary diff-viewed-cta"
+                                    <div class="diff-footer-center">
+                                        <button
+                                            class=move || {
+                                                let is_v = viewed_files
+                                                    .get()
+                                                    .get(&modal_path_chk)
+                                                    .is_some_and(|s| s == &modal_fp_chk);
+                                                if is_v {
+                                                    "btn diff-viewed-cta is-viewed"
+                                                } else {
+                                                    "btn btn-primary diff-viewed-cta"
+                                                }
                                             }
-                                        }
-                                        on:click=move |_| {
-                                            let currently_viewed = viewed_files
-                                                .get_untracked()
-                                                .get(&modal_path_cb)
-                                                .is_some_and(|s| s == &modal_fp);
-                                            toggle_file_viewed(
-                                                modal_path_cb.clone(),
-                                                modal_fp.clone(),
-                                                !currently_viewed,
-                                            );
-                                        }
-                                    >
-                                        {move || {
-                                            let is_v = viewed_files
-                                                .get()
-                                                .get(&modal_path_lbl)
-                                                .is_some_and(|s| s == &modal_fp_lbl);
-                                            if is_v {
-                                                "✓ Viewed"
-                                            } else {
-                                                "✓ Mark as Viewed"
+                                            title="Toggle viewed (v)"
+                                            on:click=move |_| {
+                                                let currently_viewed = viewed_files
+                                                    .get_untracked()
+                                                    .get(&modal_path_cb)
+                                                    .is_some_and(|s| s == &modal_fp);
+                                                toggle_file_viewed(
+                                                    modal_path_cb.clone(),
+                                                    modal_fp.clone(),
+                                                    !currently_viewed,
+                                                );
                                             }
-                                        }}
-                                    </button>
+                                        >
+                                            {move || {
+                                                let is_v = viewed_files
+                                                    .get()
+                                                    .get(&modal_path_lbl)
+                                                    .is_some_and(|s| s == &modal_fp_lbl);
+                                                if is_v {
+                                                    "✓ Viewed"
+                                                } else {
+                                                    "✓ Mark as Viewed"
+                                                }
+                                            }}
+                                        </button>
+                                        <button
+                                            class="btn btn-ghost diff-nav-btn"
+                                            title="Mark as viewed and advance to next unviewed file"
+                                            on:click=move |_| {
+                                                mark_viewed_and_next(
+                                                    modal_path_next.clone(),
+                                                    modal_fp_next.clone(),
+                                                );
+                                            }
+                                        >
+                                            "✓ Viewed & Next →"
+                                        </button>
+                                    </div>
                                     <button
                                         class="btn btn-ghost diff-nav-btn"
                                         disabled=next_file.is_none()
@@ -2064,6 +2657,46 @@ pub fn App() -> impl IntoView {
                             <p class="modal-help">
                                 "Only needed for private repos when "<code>"gh"</code>"/"<code>"glab"</code>" CLI or SSH isn't configured."
                             </p>
+                            <label class="modal-label">"Theme"</label>
+                            <div class="modal-presets">
+                                {[("dark", "Dark"), ("light", "Light"), ("hc", "High Contrast")].into_iter().map(|(val, lbl)| {
+                                    view! {
+                                        <button
+                                            class=move || if theme_mode.get() == val { "preset-chip is-active" } else { "preset-chip" }
+                                            on:click=move |_| {
+                                                theme_mode.set(val.to_string());
+                                                tauri_bridge::local_storage_set("vcode.theme", val);
+                                            }
+                                        >
+                                            {lbl}
+                                        </button>
+                                    }
+                                }).collect_view()}
+                            </div>
+                            <label class="modal-label">"Diff & Code Font Size"</label>
+                            <div class="modal-presets">
+                                <button
+                                    class="preset-chip"
+                                    on:click=move |_| {
+                                        let next = (code_font_size.get_untracked() - 1).max(10);
+                                        code_font_size.set(next);
+                                        tauri_bridge::local_storage_set("vcode.fontSize", &next.to_string());
+                                    }
+                                >
+                                    "A-"
+                                </button>
+                                <span class="modal-help">{move || format!("{} px", code_font_size.get())}</span>
+                                <button
+                                    class="preset-chip"
+                                    on:click=move |_| {
+                                        let next = (code_font_size.get_untracked() + 1).min(18);
+                                        code_font_size.set(next);
+                                        tauri_bridge::local_storage_set("vcode.fontSize", &next.to_string());
+                                    }
+                                >
+                                    "A+"
+                                </button>
+                            </div>
                         </div>
                         <div class="modal-footer">
                             <button class="btn btn-ghost" on:click=move |_| settings_open.set(false)>"Cancel"</button>
@@ -2131,6 +2764,250 @@ pub fn App() -> impl IntoView {
                         <div class="modal-footer">
                             <button class="btn btn-ghost" on:click=move |_| open_url_modal.set(false)>"Cancel"</button>
                             <button class="btn btn-primary" on:click=move |_| submit_open_url()>"Open"</button>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || pr_modal_open.get()>
+                <div class="modal-backdrop" on:click=move |_| pr_modal_open.set(false)>
+                    <div class="pr-modal-card" on:click=move |ev| ev.stop_propagation()>
+                        <div class="modal-header">
+                            <h3>"Open Pull Requests"</h3>
+                            <div class="pr-scope-row">
+                                <button
+                                    class="btn btn-ghost pr-refresh-btn"
+                                    disabled=move || repo_prs_busy.get()
+                                    title="Refresh PR list"
+                                    on:click=move |_| load_repo_prs()
+                                >
+                                    {move || if repo_prs_busy.get() { "…" } else { "↻" }}
+                                </button>
+                                <button class="btn btn-ghost" on:click=move |_| pr_modal_open.set(false)>"✕"</button>
+                            </div>
+                        </div>
+                        <div class="pr-modal-toolbar">
+                            <input
+                                class="modal-input"
+                                type="text"
+                                autofocus=true
+                                placeholder="Filter PRs by title, repo, or @author..."
+                                prop:value=move || pr_search_query.get()
+                                on:input=move |ev| pr_search_query.set(event_target_value(&ev))
+                            />
+                            <div class="pr-filter-row">
+                                {move || {
+                                    let all = repo_prs.get();
+                                    let n_all = all.len();
+                                    let n_inv = all.iter().filter(|p| p.is_involved || p.is_author || p.is_reviewer || p.is_assigned).count();
+                                    let n_rev = all.iter().filter(|p| p.is_reviewer).count();
+                                    let n_mine = all.iter().filter(|p| p.is_author).count();
+                                    let cur = pr_list_filter.get();
+                                    [
+                                        ("involved", format!("Involved ({n_inv})")),
+                                        ("review", format!("Review ({n_rev})")),
+                                        ("mine", format!("Mine ({n_mine})")),
+                                        ("all", format!("All ({n_all})")),
+                                    ]
+                                    .into_iter()
+                                    .map(|(k, lbl)| {
+                                        let cls = if cur == k { "pr-filter-chip is-active" } else { "pr-filter-chip" };
+                                        view! {
+                                            <button class=cls on:click=move |_| pr_list_filter.set(k.to_string())>
+                                                {lbl}
+                                            </button>
+                                        }
+                                    })
+                                    .collect_view()
+                                }}
+                            </div>
+                        </div>
+                        {move || repo_prs_error.get().map(|err| view! {
+                            <div class="review-error">{err}</div>
+                        })}
+                        <div class="pr-modal-list">
+                            {move || {
+                                let filter = pr_list_filter.get();
+                                let q = pr_search_query.get().to_lowercase();
+                                let active_num = diff_summary.get().and_then(|d| d.pr).map(|p| p.number);
+                                let filtered: Vec<PrListItem> = repo_prs
+                                    .get()
+                                    .into_iter()
+                                    .filter(|p| match filter.as_str() {
+                                        "involved" => p.is_involved || p.is_author || p.is_reviewer || p.is_assigned,
+                                        "review" => p.is_reviewer,
+                                        "mine" => p.is_author,
+                                        _ => true,
+                                    })
+                                    .filter(|p| {
+                                        q.is_empty()
+                                            || p.title.to_lowercase().contains(&q)
+                                            || p.repo_name.to_lowercase().contains(&q)
+                                            || p.author.to_lowercase().contains(&q)
+                                            || p.number.to_string().contains(&q)
+                                    })
+                                    .collect();
+                                if filtered.is_empty() {
+                                    view! {
+                                        <div class="palette-empty">
+                                            {if repo_prs_busy.get() { "Loading open PRs..." } else { "No matching open PRs." }}
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    filtered.into_iter().map(|pr| {
+                                        let is_sel = active_num == Some(pr.number);
+                                        let cls = if is_sel { "pr-list-row is-selected" } else { "pr-list-row" };
+                                        let target = if pr.url.is_empty() { format!("#{}", pr.number) } else { pr.url.clone() };
+                                        let role = if pr.is_reviewer {
+                                            Some("Review")
+                                        } else if pr.is_author {
+                                            Some("Author")
+                                        } else if pr.is_assigned {
+                                            Some("Assigned")
+                                        } else {
+                                            None
+                                        };
+                                        let meta_right = if !pr.head_branch.is_empty() {
+                                            format!("{} → {}", pr.head_branch, pr.base_branch)
+                                        } else {
+                                            pr.repo_name.clone()
+                                        };
+                                        let num_lbl = if !pr.repo_name.is_empty() {
+                                            format!("{} #{}", pr.repo_name, pr.number)
+                                        } else {
+                                            format!("#{}", pr.number)
+                                        };
+                                        view! {
+                                            <button
+                                                class=cls
+                                                disabled=move || review_busy.get()
+                                                on:click=move |_| {
+                                                    pr_modal_open.set(false);
+                                                    refresh_pr_review(target.clone());
+                                                }
+                                            >
+                                                <div class="pr-row-top">
+                                                    <span class="pr-row-num">{num_lbl}</span>
+                                                    <span class="pr-row-title">{pr.title}</span>
+                                                    {pr.draft.then(|| view! { <span class="pr-badge is-draft">"Draft"</span> })}
+                                                    {role.map(|r| view! { <span class="pr-badge">{r}</span> })}
+                                                </div>
+                                                <div class="pr-row-meta">
+                                                    <span>{format!("@{}", pr.author)}</span>
+                                                    <span>{meta_right}</span>
+                                                </div>
+                                            </button>
+                                        }
+                                    }).collect_view().into_any()
+                                }
+                            }}
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || palette_open.get()>
+                <div class="modal-backdrop" on:click=move |_| palette_open.set(false)>
+                    <div class="palette-card" on:click=move |ev| ev.stop_propagation()>
+                        <input
+                            class="palette-input"
+                            type="text"
+                            autofocus=true
+                            placeholder="Jump to file, class, function, or changed diff... (Cmd/Ctrl+K)"
+                            prop:value=move || palette_query.get()
+                            on:input=move |ev| {
+                                palette_query.set(event_target_value(&ev));
+                                palette_cursor.set(0);
+                            }
+                            on:keydown=move |ev| {
+                                let q = palette_query.get_untracked().to_lowercase();
+                                let items = graph.with_untracked(|g| {
+                                    let mut res: Vec<(String, String, &'static str)> = Vec::new();
+                                    for grp in &g.groups {
+                                        if q.is_empty() || grp.name.to_lowercase().contains(&q) || grp.file_path.as_deref().unwrap_or("").to_lowercase().contains(&q) {
+                                            let kind = match grp.kind {
+                                                GroupKind::Directory => "dir",
+                                                GroupKind::Module => "file",
+                                                GroupKind::Class => "class",
+                                            };
+                                            res.push((grp.id.clone(), grp.name.clone(), kind));
+                                        }
+                                    }
+                                    for f in &g.functions {
+                                        if q.is_empty() || f.name.to_lowercase().contains(&q) {
+                                            res.push((f.id.clone(), format!("{} ({})", f.name, f.file_path), "fn"));
+                                        }
+                                    }
+                                    res.truncate(24);
+                                    res
+                                });
+                                match ev.key().as_str() {
+                                    "ArrowDown" => {
+                                        ev.prevent_default();
+                                        if !items.is_empty() {
+                                            palette_cursor.update(|c| *c = (*c + 1).min(items.len() - 1));
+                                        }
+                                    }
+                                    "ArrowUp" => {
+                                        ev.prevent_default();
+                                        palette_cursor.update(|c| *c = c.saturating_sub(1));
+                                    }
+                                    "Enter" => {
+                                        ev.prevent_default();
+                                        let idx = palette_cursor.get_untracked();
+                                        if let Some((id, _, _)) = items.get(idx) {
+                                            focus_node.run(id.clone());
+                                            palette_open.set(false);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        />
+                        <div class="palette-results">
+                            {move || {
+                                let q = palette_query.get().to_lowercase();
+                                let cur = palette_cursor.get();
+                                let items = graph.with(|g| {
+                                    let mut res: Vec<(String, String, &'static str)> = Vec::new();
+                                    for grp in &g.groups {
+                                        if q.is_empty() || grp.name.to_lowercase().contains(&q) || grp.file_path.as_deref().unwrap_or("").to_lowercase().contains(&q) {
+                                            let kind = match grp.kind {
+                                                GroupKind::Directory => "dir",
+                                                GroupKind::Module => "file",
+                                                GroupKind::Class => "class",
+                                            };
+                                            res.push((grp.id.clone(), grp.name.clone(), kind));
+                                        }
+                                    }
+                                    for f in &g.functions {
+                                        if q.is_empty() || f.name.to_lowercase().contains(&q) {
+                                            res.push((f.id.clone(), format!("{} ({})", f.name, f.file_path), "fn"));
+                                        }
+                                    }
+                                    res.truncate(24);
+                                    res
+                                });
+                                if items.is_empty() {
+                                    view! { <div class="palette-empty">"No matching symbols or files."</div> }.into_any()
+                                } else {
+                                    items.into_iter().enumerate().map(|(i, (id, label, kind))| {
+                                        let cls = if i == cur { "palette-row is-active" } else { "palette-row" };
+                                        view! {
+                                            <button
+                                                class=cls
+                                                on:click=move |_| {
+                                                    focus_node.run(id.clone());
+                                                    palette_open.set(false);
+                                                }
+                                            >
+                                                <span class="palette-kind">{kind}</span>
+                                                <span class="palette-label">{label}</span>
+                                            </button>
+                                        }
+                                    }).collect_view().into_any()
+                                }
+                            }}
                         </div>
                     </div>
                 </div>

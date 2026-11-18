@@ -986,6 +986,450 @@ pub async fn fetch_pr_review(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrListItem {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    #[serde(default)]
+    pub repo_name: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub draft: bool,
+    pub is_author: bool,
+    pub is_reviewer: bool,
+    pub is_assigned: bool,
+    #[serde(default)]
+    pub is_involved: bool,
+}
+
+fn extract_repo_name_from_pr_json(pr: &serde_json::Value, default_repo: &str) -> String {
+    if let Some(nwo) = pr
+        .get("repository")
+        .and_then(|r| r.get("nameWithOwner"))
+        .and_then(|v| v.as_str())
+    {
+        return nwo.to_string();
+    }
+    if let Some(repo_url) = pr.get("repository_url").and_then(|v| v.as_str()) {
+        if let Some((_, rest)) = repo_url.split_once("/repos/") {
+            return rest.trim_end_matches('/').to_string();
+        }
+    }
+    if let Some(html_url) = pr.get("html_url").or_else(|| pr.get("url")).and_then(|v| v.as_str()) {
+        if let Some((_, rest)) = html_url.split_once("github.com/") {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return format!("{}/{}", parts[0], parts[1]);
+            }
+        }
+    }
+    default_repo.to_string()
+}
+
+fn parse_github_pr_list_with_repo(
+    items: &[serde_json::Value],
+    current_user: Option<&str>,
+    default_repo: &str,
+    mark_all_involved: bool,
+) -> Vec<PrListItem> {
+    items
+        .iter()
+        .filter_map(|pr| {
+            let number = pr.get("number").and_then(|v| v.as_u64())?;
+            let title = pr.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let url = pr
+                .get("html_url")
+                .or_else(|| pr.get("url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let author = pr
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .or_else(|| pr.get("author").and_then(|u| u.get("login")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let head_branch = pr
+                .get("head")
+                .and_then(|h| h.get("ref"))
+                .or_else(|| pr.get("headRefName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let base_branch = pr
+                .get("base")
+                .and_then(|b| b.get("ref"))
+                .or_else(|| pr.get("baseRefName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let draft = pr
+                .get("draft")
+                .or_else(|| pr.get("isDraft"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let is_author = current_user.is_some_and(|u| u.eq_ignore_ascii_case(&author));
+            let is_reviewer = current_user.is_some_and(|u| {
+                pr.get("requested_reviewers")
+                    .or_else(|| pr.get("reviewRequests"))
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|r| {
+                            r.get("login")
+                                .and_then(|l| l.as_str())
+                                .is_some_and(|l| l.eq_ignore_ascii_case(u))
+                        })
+                    })
+            });
+            let is_assigned = current_user.is_some_and(|u| {
+                pr.get("assignees")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|a| {
+                            a.get("login")
+                                .and_then(|l| l.as_str())
+                                .is_some_and(|l| l.eq_ignore_ascii_case(u))
+                        })
+                    })
+            });
+            let repo_name = extract_repo_name_from_pr_json(pr, default_repo);
+            let is_involved = mark_all_involved || is_author || is_reviewer || is_assigned;
+            Some(PrListItem {
+                number,
+                title,
+                url,
+                author,
+                repo_name,
+                head_branch,
+                base_branch,
+                draft,
+                is_author,
+                is_reviewer,
+                is_assigned,
+                is_involved,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn parse_github_pr_list(items: &[serde_json::Value], current_user: Option<&str>) -> Vec<PrListItem> {
+    parse_github_pr_list_with_repo(items, current_user, "", false)
+}
+
+pub async fn list_involved_prs_all_repos(token: Option<String>) -> Result<Vec<PrListItem>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    let tok = resolve_github_token(token);
+    let mut current_user: Option<String> = None;
+    if let Some(t) = tok.as_deref() {
+        if let Ok(u_resp) = client
+            .get("https://api.github.com/user")
+            .header("User-Agent", "vcode-app")
+            .header("Authorization", format!("Bearer {t}"))
+            .send()
+            .await
+        {
+            if u_resp.status().is_success() {
+                if let Ok(uj) = u_resp.json::<serde_json::Value>().await {
+                    current_user = uj.get("login").and_then(|v| v.as_str()).map(str::to_string);
+                }
+            }
+        }
+    }
+
+    if let Some(t) = tok.as_deref() {
+        // Fetch involved PRs and review-requested PRs so we can accurately tag review requests
+        let mut review_urls = std::collections::HashSet::<String>::new();
+        if let Ok(r_resp) = client
+            .get("https://api.github.com/search/issues?q=is:open+is:pr+review-requested:@me&sort=updated&order=desc&per_page=50")
+            .header("User-Agent", "vcode-app")
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {t}"))
+            .send()
+            .await
+        {
+            if r_resp.status().is_success() {
+                if let Ok(rj) = r_resp.json::<serde_json::Value>().await {
+                    if let Some(arr) = rj.get("items").and_then(|v| v.as_array()) {
+                        for it in arr {
+                            if let Some(u) = it.get("html_url").and_then(|v| v.as_str()) {
+                                review_urls.insert(u.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(resp) = client
+            .get("https://api.github.com/search/issues?q=is:open+is:pr+involves:@me&sort=updated&order=desc&per_page=50")
+            .header("User-Agent", "vcode-app")
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {t}"))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse GitHub PR search: {e}"))?;
+                let items = body
+                    .get("items")
+                    .and_then(|v| v.as_array())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let mut parsed =
+                    parse_github_pr_list_with_repo(items, current_user.as_deref(), "", true);
+                for pr in &mut parsed {
+                    if review_urls.contains(&pr.url) {
+                        pr.is_reviewer = true;
+                    }
+                }
+                return Ok(parsed);
+            }
+        }
+    }
+
+    // Fallback to gh CLI
+    let gh_bin = find_cli_binary("gh");
+    if current_user.is_none() {
+        if let Ok(u_out) = Command::new(&gh_bin).args(["api", "user", "--jq", ".login"]).output() {
+            if u_out.status.success() {
+                let u = String::from_utf8_lossy(&u_out.stdout).trim().to_string();
+                if !u.is_empty() {
+                    current_user = Some(u);
+                }
+            }
+        }
+    }
+    let out = Command::new(&gh_bin)
+        .args([
+            "search",
+            "prs",
+            "--involves",
+            "@me",
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,url,author,repository,isDraft,assignees",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run gh search prs: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to list PRs across repositories (configure a GitHub token in Settings or sign in with `gh auth login`): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("Failed to parse gh search prs JSON: {e}"))?;
+    Ok(parse_github_pr_list_with_repo(
+        &items,
+        current_user.as_deref(),
+        "",
+        true,
+    ))
+}
+
+pub async fn list_repo_prs(
+    project_path: &str,
+    token: Option<String>,
+) -> Result<Vec<PrListItem>, String> {
+    let root = Path::new(project_path);
+    let (_, host, repo_path) = parse_remote_repo(root)
+        .ok_or_else(|| "No GitHub/GitLab origin remote found for this project.".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    if host.contains("github.com") {
+        let mut parts = repo_path.splitn(2, '/');
+        let owner = parts.next().unwrap_or("");
+        let repo = parts.next().unwrap_or("");
+        if owner.is_empty() || repo.is_empty() {
+            return Err(format!("Invalid GitHub repository path: {repo_path}"));
+        }
+        let tok = resolve_github_token(token);
+        let mut current_user: Option<String> = None;
+        if let Some(t) = tok.as_deref() {
+            if let Ok(u_resp) = client
+                .get("https://api.github.com/user")
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", format!("Bearer {t}"))
+                .send()
+                .await
+            {
+                if u_resp.status().is_success() {
+                    if let Ok(uj) = u_resp.json::<serde_json::Value>().await {
+                        current_user = uj.get("login").and_then(|v| v.as_str()).map(str::to_string);
+                    }
+                }
+            }
+        }
+
+        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/pulls?state=open&per_page=50");
+        let mut req = client
+            .get(&api_url)
+            .header("User-Agent", "vcode-app")
+            .header("Accept", "application/vnd.github+json");
+        if let Some(t) = tok.as_deref() {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let api_res = req.send().await;
+        if let Ok(resp) = api_res {
+            if resp.status().is_success() {
+                let items: Vec<serde_json::Value> = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse GitHub PR list: {e}"))?;
+                return Ok(parse_github_pr_list_with_repo(
+                    &items,
+                    current_user.as_deref(),
+                    &repo_path,
+                    false,
+                ));
+            }
+        }
+
+        // Fallback to gh CLI
+        let gh_bin = find_cli_binary("gh");
+        if current_user.is_none() {
+            if let Ok(u_out) = Command::new(&gh_bin).args(["api", "user", "--jq", ".login"]).output() {
+                if u_out.status.success() {
+                    let u = String::from_utf8_lossy(&u_out.stdout).trim().to_string();
+                    if !u.is_empty() {
+                        current_user = Some(u);
+                    }
+                }
+            }
+        }
+        let out = Command::new(&gh_bin)
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                &format!("{owner}/{repo}"),
+                "--state",
+                "open",
+                "--limit",
+                "50",
+                "--json",
+                "number,title,url,author,headRefName,baseRefName,isDraft,reviewRequests,assignees",
+            ])
+            .output()
+            .map_err(|e| format!("Failed to run gh pr list: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "gh pr list failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
+            .map_err(|e| format!("Failed to parse gh pr list JSON: {e}"))?;
+        return Ok(parse_github_pr_list_with_repo(
+            &items,
+            current_user.as_deref(),
+            &repo_path,
+            false,
+        ));
+    }
+
+    // GitLab
+    let tok = token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("GITLAB_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| resolve_cli_token("glab", &["config", "get", "token"]));
+    let mut current_user: Option<String> = None;
+    if let Some(t) = tok.as_deref() {
+        if let Ok(u_resp) = client
+            .get(format!("https://{host}/api/v4/user"))
+            .header("PRIVATE-TOKEN", t)
+            .send()
+            .await
+        {
+            if u_resp.status().is_success() {
+                if let Ok(uj) = u_resp.json::<serde_json::Value>().await {
+                    current_user = uj.get("username").and_then(|v| v.as_str()).map(str::to_string);
+                }
+            }
+        }
+    }
+    let encoded = repo_path.replace('/', "%2F");
+    let mr_url = format!("https://{host}/api/v4/projects/{encoded}/merge_requests?state=opened&per_page=50");
+    let mut req = client.get(&mr_url).header("User-Agent", "vcode-app");
+    if let Some(t) = tok.as_deref() {
+        req = req.header("PRIVATE-TOKEN", t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitLab MRs: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitLab MR list failed (HTTP {})", resp.status()));
+    }
+    let items: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse GitLab MR list: {e}"))?;
+    let out = items
+        .iter()
+        .filter_map(|mr| {
+            let number = mr.get("iid").and_then(|v| v.as_u64())?;
+            let title = mr.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let url = mr.get("web_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let author = mr
+                .get("author")
+                .and_then(|u| u.get("username"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let head_branch = mr.get("source_branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let base_branch = mr.get("target_branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let draft = mr.get("draft").or_else(|| mr.get("work_in_progress")).and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_author = current_user.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&author));
+            let is_reviewer = current_user.as_deref().is_some_and(|u| {
+                mr.get("reviewers").and_then(|v| v.as_array()).is_some_and(|arr| {
+                    arr.iter().any(|r| r.get("username").and_then(|l| l.as_str()).is_some_and(|l| l.eq_ignore_ascii_case(u)))
+                })
+            });
+            let is_assigned = current_user.as_deref().is_some_and(|u| {
+                mr.get("assignees").and_then(|v| v.as_array()).is_some_and(|arr| {
+                    arr.iter().any(|a| a.get("username").and_then(|l| l.as_str()).is_some_and(|l| l.eq_ignore_ascii_case(u)))
+                })
+            });
+            Some(PrListItem {
+                number,
+                title,
+                url,
+                author,
+                repo_name: repo_path.clone(),
+                head_branch,
+                base_branch,
+                draft,
+                is_author,
+                is_reviewer,
+                is_assigned,
+                is_involved: is_author || is_reviewer || is_assigned,
+            })
+        })
+        .collect();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,5 +1525,37 @@ index 111..222 100644
                 "https://github.com/yeusin/vcode.git".to_string()
             )
         );
+    }
+
+    #[test]
+    fn parses_github_pr_list_with_involvement_flags() {
+        let raw = serde_json::json!([
+            {
+                "number": 42,
+                "title": "Add PR selector",
+                "html_url": "https://github.com/yeusin/vcode/pull/42",
+                "user": { "login": "alice" },
+                "head": { "ref": "feat/pr-list" },
+                "base": { "ref": "main" },
+                "draft": false,
+                "requested_reviewers": [{ "login": "ykim" }],
+                "assignees": []
+            },
+            {
+                "number": 43,
+                "title": "My own PR",
+                "html_url": "https://github.com/yeusin/vcode/pull/43",
+                "user": { "login": "ykim" },
+                "head": { "ref": "fix/bug" },
+                "base": { "ref": "main" },
+                "draft": true,
+                "requested_reviewers": [],
+                "assignees": [{ "login": "ykim" }]
+            }
+        ]);
+        let items = parse_github_pr_list(raw.as_array().unwrap(), Some("ykim"));
+        assert_eq!(items.len(), 2);
+        assert!(items[0].is_reviewer && !items[0].is_author);
+        assert!(items[1].is_author && items[1].is_assigned && items[1].draft);
     }
 }

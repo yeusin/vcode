@@ -24,6 +24,11 @@ enum Lang {
     JavaScript,
     Rust,
     Go,
+    Java,
+    C,
+    Cpp,
+    CSharp,
+    Ruby,
     Text,
 }
 
@@ -41,6 +46,11 @@ impl Lang {
                 "js" | "jsx" | "mjs" | "cjs" => Some(Lang::JavaScript),
                 "rs" => Some(Lang::Rust),
                 "go" => Some(Lang::Go),
+                "java" => Some(Lang::Java),
+                "c" | "h" => Some(Lang::C),
+                "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Lang::Cpp),
+                "cs" => Some(Lang::CSharp),
+                "rb" => Some(Lang::Ruby),
                 "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "icns" | "tiff"
                 | "tif" | "avif" | "pdf" | "zip" | "tar" | "gz" | "tgz" | "xz" | "bz2"
                 | "7z" | "rar" | "exe" | "dll" | "so" | "dylib" | "a" | "lib" | "o"
@@ -63,6 +73,11 @@ impl Lang {
             Lang::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
             Lang::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
             Lang::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            Lang::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            Lang::C => Some(tree_sitter_c::LANGUAGE.into()),
+            Lang::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            Lang::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+            Lang::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
             Lang::Text => None,
         }
     }
@@ -98,6 +113,7 @@ pub struct FunctionNode {
     pub start_line: usize,
     pub end_line: usize,
     pub code: String,
+    pub complexity: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -812,6 +828,49 @@ fn ensure_class_group(
     class_id
 }
 
+fn estimate_complexity(node: Node, src: &str) -> usize {
+    fn walk(n: Node, src: &str, count: &mut usize) {
+        match n.kind() {
+            "if_statement"
+            | "if_expression"
+            | "elif_clause"
+            | "elsif"
+            | "for_statement"
+            | "for_in_statement"
+            | "for_expression"
+            | "enhanced_for_statement"
+            | "foreach_statement"
+            | "while_statement"
+            | "while_expression"
+            | "do_statement"
+            | "match_arm"
+            | "switch_case"
+            | "case_clause"
+            | "when"
+            | "catch_clause"
+            | "rescue"
+            | "conditional_expression"
+            | "ternary_expression" => {
+                *count += 1;
+            }
+            "binary_expression" => {
+                let txt = node_text(n, src);
+                if txt.contains("&&") || txt.contains("||") {
+                    *count += 1;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            walk(child, src, count);
+        }
+    }
+    let mut count = 1usize;
+    walk(node, src, &mut count);
+    count
+}
+
 fn register_function(
     ctx: &mut ExtractContext,
     name: String,
@@ -834,6 +893,9 @@ fn register_function(
     };
 
     let code = slice_lines(ctx.src, start_line, end_line);
+    let complexity = body_node
+        .map(|b| estimate_complexity(b, ctx.src))
+        .unwrap_or(1);
     ctx.functions.push(FunctionNode {
         id: fn_id.clone(),
         name: name.clone(),
@@ -848,6 +910,7 @@ fn register_function(
         start_line,
         end_line,
         code,
+        complexity,
     });
 
     if let Some(cid) = &class_id {
@@ -873,6 +936,10 @@ fn extract_module(root: Node, ctx: &mut ExtractContext) {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => extract_ts_js(root, ctx),
         Lang::Rust => extract_rust(root, ctx),
         Lang::Go => extract_go(root, ctx),
+        Lang::Java => extract_java(root, ctx),
+        Lang::C | Lang::Cpp => extract_c_cpp(root, ctx),
+        Lang::CSharp => extract_csharp(root, ctx),
+        Lang::Ruby => extract_ruby(root, ctx),
         Lang::Text => {}
     }
 }
@@ -1380,6 +1447,313 @@ fn extract_go_fn(
 }
 
 // ---------------- CALL EXTRACTION ----------------
+// ---------------- JAVA / C / C++ / C# / RUBY ----------------
+fn extract_java(root: Node, ctx: &mut ExtractContext) {
+    fn walk(node: Node, ctx: &mut ExtractContext, class_id: Option<&str>, prefix: &str) {
+        match node.kind() {
+            "import_declaration" => {
+                let raw = node_text(node, ctx.src)
+                    .trim_start_matches("import")
+                    .trim_start_matches("static")
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
+                if !raw.is_empty() {
+                    ctx.mod_info.raw_imports.push(raw.to_string());
+                }
+            }
+            "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let cname = node_text(name_node, ctx.src).to_string();
+                    let cid = ensure_class_group(
+                        ctx,
+                        &cname,
+                        node.start_position().row + 1,
+                        node.end_position().row + 1,
+                        None,
+                    );
+                    let mut c = node.walk();
+                    for child in node.named_children(&mut c) {
+                        if child.id() != name_node.id() {
+                            walk(child, ctx, Some(&cid), &format!("{cname}."));
+                        }
+                    }
+                    return;
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                let mut c = node.walk();
+                let name_node = node.child_by_field_name("name").or_else(|| {
+                    node.named_children(&mut c)
+                        .find(|ch| ch.kind() == "identifier")
+                });
+                if let Some(name_node) = name_node {
+                    let name = node_text(name_node, ctx.src).to_string();
+                    let params = node
+                        .child_by_field_name("parameters")
+                        .map(|p| node_text(p, ctx.src))
+                        .unwrap_or("()");
+                    let start = node.start_position().row + 1;
+                    let end = node.end_position().row + 1;
+                    let parent = class_id.unwrap_or(ctx.module_id).to_string();
+                    register_function(
+                        ctx,
+                        name,
+                        parent,
+                        class_id.map(str::to_string),
+                        prefix,
+                        false,
+                        Vec::new(),
+                        params.to_string(),
+                        None,
+                        start,
+                        end,
+                        node.child_by_field_name("body"),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, ctx, class_id, prefix);
+        }
+    }
+    walk(root, ctx, None, "");
+}
+
+fn extract_c_cpp(root: Node, ctx: &mut ExtractContext) {
+    fn find_fn_name(decl: Node, src: &str) -> Option<String> {
+        if decl.kind() == "identifier" || decl.kind() == "field_identifier" {
+            return Some(node_text(decl, src).to_string());
+        }
+        if let Some(inner) = decl.child_by_field_name("declarator") {
+            return find_fn_name(inner, src);
+        }
+        let mut cursor = decl.walk();
+        for ch in decl.named_children(&mut cursor) {
+            if let Some(n) = find_fn_name(ch, src) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    fn walk(node: Node, ctx: &mut ExtractContext, class_id: Option<&str>, prefix: &str) {
+        match node.kind() {
+            "preproc_include" => {
+                if let Some(path_node) = node.child_by_field_name("path") {
+                    let raw = node_text(path_node, ctx.src)
+                        .trim_matches(|c| c == '"' || c == '<' || c == '>');
+                    if !raw.is_empty() {
+                        ctx.mod_info.raw_imports.push(raw.to_string());
+                    }
+                }
+            }
+            "class_specifier" | "struct_specifier" => {
+                if let (Some(name_node), Some(body)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("body"),
+                ) {
+                    let cname = node_text(name_node, ctx.src).to_string();
+                    let cid = ensure_class_group(
+                        ctx,
+                        &cname,
+                        node.start_position().row + 1,
+                        node.end_position().row + 1,
+                        None,
+                    );
+                    let mut c = body.walk();
+                    for child in body.named_children(&mut c) {
+                        walk(child, ctx, Some(&cid), &format!("{cname}::"));
+                    }
+                    return;
+                }
+            }
+            "function_definition" => {
+                if let Some(decl) = node.child_by_field_name("declarator") {
+                    if let Some(name) = find_fn_name(decl, ctx.src) {
+                        let start = node.start_position().row + 1;
+                        let end = node.end_position().row + 1;
+                        let parent = class_id.unwrap_or(ctx.module_id).to_string();
+                        register_function(
+                            ctx,
+                            name,
+                            parent,
+                            class_id.map(str::to_string),
+                            prefix,
+                            false,
+                            Vec::new(),
+                            "()".to_string(),
+                            None,
+                            start,
+                            end,
+                            node.child_by_field_name("body"),
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, ctx, class_id, prefix);
+        }
+    }
+    walk(root, ctx, None, "");
+}
+
+fn extract_csharp(root: Node, ctx: &mut ExtractContext) {
+    fn walk(node: Node, ctx: &mut ExtractContext, class_id: Option<&str>, prefix: &str) {
+        match node.kind() {
+            "using_directive" => {
+                let raw = node_text(node, ctx.src)
+                    .trim_start_matches("using")
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
+                if !raw.is_empty() {
+                    ctx.mod_info.raw_imports.push(raw.to_string());
+                }
+            }
+            "class_declaration" | "interface_declaration" | "struct_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let cname = node_text(name_node, ctx.src).to_string();
+                    let cid = ensure_class_group(
+                        ctx,
+                        &cname,
+                        node.start_position().row + 1,
+                        node.end_position().row + 1,
+                        None,
+                    );
+                    let mut c = node.walk();
+                    for child in node.named_children(&mut c) {
+                        if child.id() != name_node.id() {
+                            walk(child, ctx, Some(&cid), &format!("{cname}."));
+                        }
+                    }
+                    return;
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                let mut c = node.walk();
+                let name_node = node.child_by_field_name("name").or_else(|| {
+                    node.named_children(&mut c)
+                        .find(|ch| ch.kind() == "identifier")
+                });
+                if let Some(name_node) = name_node {
+                    let name = node_text(name_node, ctx.src).to_string();
+                    let params = node
+                        .child_by_field_name("parameters")
+                        .map(|p| node_text(p, ctx.src))
+                        .unwrap_or("()");
+                    let is_async = node_text(node, ctx.src).contains("async ");
+                    let start = node.start_position().row + 1;
+                    let end = node.end_position().row + 1;
+                    let parent = class_id.unwrap_or(ctx.module_id).to_string();
+                    register_function(
+                        ctx,
+                        name,
+                        parent,
+                        class_id.map(str::to_string),
+                        prefix,
+                        is_async,
+                        Vec::new(),
+                        params.to_string(),
+                        None,
+                        start,
+                        end,
+                        node.child_by_field_name("body"),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, ctx, class_id, prefix);
+        }
+    }
+    walk(root, ctx, None, "");
+}
+
+fn extract_ruby(root: Node, ctx: &mut ExtractContext) {
+    fn walk(node: Node, ctx: &mut ExtractContext, class_id: Option<&str>, prefix: &str) {
+        match node.kind() {
+            "call" => {
+                if let Some(method_node) = node.child_by_field_name("method") {
+                    let m = node_text(method_node, ctx.src);
+                    if m == "require" || m == "require_relative" {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            let raw = node_text(args, ctx.src)
+                                .trim()
+                                .trim_matches(|c| c == '(' || c == ')' || c == '\'' || c == '"');
+                            if !raw.is_empty() {
+                                ctx.mod_info.raw_imports.push(raw.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "class" | "module" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let cname = node_text(name_node, ctx.src).to_string();
+                    let cid = ensure_class_group(
+                        ctx,
+                        &cname,
+                        node.start_position().row + 1,
+                        node.end_position().row + 1,
+                        None,
+                    );
+                    let mut c = node.walk();
+                    for child in node.named_children(&mut c) {
+                        if child.id() != name_node.id() {
+                            walk(child, ctx, Some(&cid), &format!("{cname}."));
+                        }
+                    }
+                    return;
+                }
+            }
+            "method" | "singleton_method" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = node_text(name_node, ctx.src).to_string();
+                    let params = node
+                        .child_by_field_name("parameters")
+                        .map(|p| node_text(p, ctx.src))
+                        .unwrap_or("()");
+                    let start = node.start_position().row + 1;
+                    let end = node.end_position().row + 1;
+                    let parent = class_id.unwrap_or(ctx.module_id).to_string();
+                    register_function(
+                        ctx,
+                        name,
+                        parent,
+                        class_id.map(str::to_string),
+                        prefix,
+                        false,
+                        Vec::new(),
+                        params.to_string(),
+                        None,
+                        start,
+                        end,
+                        node.child_by_field_name("body"),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, ctx, class_id, prefix);
+        }
+    }
+    walk(root, ctx, None, "");
+}
+
 fn collect_calls(node: Node, ctx: &mut ExtractContext, fn_id: &str, class_id: Option<&str>) {
     match node.kind() {
         "call" | "call_expression" => {
@@ -1431,6 +1805,34 @@ fn collect_calls(node: Node, ctx: &mut ExtractContext, fn_id: &str, class_id: Op
                     }
                     _ => {}
                 }
+            }
+        }
+        "method_invocation" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let receiver = node
+                    .child_by_field_name("object")
+                    .map(|r| node_text(r, ctx.src).to_string());
+                ctx.pending_calls.push(PendingCall {
+                    fn_id: fn_id.to_string(),
+                    module_id: ctx.module_id.to_string(),
+                    class_id: class_id.map(str::to_string),
+                    receiver,
+                    callee: node_text(name_node, ctx.src).to_string(),
+                });
+            }
+        }
+        "invocation_expression" => {
+            if let Some(fn_node) = node.child_by_field_name("function") {
+                let txt = node_text(fn_node, ctx.src);
+                let callee = txt.rsplit('.').next().unwrap_or(txt).to_string();
+                let receiver = txt.rsplit_once('.').map(|(r, _)| r.to_string());
+                ctx.pending_calls.push(PendingCall {
+                    fn_id: fn_id.to_string(),
+                    module_id: ctx.module_id.to_string(),
+                    class_id: class_id.map(str::to_string),
+                    receiver,
+                    callee,
+                });
             }
         }
         "method_call_expression" => {
@@ -1505,7 +1907,53 @@ fn resolve_import_target(
                 }
             }
         }
-        Lang::Python | Lang::Text => {}
+        Lang::Python => {
+            if raw_import.starts_with('.') {
+                let dots = raw_import.chars().take_while(|&c| c == '.').count();
+                let rest = raw_import[dots..].replace('.', "/");
+                let mut dir = Path::new(current_rel_posix).parent().unwrap_or(Path::new(""));
+                for _ in 1..dots {
+                    dir = dir.parent().unwrap_or(Path::new(""));
+                }
+                let joined = if rest.is_empty() {
+                    normalize_rel(dir.to_path_buf())
+                } else {
+                    normalize_rel(dir.join(&rest))
+                };
+                if let Some(found) = module_by_rel_no_ext.get(&joined) {
+                    return Some(found.clone());
+                }
+                let init_path = format!("{joined}/__init__");
+                if let Some(found) = module_by_rel_no_ext.get(&init_path) {
+                    return Some(found.clone());
+                }
+            }
+        }
+        Lang::Java | Lang::CSharp => {
+            if let Some(last) = raw_import.rsplit('.').next() {
+                for (dotted, mod_id) in module_by_dotted {
+                    if dotted.ends_with(&format!(".{last}")) || dotted == last {
+                        return Some(mod_id.clone());
+                    }
+                }
+            }
+        }
+        Lang::C | Lang::Cpp | Lang::Ruby => {
+            let cur_dir = Path::new(current_rel_posix).parent().unwrap_or(Path::new(""));
+            let joined = normalize_rel(cur_dir.join(raw_import));
+            let no_ext = joined
+                .rsplit_once('.')
+                .map(|(a, _)| a)
+                .unwrap_or(&joined);
+            if let Some(found) = module_by_rel_no_ext.get(no_ext) {
+                return Some(found.clone());
+            }
+            let raw_no_ext = raw_import.rsplit_once('.').map(|(a, _)| a).unwrap_or(raw_import);
+            if let Some(found) = module_by_rel_no_ext.get(raw_no_ext) {
+                return Some(found.clone());
+            }
+        }
+        Lang::Text => {}
     }
     None
 }
@@ -1616,6 +2064,43 @@ mod tests {
         assert!(graph.groups.iter().any(|g| g.id == "file:package.json" && g.line_count == 3));
         assert!(graph.groups.iter().any(|g| g.id == "file:docs/README.md" && g.line_count == 2));
         assert!(graph.groups.iter().any(|g| g.id == "file:docs/notes.customext" && g.line_count == 1));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn analyzes_java_cpp_csharp_ruby_and_complexity() {
+        let tmp = std::env::temp_dir().join(format!("vcode_langs_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(
+            tmp.join("App.java"),
+            "public class App {\n    public int run(int x) {\n        if (x > 0) { return helper(x); }\n        return 0;\n    }\n    private int helper(int v) { return v; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("engine.cpp"),
+            "#include \"engine.hpp\"\nint compute(int n) { for (int i=0;i<n;i++) {} return n; }\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("Worker.cs"),
+            "class Worker { void Run() { Step(); } void Step() {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("service.rb"),
+            "class Service\n  def call(x)\n    x > 0 ? x : 0\n  end\nend\n",
+        )
+        .unwrap();
+
+        let graph = analyze_project(&tmp).unwrap();
+        let fn_names: Vec<_> = graph.functions.iter().map(|f| (&f.file_path, &f.name, f.complexity)).collect();
+        assert!(graph.functions.iter().any(|f| f.name == "run" && f.complexity >= 2), "fns: {fn_names:?}");
+        assert!(graph.functions.iter().any(|f| f.name == "compute" && f.complexity >= 2), "fns: {fn_names:?}");
+        assert!(graph.functions.iter().any(|f| f.name == "Run"), "fns: {fn_names:?}, errs: {:?}", graph.parse_errors);
+        assert!(graph.functions.iter().any(|f| f.name == "call"), "fns: {fn_names:?}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

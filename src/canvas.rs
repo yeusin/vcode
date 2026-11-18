@@ -14,12 +14,46 @@ use crate::types::{
     Viewport,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReviewFilterMode {
+    #[default]
+    All,
+    ChangedOnly,
+    BlastRadius,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ReviewOverlay {
     pub active: bool,
     pub changed_only: bool,
+    pub filter_mode: ReviewFilterMode,
     pub changed_ids: HashSet<String>,
+    pub impact_ids: HashSet<String>,
     pub diff_stats: HashMap<String, (usize, usize)>,
+}
+
+impl ReviewOverlay {
+    pub fn is_dimmed(&self, id: &str) -> bool {
+        if !self.active {
+            return false;
+        }
+        match self.filter_mode {
+            ReviewFilterMode::All => {
+                self.changed_only && !self.changed_ids.contains(id)
+            }
+            ReviewFilterMode::ChangedOnly => !self.changed_ids.contains(id),
+            ReviewFilterMode::BlastRadius => {
+                !self.changed_ids.contains(id) && !self.impact_ids.contains(id)
+            }
+        }
+    }
+
+    pub fn is_impact(&self, id: &str) -> bool {
+        self.active
+            && self.filter_mode == ReviewFilterMode::BlastRadius
+            && !self.changed_ids.contains(id)
+            && self.impact_ids.contains(id)
+    }
 }
 
 #[derive(Clone)]
@@ -133,6 +167,7 @@ fn render_canvas(
     fn_counts: &HashMap<String, (usize, usize)>,
     edges_by_node: &HashMap<String, Vec<usize>>,
     review: &ReviewOverlay,
+    trace_path: &HashSet<String>,
     action_hits: &mut Vec<ActionHit>,
 ) {
     action_hits.clear();
@@ -201,7 +236,8 @@ fn render_canvas(
         let is_selected = selected_id == Some(g.node.id.as_str());
         let is_hovered = hovered_id == Some(g.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&g.node.id);
-        let dimmed = review.active && review.changed_only && !is_changed;
+        let is_impact = review.is_impact(&g.node.id);
+        let dimmed = review.is_dimmed(&g.node.id);
 
         let (mut fill, mut stroke, radius) = match g.node.kind {
             GroupKind::Directory => (
@@ -245,6 +281,10 @@ fn render_canvas(
             } else if !is_hovered {
                 stroke = "#f59e0b";
             }
+        } else if trace_path.contains(&g.node.id) {
+            stroke = "#34d399";
+        } else if is_impact && !is_selected && !is_hovered {
+            stroke = "#22d3ee";
         }
 
         ctx.save();
@@ -292,7 +332,7 @@ fn render_canvas(
             );
             continue;
         }
-        let dimmed = review.active && review.changed_only && !is_changed;
+        let dimmed = review.is_dimmed(&fn_item.node.id);
 
         ctx.save();
         if dimmed {
@@ -345,13 +385,19 @@ fn render_canvas(
             ctx.set_fill_style_str("rgba(30, 41, 59, 0.85)");
             ctx.fill_rect(hx + 1.0, hy + 1.0, hw - 2.0, 34.0);
 
-            // Line & caller/callee metadata badge
+            // Line, complexity & caller/callee metadata badge
             let (c_in, c_out) = fn_counts.get(&fn_item.node.id).copied().unwrap_or((0, 0));
+            let c_part = if fn_item.node.complexity >= 2 {
+                format!(" · C{}", fn_item.node.complexity)
+            } else {
+                String::new()
+            };
             let line_badge = format!(
-                "{}L · L{}-{} · {} in · {} out",
+                "{}L · L{}-{}{} · {} in · {} out",
                 fn_item.line_count,
                 fn_item.node.start_line,
                 fn_item.node.end_line,
+                c_part,
                 fmt_edge_count(c_in),
                 fmt_edge_count(c_out)
             );
@@ -369,7 +415,11 @@ fn render_canvas(
             let _ = ctx.fill_text(&clipped_title, hx + 12.0, hy + 21.0);
 
             ctx.set_font("500 10.5px 'Inter', system-ui, sans-serif");
-            ctx.set_fill_style_str("#94a3b8");
+            ctx.set_fill_style_str(if fn_item.node.complexity >= 10 {
+                "#f59e0b"
+            } else {
+                "#94a3b8"
+            });
             let _ = ctx.fill_text(&line_badge, hx + hw - badge_w - 10.0, hy + 21.0);
 
             // Signature
@@ -620,6 +670,27 @@ fn render_canvas(
         }
     }
 
+    // 6b. Traced Call Path Edges
+    if trace_path.len() >= 2 {
+        ctx.save();
+        ctx.set_stroke_style_str("#34d399");
+        ctx.set_line_width(2.5);
+        for e in &layout.edges {
+            if trace_path.contains(&e.edge.source_id) && trace_path.contains(&e.edge.target_id) {
+                let sx1 = e.x1 * scale + viewport.x;
+                let sy1 = e.y1 * scale + viewport.y;
+                let sx2 = e.x2 * scale + viewport.x;
+                let sy2 = e.y2 * scale + viewport.y;
+                ctx.begin_path();
+                ctx.move_to(sx1, sy1);
+                let mx = (sx1 + sx2) * 0.5;
+                ctx.bezier_curve_to(mx, sy1, mx, sy2, sx2, sy2);
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+    }
+
     // 7. Top-right Overview Minimap
     if let Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y)) =
         minimap_geometry(css_w, css_h, layout.bounds)
@@ -820,6 +891,7 @@ pub fn CanvasView(
     selected_id: RwSignal<Option<String>>,
     hovered_id: RwSignal<Option<String>>,
     review_overlay: Memo<ReviewOverlay>,
+    trace_path_ids: Memo<HashSet<String>>,
     on_open_in_editor: Callback<String>,
     on_focus_node: Callback<String>,
 ) -> impl IntoView {
@@ -985,6 +1057,7 @@ pub fn CanvasView(
         let fc = fn_counts.get();
         let ebn = edges_by_node.get();
         let rev = review_overlay.get();
+        let tp = trace_path_ids.get();
 
         let mut hits = hits_for_render.borrow_mut();
         render_canvas(
@@ -997,6 +1070,7 @@ pub fn CanvasView(
             &fc,
             &ebn,
             &rev,
+            &tp,
             &mut hits,
         );
     });
@@ -1025,6 +1099,26 @@ pub fn CanvasView(
     let on_mousedown = move |ev: MouseEvent| {
         if ev.button() != 0 {
             return;
+        }
+        if let Some(canvas) = canvas_ref.get() {
+            let canvas_el: HtmlCanvasElement = canvas.into();
+            let rect = canvas_el.get_bounding_client_rect();
+            let sx = ev.client_x() as f64 - rect.left();
+            let sy = ev.client_y() as f64 - rect.top();
+            let l = layout.get_untracked();
+            if let Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y)) =
+                minimap_geometry(rect.width(), rect.height(), l.bounds)
+            {
+                if sx >= mm_x && sx <= mm_x + mm_w && sy >= mm_y && sy <= mm_y + mm_h {
+                    let wx = l.bounds.x + (sx - off_x) / mm_scale;
+                    let wy = l.bounds.y + (sy - off_y) / mm_scale;
+                    viewport.update(|vp| {
+                        vp.x = rect.width() * 0.5 - wx * vp.scale;
+                        vp.y = rect.height() * 0.5 - wy * vp.scale;
+                    });
+                    return;
+                }
+            }
         }
         let vp = viewport.get_untracked();
         let mut ds = drag_down.borrow_mut();

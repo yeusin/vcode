@@ -111,6 +111,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 5,
                 end_line: 16,
                 code: "async def bootstrap(raw_items: list[dict]) -> list[str]:\n    \"\"\"Parse tasks and run them through PipelineRunner.\"\"\"\n    tasks = [build_task(item) for item in raw_items]\n    runner = PipelineRunner(max_retries=2)\n    return await runner.execute_batch(tasks)".to_string(),
+                complexity: 2,
             },
             FunctionNode {
                 id: "fn:core/models.py::build_task".to_string(),
@@ -126,6 +127,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 4,
                 end_line: 12,
                 code: "def build_task(payload: dict) -> TaskItem:\n    \"\"\"Construct and validate a TaskItem from a dict.\"\"\"\n    item = TaskItem(\n        task_id=str(payload[\"id\"]),\n        priority=int(payload.get(\"priority\", 1)),\n    )\n    item.validate()\n    return item".to_string(),
+                complexity: 1,
             },
             FunctionNode {
                 id: "fn:core/models.py::TaskItem.validate".to_string(),
@@ -141,6 +143,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 18,
                 end_line: 25,
                 code: "def validate(self) -> None:\n    \"\"\"Ensure task_id is non-empty and priority is positive.\"\"\"\n    if not self.task_id.strip():\n        raise ValueError(\"task_id must not be empty\")\n    if self.priority < 1:\n        raise ValueError(\"priority must be >= 1\")".to_string(),
+                complexity: 3,
             },
             FunctionNode {
                 id: "fn:services/runner.py::PipelineRunner.execute_batch".to_string(),
@@ -156,6 +159,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 10,
                 end_line: 21,
                 code: "async def execute_batch(self, tasks: list[TaskItem]) -> list[str]:\n    \"\"\"Run all tasks in priority order.\"\"\"\n    ordered = sorted(tasks, key=lambda t: t.priority, reverse=True)\n    results = []\n    for task in ordered:\n        results.append(await self._run_single(task))\n    return results".to_string(),
+                complexity: 2,
             },
             FunctionNode {
                 id: "fn:services/runner.py::PipelineRunner._run_single".to_string(),
@@ -171,6 +175,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 23,
                 end_line: 34,
                 code: "async def _run_single(self, task: TaskItem) -> str:\n    \"\"\"Execute a single task with retry handling.\"\"\"\n    for attempt in range(1, self.max_retries + 1):\n        try:\n            return format_result(task.task_id, attempt)\n        except RuntimeError:\n            if attempt == self.max_retries:\n                raise\n    return \"unreachable\"".to_string(),
+                complexity: 4,
             },
             FunctionNode {
                 id: "fn:services/runner.py::format_result".to_string(),
@@ -186,6 +191,7 @@ pub fn sample_project() -> ProjectGraph {
                 start_line: 36,
                 end_line: 40,
                 code: "def format_result(task_id: str, attempt: int) -> str:\n    \"\"\"Format completion status string.\"\"\"\n    return f\"completed:{task_id}:attempt={attempt}\"".to_string(),
+                complexity: 1,
             },
         ],
         edges: vec![

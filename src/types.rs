@@ -39,6 +39,8 @@ pub struct FunctionNode {
     pub start_line: usize,
     pub end_line: usize,
     pub code: String,
+    #[serde(default)]
+    pub complexity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +247,25 @@ pub struct PrInfo {
     pub repo_name: String,
     #[serde(default)]
     pub checkout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrListItem {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    #[serde(default)]
+    pub repo_name: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub draft: bool,
+    pub is_author: bool,
+    pub is_reviewer: bool,
+    pub is_assigned: bool,
+    #[serde(default)]
+    pub is_involved: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

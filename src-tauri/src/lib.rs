@@ -596,6 +596,21 @@ async fn fetch_pr_review(
 }
 
 #[tauri::command]
+async fn list_repo_prs(
+    project_path: String,
+    token: Option<String>,
+) -> Result<Vec<review::PrListItem>, String> {
+    review::list_repo_prs(&project_path, token).await
+}
+
+#[tauri::command]
+async fn list_involved_prs_all_repos(
+    token: Option<String>,
+) -> Result<Vec<review::PrListItem>, String> {
+    review::list_involved_prs_all_repos(token).await
+}
+
+#[tauri::command]
 async fn clone_github_repo(repo_url: String, token: Option<String>) -> Result<String, String> {
     review::clone_github_repo(&repo_url, token).await
 }
@@ -626,6 +641,49 @@ fn resolve_cli_target_arg(args: &[String], cwd: &Path) -> Option<String> {
     Some(resolved.to_string_lossy().into_owned())
 }
 
+fn parse_semver_tuple(v: &str) -> Option<(u64, u64, u64)> {
+    let clean = v.trim().trim_start_matches('v');
+    let core = clean.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[tauri::command]
+async fn check_latest_release() -> Result<Option<(String, String)>, String> {
+    let current = parse_semver_tuple(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
+    if current == (0, 0, 0) {
+        return Ok(None);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://api.github.com/repos/yeusin/vcode/releases/latest")
+        .header("User-Agent", "vcode-app")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
+    let url = json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://github.com/yeusin/vcode/releases/latest");
+    if let Some(latest) = parse_semver_tuple(tag) {
+        if latest > current {
+            return Ok(Some((tag.to_string(), url.to_string())));
+        }
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 fn get_launch_target() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
@@ -652,8 +710,11 @@ pub fn run() {
             set_window_title,
             get_git_diff,
             fetch_pr_review,
+            list_repo_prs,
+            list_involved_prs_all_repos,
             clone_github_repo,
-            get_launch_target
+            get_launch_target,
+            check_latest_release
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
@@ -769,5 +830,12 @@ mod tests {
             super::resolve_cli_target_arg(&["vcode".to_string()], &cwd),
             None
         );
+    }
+
+    #[test]
+    fn parses_semver_tags_for_update_check() {
+        assert_eq!(super::parse_semver_tuple("v0.3.5"), Some((0, 3, 5)));
+        assert_eq!(super::parse_semver_tuple("0.4.0-beta.1"), Some((0, 4, 0)));
+        assert!(super::parse_semver_tuple("v0.3.6") > super::parse_semver_tuple("v0.3.5"));
     }
 }

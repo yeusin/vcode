@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::{
     FunctionNode, GroupKind, GroupNode, LayoutResult, PositionedEdge, PositionedFunction,
@@ -140,7 +140,15 @@ fn anchor_points(a: &Rect, b: &Rect) -> (f64, f64, f64, f64) {
     }
 }
 
+#[allow(dead_code)]
 pub fn compute_layout(graph: &ProjectGraph) -> LayoutResult {
+    compute_layout_with_collapsed(graph, &HashSet::new())
+}
+
+pub fn compute_layout_with_collapsed(
+    graph: &ProjectGraph,
+    collapsed_groups: &HashSet<String>,
+) -> LayoutResult {
     let mut group_by_id: HashMap<&str, &GroupNode> = HashMap::new();
     let mut child_group_ids: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut child_fn_map: HashMap<&str, Vec<&FunctionNode>> = HashMap::new();
@@ -168,39 +176,61 @@ pub fn compute_layout(graph: &ProjectGraph) -> LayoutResult {
     let fn_by_id: HashMap<&str, &FunctionNode> =
         graph.functions.iter().map(|f| (f.id.as_str(), f)).collect();
 
+    fn count_functions<'a>(
+        group_id: &'a str,
+        child_group_ids: &HashMap<&'a str, Vec<&'a str>>,
+        child_fn_map: &HashMap<&'a str, Vec<&'a FunctionNode>>,
+    ) -> usize {
+        let own = child_fn_map.get(group_id).map(|v| v.len()).unwrap_or(0);
+        let sub: usize = child_group_ids
+            .get(group_id)
+            .map(|ids| {
+                ids.iter()
+                    .map(|&id| count_functions(id, child_group_ids, child_fn_map))
+                    .sum()
+            })
+            .unwrap_or(0);
+        own + sub
+    }
+
     fn build_box<'a>(
         group_id: &'a str,
         group_by_id: &HashMap<&'a str, &'a GroupNode>,
         child_group_ids: &HashMap<&'a str, Vec<&'a str>>,
         child_fn_map: &HashMap<&'a str, Vec<&'a FunctionNode>>,
+        collapsed_groups: &HashSet<String>,
     ) -> LayoutBox {
         let group = group_by_id[group_id];
+        let is_collapsed = collapsed_groups.contains(group_id);
         let mut child_boxes: Vec<LayoutBox> = Vec::new();
 
-        if let Some(sub_ids) = child_group_ids.get(group_id) {
-            for &sub_id in sub_ids {
-                child_boxes.push(build_box(
-                    sub_id,
-                    group_by_id,
-                    child_group_ids,
-                    child_fn_map,
-                ));
+        if !is_collapsed {
+            if let Some(sub_ids) = child_group_ids.get(group_id) {
+                for &sub_id in sub_ids {
+                    child_boxes.push(build_box(
+                        sub_id,
+                        group_by_id,
+                        child_group_ids,
+                        child_fn_map,
+                        collapsed_groups,
+                    ));
+                }
             }
-        }
 
-        if let Some(sub_fns) = child_fn_map.get(group_id) {
-            for &fn_node in sub_fns {
-                let (width, height, _) = measure_function_box(fn_node);
-                child_boxes.push(LayoutBox {
-                    id: fn_node.id.clone(),
-                    kind: BoxKind::Function,
-                    width,
-                    height,
-                    rel_x: 0.0,
-                    rel_y: 0.0,
-                    children: Vec::new(),
-                    function_count: 1,
-                });
+            if let Some(sub_fns) = child_fn_map.get(group_id) {
+                for &fn_node in sub_fns {
+                    let (width, height, _) = measure_function_box(fn_node);
+                    child_boxes.push(LayoutBox {
+                        id: fn_node.id.clone(),
+                        kind: BoxKind::Function,
+                        width,
+                        height,
+                        rel_x: 0.0,
+                        rel_y: 0.0,
+                        children: Vec::new(),
+                        function_count: 1,
+                    });
+                }
             }
         }
 
@@ -214,7 +244,11 @@ pub fn compute_layout(graph: &ProjectGraph) -> LayoutResult {
             style.min_w,
             style.min_h,
         );
-        let function_count = child_boxes.iter().map(|c| c.function_count).sum();
+        let function_count = if is_collapsed {
+            count_functions(group_id, child_group_ids, child_fn_map)
+        } else {
+            child_boxes.iter().map(|c| c.function_count).sum()
+        };
 
         LayoutBox {
             id: group.id.clone(),
@@ -230,7 +264,15 @@ pub fn compute_layout(graph: &ProjectGraph) -> LayoutResult {
 
     let mut root_boxes: Vec<LayoutBox> = root_group_ids
         .iter()
-        .map(|&id| build_box(id, &group_by_id, &child_group_ids, &child_fn_map))
+        .map(|&id| {
+            build_box(
+                id,
+                &group_by_id,
+                &child_group_ids,
+                &child_fn_map,
+                collapsed_groups,
+            )
+        })
         .collect();
     let (bound_w, bound_h) = pack_boxes(&mut root_boxes, 48.0, 40.0, 40.0, 40.0, 400.0, 300.0);
 
@@ -308,12 +350,46 @@ pub fn compute_layout(graph: &ProjectGraph) -> LayoutResult {
         );
     }
 
+    let mut parent_map: HashMap<&str, &str> = HashMap::new();
+    for g in &graph.groups {
+        if let Some(pid) = &g.parent_id {
+            parent_map.insert(g.id.as_str(), pid.as_str());
+        }
+    }
+    for f in &graph.functions {
+        parent_map.insert(f.id.as_str(), f.parent_id.as_str());
+    }
+    let resolve_visible = |id: &str| -> Option<String> {
+        let mut cur = id;
+        loop {
+            if node_rects.contains_key(cur) {
+                return Some(cur.to_string());
+            }
+            cur = parent_map.get(cur).copied()?;
+        }
+    };
+
     let mut positioned_edges = Vec::new();
+    let mut seen_collapsed_edges: HashSet<(String, String)> = HashSet::new();
     for edge in &graph.edges {
-        let Some(src_rect) = node_rects.get(&edge.source_id) else {
+        let Some(vis_src) = resolve_visible(&edge.source_id) else {
             continue;
         };
-        let Some(dst_rect) = node_rects.get(&edge.target_id) else {
+        let Some(vis_dst) = resolve_visible(&edge.target_id) else {
+            continue;
+        };
+        if vis_src == vis_dst {
+            continue;
+        }
+        if vis_src != edge.source_id || vis_dst != edge.target_id {
+            if !seen_collapsed_edges.insert((vis_src.clone(), vis_dst.clone())) {
+                continue;
+            }
+        }
+        let Some(src_rect) = node_rects.get(&vis_src) else {
+            continue;
+        };
+        let Some(dst_rect) = node_rects.get(&vis_dst) else {
             continue;
         };
         let (x1, y1, x2, y2) = anchor_points(src_rect, dst_rect);
@@ -391,6 +467,7 @@ mod tests {
                     start_line: 1,
                     end_line: 2,
                     code: "def alpha():\n    beta()".to_string(),
+                    complexity: 1,
                 },
                 FunctionNode {
                     id: "fn:b".to_string(),
@@ -406,6 +483,7 @@ mod tests {
                     start_line: 4,
                     end_line: 5,
                     code: "def beta():\n    return 1".to_string(),
+                    complexity: 1,
                 },
             ],
             edges: vec![GraphEdge {
@@ -515,6 +593,7 @@ mod tests {
                 start_line: 1,
                 end_line: 4,
                 code: "def fn(self, x):\n    return x + 1".to_string(),
+                complexity: 1,
             });
         }
 

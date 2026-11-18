@@ -278,6 +278,39 @@ pub async fn fetch_pr_review(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ListPrsArgs<'a> {
+    project_path: &'a str,
+    token: Option<&'a str>,
+}
+
+pub async fn list_repo_prs(
+    project_path: &str,
+    token: Option<&str>,
+) -> Result<Vec<crate::types::PrListItem>, String> {
+    invoke(
+        "list_repo_prs",
+        &ListPrsArgs {
+            project_path,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenArgs<'a> {
+    token: Option<&'a str>,
+}
+
+pub async fn list_involved_prs_all_repos(
+    token: Option<&str>,
+) -> Result<Vec<crate::types::PrListItem>, String> {
+    invoke("list_involved_prs_all_repos", &TokenArgs { token }).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CloneRepoArgs<'a> {
     repo_url: &'a str,
     token: Option<&'a str>,
@@ -289,6 +322,13 @@ pub async fn clone_github_repo(repo_url: &str, token: Option<&str>) -> Result<St
 
 pub async fn get_launch_target() -> Option<String> {
     invoke::<_, Option<String>>("get_launch_target", &EmptyArgs {})
+        .await
+        .ok()
+        .flatten()
+}
+
+pub async fn check_latest_release() -> Option<(String, String)> {
+    invoke::<_, Option<(String, String)>>("check_latest_release", &EmptyArgs {})
         .await
         .ok()
         .flatten()
