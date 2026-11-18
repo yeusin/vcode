@@ -333,3 +333,229 @@ pub async fn check_latest_release() -> Option<(String, String)> {
         .ok()
         .flatten()
 }
+
+pub async fn fetch_pr_details(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: Option<&str>,
+) -> Result<crate::types::PrDetails, String> {
+    invoke(
+        "fetch_pr_details",
+        &FetchPrArgs {
+            project_path,
+            pr_url_or_number,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostPrCommentArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    body: &'a str,
+    token: Option<&'a str>,
+}
+
+pub async fn post_pr_comment(
+    project_path: &str,
+    pr_url_or_number: &str,
+    body: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
+    invoke(
+        "post_pr_comment",
+        &PostPrCommentArgs {
+            project_path,
+            pr_url_or_number,
+            body,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddPrLineCommentArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    path: &'a str,
+    line: usize,
+    side: &'a str,
+    body: &'a str,
+    in_reply_to: Option<u64>,
+    commit_id: &'a str,
+    token: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn add_pr_line_comment(
+    project_path: &str,
+    pr_url_or_number: &str,
+    path: &str,
+    line: usize,
+    side: &str,
+    body: &str,
+    in_reply_to: Option<u64>,
+    commit_id: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
+    invoke(
+        "add_pr_line_comment",
+        &AddPrLineCommentArgs {
+            project_path,
+            pr_url_or_number,
+            path,
+            line,
+            side,
+            body,
+            in_reply_to,
+            commit_id,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvePrThreadArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    thread_id: &'a str,
+    resolve: bool,
+    token: Option<&'a str>,
+}
+
+pub async fn resolve_pr_thread(
+    project_path: &str,
+    pr_url_or_number: &str,
+    thread_id: &str,
+    resolve: bool,
+    token: Option<&str>,
+) -> Result<(), String> {
+    invoke(
+        "resolve_pr_thread",
+        &ResolvePrThreadArgs {
+            project_path,
+            pr_url_or_number,
+            thread_id,
+            resolve,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitPrReviewArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    event: &'a str,
+    body: &'a str,
+    pending_comments: &'a [crate::types::PendingReviewComment],
+    token: Option<&'a str>,
+}
+
+pub async fn submit_pr_review(
+    project_path: &str,
+    pr_url_or_number: &str,
+    event: &str,
+    body: &str,
+    pending_comments: &[crate::types::PendingReviewComment],
+    token: Option<&str>,
+) -> Result<(), String> {
+    invoke(
+        "submit_pr_review",
+        &SubmitPrReviewArgs {
+            project_path,
+            pr_url_or_number,
+            event,
+            body,
+            pending_comments,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagePrArgs<'a> {
+    project_path: &'a str,
+    pr_url_or_number: &'a str,
+    action: &'a str,
+    value: &'a str,
+    token: Option<&'a str>,
+}
+
+pub async fn manage_pr(
+    project_path: &str,
+    pr_url_or_number: &str,
+    action: &str,
+    value: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
+    invoke(
+        "manage_pr",
+        &ManagePrArgs {
+            project_path,
+            pr_url_or_number,
+            action,
+            value,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FindBranchPrArgs<'a> {
+    project_path: &'a str,
+    token: Option<&'a str>,
+}
+
+pub async fn find_branch_pr(
+    project_path: &str,
+    token: Option<&str>,
+) -> Result<Option<String>, String> {
+    invoke(
+        "find_branch_pr",
+        &FindBranchPrArgs {
+            project_path,
+            token,
+        },
+    )
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenExternalUrlArgs<'a> {
+    url: &'a str,
+}
+
+pub async fn open_external_url(url: &str) -> Result<(), String> {
+    invoke("open_external_url", &OpenExternalUrlArgs { url }).await
+}
+
+pub async fn fetch_pr_suggestions(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: Option<&str>,
+) -> Result<crate::types::PrSuggestions, String> {
+    invoke(
+        "fetch_pr_suggestions",
+        &FetchPrArgs {
+            project_path,
+            pr_url_or_number,
+            token,
+        },
+    )
+    .await
+}

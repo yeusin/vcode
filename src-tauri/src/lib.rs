@@ -611,8 +611,142 @@ async fn list_involved_prs_all_repos(
 }
 
 #[tauri::command]
+async fn fetch_pr_details(
+    project_path: String,
+    pr_url_or_number: String,
+    token: Option<String>,
+) -> Result<review::PrDetails, String> {
+    review::fetch_pr_details(&project_path, &pr_url_or_number, token).await
+}
+
+#[tauri::command]
+async fn post_pr_comment(
+    project_path: String,
+    pr_url_or_number: String,
+    body: String,
+    token: Option<String>,
+) -> Result<(), String> {
+    review::post_pr_comment(&project_path, &pr_url_or_number, &body, token).await
+}
+
+#[tauri::command]
+async fn add_pr_line_comment(
+    project_path: String,
+    pr_url_or_number: String,
+    path: String,
+    line: usize,
+    side: String,
+    body: String,
+    in_reply_to: Option<u64>,
+    commit_id: String,
+    token: Option<String>,
+) -> Result<(), String> {
+    review::add_pr_line_comment(
+        &project_path,
+        &pr_url_or_number,
+        &path,
+        line,
+        &side,
+        &body,
+        in_reply_to,
+        &commit_id,
+        token,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn resolve_pr_thread(
+    project_path: String,
+    pr_url_or_number: String,
+    thread_id: String,
+    resolve: bool,
+    token: Option<String>,
+) -> Result<(), String> {
+    review::resolve_pr_thread(&project_path, &pr_url_or_number, &thread_id, resolve, token).await
+}
+
+#[tauri::command]
+async fn submit_pr_review(
+    project_path: String,
+    pr_url_or_number: String,
+    event: String,
+    body: String,
+    pending_comments: Vec<review::PendingReviewComment>,
+    token: Option<String>,
+) -> Result<(), String> {
+    review::submit_pr_review(
+        &project_path,
+        &pr_url_or_number,
+        &event,
+        &body,
+        pending_comments,
+        token,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn manage_pr(
+    project_path: String,
+    pr_url_or_number: String,
+    action: String,
+    value: String,
+    token: Option<String>,
+) -> Result<(), String> {
+    review::manage_pr(&project_path, &pr_url_or_number, &action, &value, token).await
+}
+
+#[tauri::command]
+async fn fetch_pr_suggestions(
+    project_path: String,
+    pr_url_or_number: String,
+    token: Option<String>,
+) -> Result<review::PrSuggestions, String> {
+    review::fetch_pr_suggestions(&project_path, &pr_url_or_number, token).await
+}
+
+#[tauri::command]
+async fn find_branch_pr(
+    project_path: String,
+    token: Option<String>,
+) -> Result<Option<String>, String> {
+    review::find_branch_pr(&project_path, token).await
+}
+
+#[tauri::command]
 async fn clone_github_repo(repo_url: String, token: Option<String>) -> Result<String, String> {
     review::clone_github_repo(&repo_url, token).await
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("https://") && !trimmed.starts_with("http://") {
+        return Err("Only http/https URLs are supported.".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+    Ok(())
 }
 
 fn resolve_cli_target_arg(args: &[String], cwd: &Path) -> Option<String> {
@@ -712,7 +846,16 @@ pub fn run() {
             fetch_pr_review,
             list_repo_prs,
             list_involved_prs_all_repos,
+            fetch_pr_details,
+            post_pr_comment,
+            add_pr_line_comment,
+            resolve_pr_thread,
+            submit_pr_review,
+            manage_pr,
+            fetch_pr_suggestions,
+            find_branch_pr,
             clone_github_repo,
+            open_external_url,
             get_launch_target,
             check_latest_release
         ])

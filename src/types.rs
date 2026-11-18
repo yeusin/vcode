@@ -286,3 +286,105 @@ pub struct AnalyzeProgress {
     pub elapsed_ms: u64,
     pub eta_ms: Option<u64>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrLabel {
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCheckRun {
+    pub name: String,
+    pub status: String,
+    pub conclusion: String,
+    pub details_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCommit {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReaction {
+    pub content: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrIssueComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub reactions: Vec<PrReaction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReviewComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub path: String,
+    pub line: Option<usize>,
+    pub side: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReviewThread {
+    pub thread_id: String,
+    pub path: String,
+    pub line: Option<usize>,
+    pub side: String,
+    pub is_resolved: bool,
+    pub comments: Vec<PrReviewComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDetails {
+    pub provider: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub author: String,
+    pub url: String,
+    pub head_sha: String,
+    pub mergeable: String,
+    pub labels: Vec<PrLabel>,
+    pub assignees: Vec<String>,
+    pub reviewers: Vec<String>,
+    pub checks: Vec<PrCheckRun>,
+    pub commits: Vec<PrCommit>,
+    pub comments: Vec<PrIssueComment>,
+    pub threads: Vec<PrReviewThread>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReviewComment {
+    pub path: String,
+    pub line: usize,
+    pub side: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrSuggestions {
+    pub labels: Vec<String>,
+    pub users: Vec<String>,
+}

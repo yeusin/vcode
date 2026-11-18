@@ -283,18 +283,25 @@ fn render_canvas(
             }
         } else if trace_path.contains(&g.node.id) {
             stroke = "#34d399";
-        } else if is_impact && !is_selected && !is_hovered {
-            stroke = "#22d3ee";
+        } else if is_impact {
+            if !is_selected && !is_hovered {
+                stroke = "#22d3ee";
+            }
+            fill = "rgba(34, 211, 238, 0.08)";
         }
 
         ctx.save();
         if dimmed {
-            ctx.set_global_alpha(0.35);
+            ctx.set_global_alpha(if review.filter_mode == ReviewFilterMode::BlastRadius {
+                0.22
+            } else {
+                0.35
+            });
         }
         round_rect(&ctx, g.rect.x, g.rect.y, g.rect.width, g.rect.height, radius);
         ctx.set_fill_style_str(fill);
         ctx.fill();
-        ctx.set_line_width(if is_selected || is_hovered || is_changed {
+        ctx.set_line_width(if is_selected || is_hovered || is_changed || is_impact {
             2.2 / scale.sqrt()
         } else {
             1.2 / scale.sqrt()
@@ -317,10 +324,13 @@ fn render_canvas(
         let is_selected = selected_id == Some(fn_item.node.id.as_str());
         let is_hovered = hovered_id == Some(fn_item.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&fn_item.node.id);
+        let is_impact = review.is_impact(&fn_item.node.id);
 
         if lod != LodLevel::Micro && sw < 16.0 && !is_selected && !is_hovered {
             ctx.set_fill_style_str(if is_changed {
                 "#f59e0b"
+            } else if is_impact {
+                "#22d3ee"
             } else {
                 "#1e293b"
             });
@@ -336,7 +346,11 @@ fn render_canvas(
 
         ctx.save();
         if dimmed {
-            ctx.set_global_alpha(0.28);
+            ctx.set_global_alpha(if review.filter_mode == ReviewFilterMode::BlastRadius {
+                0.16
+            } else {
+                0.28
+            });
         }
         round_rect(
             &ctx,
@@ -352,11 +366,13 @@ fn render_canvas(
             "#16233b"
         } else if is_hovered {
             "#141f35"
+        } else if is_impact {
+            "#0d2433"
         } else {
             "#0f172a"
         });
         ctx.fill();
-        ctx.set_line_width(if is_selected || is_changed {
+        ctx.set_line_width(if is_selected || is_changed || is_impact {
             2.4
         } else if is_hovered {
             1.8
@@ -369,6 +385,8 @@ fn render_canvas(
             "#38bdf8"
         } else if is_changed {
             "#f59e0b"
+        } else if is_impact {
+            "#22d3ee"
         } else if is_hovered {
             "#60a5fa"
         } else {
@@ -691,6 +709,32 @@ fn render_canvas(
         ctx.restore();
     }
 
+    // 6c. 1-Hop Impact Edges
+    if review.active && review.filter_mode == ReviewFilterMode::BlastRadius {
+        ctx.save();
+        ctx.set_global_alpha(0.85);
+        ctx.set_stroke_style_str("#22d3ee");
+        ctx.set_line_width(2.0);
+        for e in &layout.edges {
+            let src_changed = review.changed_ids.contains(&e.edge.source_id);
+            let dst_changed = review.changed_ids.contains(&e.edge.target_id);
+            let src_imp = review.impact_ids.contains(&e.edge.source_id);
+            let dst_imp = review.impact_ids.contains(&e.edge.target_id);
+            if (src_changed && (dst_imp || dst_changed)) || (dst_changed && src_imp) {
+                let sx1 = e.x1 * scale + viewport.x;
+                let sy1 = e.y1 * scale + viewport.y;
+                let sx2 = e.x2 * scale + viewport.x;
+                let sy2 = e.y2 * scale + viewport.y;
+                ctx.begin_path();
+                ctx.move_to(sx1, sy1);
+                let mx = (sx1 + sx2) * 0.5;
+                ctx.bezier_curve_to(mx, sy1, mx, sy2, sx2, sy2);
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+    }
+
     // 7. Top-right Overview Minimap
     if let Some((mm_x, mm_y, mm_w, mm_h, mm_scale, off_x, off_y)) =
         minimap_geometry(css_w, css_h, layout.bounds)
@@ -719,8 +763,11 @@ fn render_canvas(
             let mx = off_x + (g.rect.x - layout.bounds.x) * mm_scale;
             let my = off_y + (g.rect.y - layout.bounds.y) * mm_scale;
             let is_changed = review.active && review.changed_ids.contains(&g.node.id);
+            let is_impact = review.is_impact(&g.node.id);
             ctx.set_fill_style_str(if is_changed {
                 "rgba(245, 158, 11, 0.78)"
+            } else if is_impact {
+                "rgba(34, 211, 238, 0.68)"
             } else if g.node.kind == GroupKind::Directory {
                 "rgba(71, 85, 105, 0.35)"
             } else {

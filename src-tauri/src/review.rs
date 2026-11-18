@@ -744,6 +744,41 @@ fn fetch_pr_via_cli(
     })
 }
 
+async fn maybe_checkout_pr_dir(
+    root: &Path,
+    target: &ParsedPrTarget,
+    head_branch: &str,
+    head_sha: &str,
+    token: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let same_repo = parse_remote_repo(root)
+        .is_some_and(|(_, _, rp)| rp.eq_ignore_ascii_case(&target.repo_name()));
+    let same_branch = !head_branch.is_empty()
+        && run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .is_some_and(|b| b.trim() == head_branch);
+    if same_repo && same_branch {
+        return Ok(None);
+    }
+    let checkout_root = root.to_path_buf();
+    let checkout_hb = head_branch.to_string();
+    let checkout_sha = head_sha.to_string();
+    let checkout_tok = token.map(|s| s.to_string());
+    let checkout_target = target.clone();
+    let dir = tauri::async_runtime::spawn_blocking(move || {
+        checkout_pr_to_temp_dir(
+            &checkout_root,
+            &checkout_target,
+            Some(&checkout_hb),
+            Some(&checkout_sha),
+            checkout_tok.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("PR checkout task failed: {e}"))??;
+    Ok(Some(dir))
+}
+
 pub async fn fetch_pr_review(
     project_path: &str,
     pr_url_or_number: &str,
@@ -812,22 +847,14 @@ pub async fn fetch_pr_review(
                 .await
                 .map_err(|e| format!("Invalid GitHub files JSON: {e}"))?;
 
-            let checkout_root = root.to_path_buf();
-            let checkout_hb = head_branch.clone();
-            let checkout_sha = head_sha.clone();
-            let checkout_tok = tok.clone();
-            let checkout_target = target_clone.clone();
-            let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
-                checkout_pr_to_temp_dir(
-                    &checkout_root,
-                    &checkout_target,
-                    Some(&checkout_hb),
-                    Some(&checkout_sha),
-                    checkout_tok.as_deref(),
-                )
-            })
-            .await
-            .map_err(|e| format!("PR checkout task failed: {e}"))??;
+            let checkout_dir = maybe_checkout_pr_dir(
+                root,
+                &target_clone,
+                &head_branch,
+                &head_sha,
+                tok.as_deref(),
+            )
+            .await?;
 
             let mut files = Vec::new();
             for f in files_json {
@@ -842,7 +869,7 @@ pub async fn fetch_pr_review(
                 let additions = f["additions"].as_u64().map(|n| n as usize).unwrap_or(p_add);
                 let deletions = f["deletions"].as_u64().map(|n| n as usize).unwrap_or(p_del);
                 files.push(FileDiff {
-                    abs_path: checkout_dir.join(&rel).to_string_lossy().into_owned(),
+                    abs_path: checkout_dir.as_deref().unwrap_or(root).join(&rel).to_string_lossy().into_owned(),
                     file_path: rel,
                     status,
                     additions,
@@ -864,7 +891,7 @@ pub async fn fetch_pr_review(
                     head_branch,
                     head_sha,
                     repo_name: target_clone.repo_name(),
-                    checkout_path: Some(checkout_dir.to_string_lossy().into_owned()),
+                    checkout_path: checkout_dir.map(|d| d.to_string_lossy().into_owned()),
                 }),
             })
         }
@@ -925,22 +952,14 @@ pub async fn fetch_pr_review(
                 .await
                 .map_err(|e| format!("Invalid GitLab changes JSON: {e}"))?;
 
-            let checkout_root = root.to_path_buf();
-            let checkout_hb = head_branch.clone();
-            let checkout_sha = head_sha.clone();
-            let checkout_tok = tok.clone();
-            let checkout_target = target_clone.clone();
-            let checkout_dir = tauri::async_runtime::spawn_blocking(move || {
-                checkout_pr_to_temp_dir(
-                    &checkout_root,
-                    &checkout_target,
-                    Some(&checkout_hb),
-                    Some(&checkout_sha),
-                    checkout_tok.as_deref(),
-                )
-            })
-            .await
-            .map_err(|e| format!("PR checkout task failed: {e}"))??;
+            let checkout_dir = maybe_checkout_pr_dir(
+                root,
+                &target_clone,
+                &head_branch,
+                &head_sha,
+                tok.as_deref(),
+            )
+            .await?;
 
             let mut files = Vec::new();
             if let Some(arr) = ch_json["changes"].as_array() {
@@ -956,7 +975,7 @@ pub async fn fetch_pr_review(
                     let patch = c["diff"].as_str().unwrap_or("");
                     let (hunks, additions, deletions) = parse_hunks_from_patch(patch);
                     files.push(FileDiff {
-                        abs_path: checkout_dir.join(&rel).to_string_lossy().into_owned(),
+                        abs_path: checkout_dir.as_deref().unwrap_or(root).join(&rel).to_string_lossy().into_owned(),
                         file_path: rel,
                         status,
                         additions,
@@ -979,7 +998,7 @@ pub async fn fetch_pr_review(
                     head_branch,
                     head_sha,
                     repo_name: target_clone.repo_name(),
-                    checkout_path: Some(checkout_dir.to_string_lossy().into_owned()),
+                    checkout_path: checkout_dir.map(|d| d.to_string_lossy().into_owned()),
                 }),
             })
         }
@@ -1428,6 +1447,1184 @@ pub async fn list_repo_prs(
         })
         .collect();
     Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrLabel {
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCheckRun {
+    pub name: String,
+    pub status: String,
+    pub conclusion: String,
+    pub details_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCommit {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReaction {
+    pub content: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrIssueComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub reactions: Vec<PrReaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReviewComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub path: String,
+    pub line: Option<usize>,
+    pub side: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReviewThread {
+    pub thread_id: String,
+    pub path: String,
+    pub line: Option<usize>,
+    pub side: String,
+    pub is_resolved: bool,
+    pub comments: Vec<PrReviewComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDetails {
+    pub provider: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub author: String,
+    pub url: String,
+    pub head_sha: String,
+    pub mergeable: String,
+    pub labels: Vec<PrLabel>,
+    pub assignees: Vec<String>,
+    pub reviewers: Vec<String>,
+    pub checks: Vec<PrCheckRun>,
+    pub commits: Vec<PrCommit>,
+    pub comments: Vec<PrIssueComment>,
+    pub threads: Vec<PrReviewThread>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReviewComment {
+    pub path: String,
+    pub line: usize,
+    pub side: String,
+    pub body: String,
+}
+
+fn parse_github_reactions(val: Option<&serde_json::Value>) -> Vec<PrReaction> {
+    let Some(obj) = val.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let keys = [
+        ("+1", "👍"),
+        ("-1", "👎"),
+        ("laugh", "😄"),
+        ("hooray", "🎉"),
+        ("confused", "😕"),
+        ("heart", "❤️"),
+        ("rocket", "🚀"),
+        ("eyes", "👀"),
+    ];
+    let mut out = Vec::new();
+    for (k, _emoji) in keys {
+        if let Some(cnt) = obj.get(k).and_then(|v| v.as_u64()) {
+            if cnt > 0 {
+                out.push(PrReaction {
+                    content: k.to_string(),
+                    count: cnt as usize,
+                });
+            }
+        }
+    }
+    out
+}
+
+pub async fn fetch_pr_details(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: Option<String>,
+) -> Result<PrDetails, String> {
+    let root = Path::new(project_path);
+    let target = resolve_pr_target(root, pr_url_or_number)?;
+    let tok = resolve_token(&target, token);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    match target {
+        ParsedPrTarget::GitHub {
+            owner,
+            repo,
+            number,
+        } => {
+            let auth_hdr = tok.as_deref().map(|t| format!("Bearer {t}"));
+            let get_json = |url: String| {
+                let mut req = client
+                    .get(&url)
+                    .header("User-Agent", "vcode-app")
+                    .header("Accept", "application/vnd.github+json");
+                if let Some(a) = &auth_hdr {
+                    req = req.header("Authorization", a);
+                }
+                req
+            };
+
+            let pr_resp = get_json(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+            ))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch PR details: {e}"))?;
+            if !pr_resp.status().is_success() {
+                return Err(format!("GitHub PR details failed (HTTP {})", pr_resp.status()));
+            }
+            let pr_json: serde_json::Value = pr_resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+
+            let title = pr_json["title"].as_str().unwrap_or("").to_string();
+            let body = pr_json["body"].as_str().unwrap_or("").to_string();
+            let state = pr_json["state"].as_str().unwrap_or("open").to_string();
+            let author = pr_json["user"]["login"].as_str().unwrap_or("").to_string();
+            let url = pr_json["html_url"].as_str().unwrap_or("").to_string();
+            let head_sha = pr_json["head"]["sha"].as_str().unwrap_or("").to_string();
+            let mergeable = match pr_json["mergeable"].as_bool() {
+                Some(true) => "mergeable".to_string(),
+                Some(false) => "conflicting".to_string(),
+                None => "unknown".to_string(),
+            };
+            let labels = pr_json["labels"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| {
+                            Some(PrLabel {
+                                name: l.get("name")?.as_str()?.to_string(),
+                                color: l.get("color").and_then(|c| c.as_str()).unwrap_or("64748b").to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let assignees = pr_json["assignees"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|u| u["login"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reviewers = pr_json["requested_reviewers"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|u| u["login"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut checks = Vec::new();
+            if !head_sha.is_empty() {
+                if let Ok(chk_resp) = get_json(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=50"
+                ))
+                .send()
+                .await
+                {
+                    if chk_resp.status().is_success() {
+                        if let Ok(cj) = chk_resp.json::<serde_json::Value>().await {
+                            if let Some(arr) = cj["check_runs"].as_array() {
+                                for cr in arr {
+                                    checks.push(PrCheckRun {
+                                        name: cr["name"].as_str().unwrap_or("").to_string(),
+                                        status: cr["status"].as_str().unwrap_or("").to_string(),
+                                        conclusion: cr["conclusion"].as_str().unwrap_or("").to_string(),
+                                        details_url: cr["html_url"].as_str().unwrap_or("").to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut commits = Vec::new();
+            if let Ok(cm_resp) = get_json(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits?per_page=50"
+            ))
+            .send()
+            .await
+            {
+                if cm_resp.status().is_success() {
+                    if let Ok(arr) = cm_resp.json::<Vec<serde_json::Value>>().await {
+                        for cm in arr {
+                            let sha = cm["sha"].as_str().unwrap_or("").chars().take(7).collect();
+                            let msg = cm["commit"]["message"]
+                                .as_str()
+                                .unwrap_or("")
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            let c_author = cm["author"]["login"]
+                                .as_str()
+                                .or_else(|| cm["commit"]["author"]["name"].as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            commits.push(PrCommit {
+                                sha,
+                                message: msg,
+                                author: c_author,
+                            });
+                        }
+                    }
+                }
+            }
+
+            let mut comments = Vec::new();
+            if let Ok(ic_resp) = get_json(format!(
+                "https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments?per_page=100"
+            ))
+            .send()
+            .await
+            {
+                if ic_resp.status().is_success() {
+                    if let Ok(arr) = ic_resp.json::<Vec<serde_json::Value>>().await {
+                        for ic in arr {
+                            comments.push(PrIssueComment {
+                                id: ic["id"].as_u64().unwrap_or(0),
+                                author: ic["user"]["login"].as_str().unwrap_or("").to_string(),
+                                body: ic["body"].as_str().unwrap_or("").to_string(),
+                                created_at: ic["created_at"].as_str().unwrap_or("").to_string(),
+                                reactions: parse_github_reactions(ic.get("reactions")),
+                            });
+                        }
+                    }
+                }
+            }
+
+            let mut threads: Vec<PrReviewThread> = Vec::new();
+            if let Some(a) = &auth_hdr {
+                let gql_query = serde_json::json!({
+                    "query": "query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$num){reviewThreads(first:100){nodes{id isResolved path line diffSide comments(first:50){nodes{databaseId author{login} body createdAt path line}}}}}}}",
+                    "variables": { "owner": owner, "repo": repo, "num": number }
+                });
+                if let Ok(g_resp) = client
+                    .post("https://api.github.com/graphql")
+                    .header("User-Agent", "vcode-app")
+                    .header("Authorization", a)
+                    .json(&gql_query)
+                    .send()
+                    .await
+                {
+                    if g_resp.status().is_success() {
+                        if let Ok(gj) = g_resp.json::<serde_json::Value>().await {
+                            if let Some(nodes) = gj["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array() {
+                                for th in nodes {
+                                    let tid = th["id"].as_str().unwrap_or("").to_string();
+                                    let path = th["path"].as_str().unwrap_or("").to_string();
+                                    let line = th["line"].as_u64().map(|n| n as usize);
+                                    let side = th["diffSide"].as_str().unwrap_or("RIGHT").to_string();
+                                    let is_resolved = th["isResolved"].as_bool().unwrap_or(false);
+                                    let mut t_comments = Vec::new();
+                                    if let Some(c_arr) = th["comments"]["nodes"].as_array() {
+                                        for c in c_arr {
+                                            t_comments.push(PrReviewComment {
+                                                id: c["databaseId"].as_u64().unwrap_or(0),
+                                                author: c["author"]["login"].as_str().unwrap_or("").to_string(),
+                                                body: c["body"].as_str().unwrap_or("").to_string(),
+                                                created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+                                                path: c["path"].as_str().unwrap_or(&path).to_string(),
+                                                line: c["line"].as_u64().map(|n| n as usize).or(line),
+                                                side: side.clone(),
+                                            });
+                                        }
+                                    }
+                                    if !t_comments.is_empty() {
+                                        threads.push(PrReviewThread {
+                                            thread_id: tid,
+                                            path,
+                                            line,
+                                            side,
+                                            is_resolved,
+                                            comments: t_comments,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if threads.is_empty() {
+                if let Ok(rc_resp) = get_json(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100"
+                ))
+                .send()
+                .await
+                {
+                    if rc_resp.status().is_success() {
+                        if let Ok(arr) = rc_resp.json::<Vec<serde_json::Value>>().await {
+                            let mut by_root: std::collections::HashMap<u64, PrReviewThread> =
+                                std::collections::HashMap::new();
+                            for rc in arr {
+                                let cid = rc["id"].as_u64().unwrap_or(0);
+                                let root_id = rc["in_reply_to_id"].as_u64().unwrap_or(cid);
+                                let path = rc["path"].as_str().unwrap_or("").to_string();
+                                let line = rc["line"]
+                                    .as_u64()
+                                    .or_else(|| rc["original_line"].as_u64())
+                                    .map(|n| n as usize);
+                                let side = rc["side"].as_str().unwrap_or("RIGHT").to_string();
+                                let comment = PrReviewComment {
+                                    id: cid,
+                                    author: rc["user"]["login"].as_str().unwrap_or("").to_string(),
+                                    body: rc["body"].as_str().unwrap_or("").to_string(),
+                                    created_at: rc["created_at"].as_str().unwrap_or("").to_string(),
+                                    path: path.clone(),
+                                    line,
+                                    side: side.clone(),
+                                };
+                                by_root
+                                    .entry(root_id)
+                                    .or_insert_with(|| PrReviewThread {
+                                        thread_id: root_id.to_string(),
+                                        path,
+                                        line,
+                                        side,
+                                        is_resolved: false,
+                                        comments: Vec::new(),
+                                    })
+                                    .comments
+                                    .push(comment);
+                            }
+                            threads = by_root.into_values().collect();
+                        }
+                    }
+                }
+            }
+
+            Ok(PrDetails {
+                provider: "github".to_string(),
+                number,
+                title,
+                body,
+                state,
+                author,
+                url,
+                head_sha,
+                mergeable,
+                labels,
+                assignees,
+                reviewers,
+                checks,
+                commits,
+                comments,
+                threads,
+            })
+        }
+        ParsedPrTarget::GitLab {
+            host,
+            project_path,
+            iid,
+        } => {
+            let encoded = project_path.replace('/', "%2F");
+            let get_gl = |url: String| {
+                let mut req = client.get(&url).header("User-Agent", "vcode-app");
+                if let Some(t) = tok.as_deref() {
+                    req = req.header("PRIVATE-TOKEN", t);
+                }
+                req
+            };
+            let mr_resp = get_gl(format!(
+                "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}"
+            ))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch GitLab MR details: {e}"))?;
+            if !mr_resp.status().is_success() {
+                return Err(format!("GitLab MR details failed (HTTP {})", mr_resp.status()));
+            }
+            let mr: serde_json::Value = mr_resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse GitLab MR JSON: {e}"))?;
+            let labels = mr["labels"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|n| PrLabel { name: n.to_string(), color: "6366f1".to_string() }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let assignees = mr["assignees"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|u| u["username"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let reviewers = mr["reviewers"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|u| u["username"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+
+            let mut comments = Vec::new();
+            let mut threads = Vec::new();
+            if let Ok(disc_resp) = get_gl(format!(
+                "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/discussions?per_page=100"
+            ))
+            .send()
+            .await
+            {
+                if disc_resp.status().is_success() {
+                    if let Ok(arr) = disc_resp.json::<Vec<serde_json::Value>>().await {
+                        for d in arr {
+                            let did = d["id"].as_str().unwrap_or("").to_string();
+                            let notes = d["notes"].as_array().cloned().unwrap_or_default();
+                            let first_pos = notes.first().and_then(|n| n.get("position"));
+                            if let Some(pos) = first_pos.filter(|p| p.get("new_path").is_some()) {
+                                let path = pos["new_path"].as_str().unwrap_or("").to_string();
+                                let line = pos["new_line"].as_u64().or_else(|| pos["old_line"].as_u64()).map(|n| n as usize);
+                                let is_resolved = notes.iter().all(|n| n["resolved"].as_bool().unwrap_or(false));
+                                let t_comments = notes.iter().filter(|n| !n["system"].as_bool().unwrap_or(false)).map(|n| PrReviewComment {
+                                    id: n["id"].as_u64().unwrap_or(0),
+                                    author: n["author"]["username"].as_str().unwrap_or("").to_string(),
+                                    body: n["body"].as_str().unwrap_or("").to_string(),
+                                    created_at: n["created_at"].as_str().unwrap_or("").to_string(),
+                                    path: path.clone(),
+                                    line,
+                                    side: "RIGHT".to_string(),
+                                }).collect::<Vec<_>>();
+                                if !t_comments.is_empty() {
+                                    threads.push(PrReviewThread {
+                                        thread_id: did,
+                                        path,
+                                        line,
+                                        side: "RIGHT".to_string(),
+                                        is_resolved,
+                                        comments: t_comments,
+                                    });
+                                }
+                            } else {
+                                for n in notes {
+                                    if n["system"].as_bool().unwrap_or(false) {
+                                        continue;
+                                    }
+                                    comments.push(PrIssueComment {
+                                        id: n["id"].as_u64().unwrap_or(0),
+                                        author: n["author"]["username"].as_str().unwrap_or("").to_string(),
+                                        body: n["body"].as_str().unwrap_or("").to_string(),
+                                        created_at: n["created_at"].as_str().unwrap_or("").to_string(),
+                                        reactions: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(PrDetails {
+                provider: "gitlab".to_string(),
+                number: iid,
+                title: mr["title"].as_str().unwrap_or("").to_string(),
+                body: mr["description"].as_str().unwrap_or("").to_string(),
+                state: mr["state"].as_str().unwrap_or("opened").to_string(),
+                author: mr["author"]["username"].as_str().unwrap_or("").to_string(),
+                url: mr["web_url"].as_str().unwrap_or("").to_string(),
+                head_sha: mr["diff_refs"]["head_sha"].as_str().unwrap_or("").to_string(),
+                mergeable: mr["merge_status"].as_str().unwrap_or("unknown").to_string(),
+                labels,
+                assignees,
+                reviewers,
+                checks: Vec::new(),
+                commits: Vec::new(),
+                comments,
+                threads,
+            })
+        }
+    }
+}
+
+pub async fn post_pr_comment(
+    project_path: &str,
+    pr_url_or_number: &str,
+    body: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token)
+        .ok_or_else(|| "Authentication token required to post comments.".to_string())?;
+    let client = reqwest::Client::new();
+    match target {
+        ParsedPrTarget::GitHub { owner, repo, number } => {
+            let resp = client
+                .post(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+                ))
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", format!("Bearer {tok}"))
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to post comment (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+        ParsedPrTarget::GitLab { host, project_path, iid } => {
+            let encoded = project_path.replace('/', "%2F");
+            let resp = client
+                .post(format!(
+                    "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/notes"
+                ))
+                .header("PRIVATE-TOKEN", tok)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to post MR note (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn add_pr_line_comment(
+    project_path: &str,
+    pr_url_or_number: &str,
+    path: &str,
+    line: usize,
+    side: &str,
+    body: &str,
+    in_reply_to: Option<u64>,
+    commit_id: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token)
+        .ok_or_else(|| "Authentication token required to post line comments.".to_string())?;
+    let client = reqwest::Client::new();
+    match target {
+        ParsedPrTarget::GitHub { owner, repo, number } => {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}/comments");
+            let payload = if let Some(reply_id) = in_reply_to {
+                serde_json::json!({ "body": body, "in_reply_to": reply_id })
+            } else {
+                serde_json::json!({
+                    "body": body,
+                    "commit_id": commit_id,
+                    "path": path,
+                    "line": line,
+                    "side": side,
+                })
+            };
+            let resp = client
+                .post(url)
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", format!("Bearer {tok}"))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Failed to post line comment: {txt}"));
+            }
+            Ok(())
+        }
+        ParsedPrTarget::GitLab { host, project_path, iid } => {
+            let encoded = project_path.replace('/', "%2F");
+            let resp = client
+                .post(format!(
+                    "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/discussions"
+                ))
+                .header("PRIVATE-TOKEN", tok)
+                .json(&serde_json::json!({ "body": body }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to post MR discussion (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn resolve_pr_thread(
+    project_path: &str,
+    pr_url_or_number: &str,
+    thread_id: &str,
+    resolve: bool,
+    token: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token)
+        .ok_or_else(|| "Authentication token required to resolve threads.".to_string())?;
+    let client = reqwest::Client::new();
+    match target {
+        ParsedPrTarget::GitHub { .. } => {
+            let mutation = if resolve {
+                "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+            } else {
+                "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+            };
+            let resp = client
+                .post("https://api.github.com/graphql")
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", format!("Bearer {tok}"))
+                .json(&serde_json::json!({
+                    "query": mutation,
+                    "variables": { "id": thread_id }
+                }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to update thread (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+        ParsedPrTarget::GitLab { host, project_path, iid } => {
+            let encoded = project_path.replace('/', "%2F");
+            let resp = client
+                .put(format!(
+                    "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/discussions/{thread_id}"
+                ))
+                .header("PRIVATE-TOKEN", tok)
+                .json(&serde_json::json!({ "resolved": resolve }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to update MR thread (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn submit_pr_review(
+    project_path: &str,
+    pr_url_or_number: &str,
+    event: &str,
+    body: &str,
+    pending_comments: Vec<PendingReviewComment>,
+    token: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token)
+        .ok_or_else(|| "Authentication token required to submit review.".to_string())?;
+    let client = reqwest::Client::new();
+    match target {
+        ParsedPrTarget::GitHub { owner, repo, number } => {
+            let comments_json: Vec<serde_json::Value> = pending_comments
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "path": c.path,
+                        "line": c.line,
+                        "side": c.side,
+                        "body": c.body,
+                    })
+                })
+                .collect();
+            let mut payload = serde_json::json!({
+                "event": event,
+                "body": body,
+            });
+            if !comments_json.is_empty() {
+                payload["comments"] = serde_json::Value::Array(comments_json);
+            }
+            let resp = client
+                .post(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews"
+                ))
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", format!("Bearer {tok}"))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Failed to submit review: {txt}"));
+            }
+            Ok(())
+        }
+        ParsedPrTarget::GitLab { host, project_path, iid } => {
+            let encoded = project_path.replace('/', "%2F");
+            if event == "APPROVE" {
+                let resp = client
+                    .post(format!(
+                        "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/approve"
+                    ))
+                    .header("PRIVATE-TOKEN", &tok)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("Failed to approve MR (HTTP {})", resp.status()));
+                }
+            }
+            if !body.trim().is_empty() {
+                let _ = client
+                    .post(format!(
+                        "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/notes"
+                    ))
+                    .header("PRIVATE-TOKEN", &tok)
+                    .json(&serde_json::json!({ "body": body }))
+                    .send()
+                    .await;
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn manage_pr(
+    project_path: &str,
+    pr_url_or_number: &str,
+    action: &str,
+    value: &str,
+    token: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token)
+        .ok_or_else(|| "Authentication token required for PR management actions.".to_string())?;
+    let client = reqwest::Client::new();
+    match target {
+        ParsedPrTarget::GitHub { owner, repo, number } => {
+            let auth = format!("Bearer {tok}");
+            let resp = match action {
+                "merge" | "squash" | "rebase" => {
+                    client
+                        .put(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/merge"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "merge_method": action }))
+                        .send()
+                        .await
+                }
+                "close" | "reopen" => {
+                    let state = if action == "close" { "closed" } else { "open" };
+                    client
+                        .patch(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "state": state }))
+                        .send()
+                        .await
+                }
+                "add_label" => {
+                    client
+                        .post(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "labels": [value] }))
+                        .send()
+                        .await
+                }
+                "remove_label" => {
+                    let encoded_lbl: String = value
+                        .bytes()
+                        .map(|b| match b {
+                            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                                (b as char).to_string()
+                            }
+                            _ => format!("%{:02X}", b),
+                        })
+                        .collect();
+                    client
+                        .delete(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels/{encoded_lbl}"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .send()
+                        .await
+                }
+                "request_reviewer" => {
+                    client
+                        .post(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/requested_reviewers"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "reviewers": [value] }))
+                        .send()
+                        .await
+                }
+                "add_assignee" => {
+                    client
+                        .post(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/assignees"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "assignees": [value] }))
+                        .send()
+                        .await
+                }
+                "remove_assignee" => {
+                    client
+                        .delete(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/assignees"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "assignees": [value] }))
+                        .send()
+                        .await
+                }
+                "react_comment" => {
+                    let (cid, reaction) = value
+                        .split_once(':')
+                        .ok_or_else(|| "Invalid reaction payload".to_string())?;
+                    let post_resp = client
+                        .post(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/comments/{cid}/reactions"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/vnd.github+json")
+                        .json(&serde_json::json!({ "content": reaction }))
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if post_resp.status() == reqwest::StatusCode::OK {
+                        let body = post_resp.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
+                        if let Some(rid) = body["id"].as_u64() {
+                            client
+                                .delete(format!(
+                                    "https://api.github.com/repos/{owner}/{repo}/issues/comments/{cid}/reactions/{rid}"
+                                ))
+                                .header("User-Agent", "vcode-app")
+                                .header("Authorization", &auth)
+                                .header("Accept", "application/vnd.github+json")
+                                .send()
+                                .await
+                        } else {
+                            return Ok(());
+                        }
+                    } else {
+                        Ok(post_resp)
+                    }
+                }
+                "delete_comment" => {
+                    client
+                        .delete(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/issues/comments/{value}"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/vnd.github+json")
+                        .send()
+                        .await
+                }
+                "delete_review_comment" => {
+                    client
+                        .delete(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/comments/{value}"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/vnd.github+json")
+                        .send()
+                        .await
+                }
+                _ => return Err(format!("Unsupported PR action: {action}")),
+            }
+            .map_err(|e| e.to_string())?;
+
+            if !resp.status().is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Action '{action}' failed: {txt}"));
+            }
+            Ok(())
+        }
+        ParsedPrTarget::GitLab { host, project_path, iid } => {
+            let encoded = project_path.replace('/', "%2F");
+            let resp = match action {
+                "merge" | "squash" | "rebase" => {
+                    client
+                        .put(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/merge"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .json(&serde_json::json!({ "squash": action == "squash" }))
+                        .send()
+                        .await
+                }
+                "close" | "reopen" => {
+                    let ev = if action == "close" { "close" } else { "reopen" };
+                    client
+                        .put(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .json(&serde_json::json!({ "state_event": ev }))
+                        .send()
+                        .await
+                }
+                "delete_comment" | "delete_review_comment" => {
+                    client
+                        .delete(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/notes/{value}"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .send()
+                        .await
+                }
+                _ => return Err(format!("Unsupported GitLab MR action: {action}")),
+            }
+            .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("GitLab MR action '{action}' failed (HTTP {})", resp.status()));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrSuggestions {
+    pub labels: Vec<String>,
+    pub users: Vec<String>,
+}
+
+pub async fn fetch_pr_suggestions(
+    project_path: &str,
+    pr_url_or_number: &str,
+    token: Option<String>,
+) -> Result<PrSuggestions, String> {
+    let target = resolve_pr_target(Path::new(project_path), pr_url_or_number)?;
+    let tok = resolve_token(&target, token);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    let mut labels = Vec::new();
+    let mut users = Vec::new();
+    match target {
+        ParsedPrTarget::GitHub { owner, repo, .. } => {
+            let auth = tok.as_deref().map(|t| format!("Bearer {t}"));
+            let get_gh = |url: String| {
+                let mut req = client
+                    .get(&url)
+                    .header("User-Agent", "vcode-app")
+                    .header("Accept", "application/vnd.github+json");
+                if let Some(a) = &auth {
+                    req = req.header("Authorization", a);
+                }
+                req
+            };
+            if let Ok(resp) = get_gh(format!(
+                "https://api.github.com/repos/{owner}/{repo}/labels?per_page=100"
+            ))
+            .send()
+            .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                        for item in arr {
+                            if let Some(name) = item["name"].as_str() {
+                                labels.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for endpoint in ["collaborators", "assignees"] {
+                if let Ok(resp) = get_gh(format!(
+                    "https://api.github.com/repos/{owner}/{repo}/{endpoint}?per_page=100"
+                ))
+                .send()
+                .await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                            for item in arr {
+                                if let Some(login) = item["login"].as_str() {
+                                    if !users.iter().any(|u| u == login) {
+                                        users.push(login.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        if !users.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        ParsedPrTarget::GitLab { host, project_path, .. } => {
+            let encoded = project_path.replace('/', "%2F");
+            let get_gl = |url: String| {
+                let mut req = client.get(&url).header("User-Agent", "vcode-app");
+                if let Some(t) = tok.as_deref() {
+                    req = req.header("PRIVATE-TOKEN", t);
+                }
+                req
+            };
+            if let Ok(resp) = get_gl(format!(
+                "https://{host}/api/v4/projects/{encoded}/labels?per_page=100"
+            ))
+            .send()
+            .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                        for item in arr {
+                            if let Some(name) = item["name"].as_str() {
+                                labels.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(resp) = get_gl(format!(
+                "https://{host}/api/v4/projects/{encoded}/members/all?per_page=100"
+            ))
+            .send()
+            .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                        for item in arr {
+                            if let Some(username) = item["username"].as_str() {
+                                if !users.iter().any(|u| u == username) {
+                                    users.push(username.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(PrSuggestions { labels, users })
+}
+
+pub async fn find_branch_pr(
+    project_path: &str,
+    token: Option<String>,
+) -> Result<Option<String>, String> {
+    let root = Path::new(project_path);
+    let Ok(branch_raw) = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]) else {
+        return Ok(None);
+    };
+    let branch = branch_raw.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return Ok(None);
+    }
+    let Some((_proto, host, repo_path)) = parse_remote_repo(root) else {
+        return Ok(None);
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    if host == "github.com" {
+        let Some((owner, repo)) = repo_path.split_once('/') else {
+            return Ok(None);
+        };
+        let target = ParsedPrTarget::GitHub {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number: 0,
+        };
+        let tok = resolve_token(&target, token);
+        let mut req = client
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}&per_page=1"
+            ))
+            .header("User-Agent", "vcode-app")
+            .header("Accept", "application/vnd.github+json");
+        if let Some(t) = tok {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                    if let Some(url) = arr.first().and_then(|p| p["html_url"].as_str()) {
+                        return Ok(Some(url.to_string()));
+                    }
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    let target = ParsedPrTarget::GitLab {
+        host: host.clone(),
+        project_path: repo_path.clone(),
+        iid: 0,
+    };
+    let tok = resolve_token(&target, token);
+    let encoded = repo_path.replace('/', "%2F");
+    let mut req = client.get(format!(
+        "https://{host}/api/v4/projects/{encoded}/merge_requests?state=opened&source_branch={branch}&per_page=1"
+    ));
+    if let Some(t) = tok {
+        req = req.header("PRIVATE-TOKEN", t);
+    }
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(arr) = resp.json::<Vec<serde_json::Value>>().await {
+                if let Some(url) = arr.first().and_then(|p| p["web_url"].as_str()) {
+                    return Ok(Some(url.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

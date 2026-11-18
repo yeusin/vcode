@@ -13,7 +13,8 @@ use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
     AnalyzeProgress, DiffLine, DiffStatus, FileDiff, FunctionNode, GitDiffSummary, GroupKind,
-    GroupNode, LodLevel, PrListItem, ProjectGraph, ProjectSettings, RecentProject, Viewport,
+    GroupNode, LodLevel, PendingReviewComment, PrDetails, PrListItem, PrSuggestions, ProjectGraph,
+    ProjectSettings, RecentProject, Viewport,
 };
 
 fn jump_diff_hunk(delta: isize) {
@@ -56,6 +57,15 @@ fn jump_diff_hunk(delta: isize) {
             .unwrap_or_else(|| *tops.first().unwrap_or(&0.0))
     };
     body.set_scroll_top((target_top - 8.0).max(0.0).round() as i32);
+}
+
+fn short_ts(ts: &str) -> String {
+    let trimmed = ts.trim();
+    if trimmed.len() >= 16 {
+        trimmed[..16].replace('T', " ")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn ease_out_cubic(t: f64) -> f64 {
@@ -488,6 +498,24 @@ pub fn App() -> impl IntoView {
     let pr_list_scope = RwSignal::new("all_repos".to_string());
     let pr_modal_open = RwSignal::new(false);
     let pr_search_query = RwSignal::new(String::new());
+    let pr_details = RwSignal::new(Option::<PrDetails>::None);
+    let pr_details_busy = RwSignal::new(false);
+    let pr_meta_busy = RwSignal::new(false);
+    let pr_comment_busy = RwSignal::new(false);
+    let pr_comment_action_busy = RwSignal::new(Option::<String>::None);
+    let pr_overview_modal = RwSignal::new(false);
+    let pr_overview_tab = RwSignal::new("conversation".to_string());
+    let pr_comment_draft = RwSignal::new(String::new());
+    let pr_review_modal = RwSignal::new(false);
+    let pr_review_body = RwSignal::new(String::new());
+    let pending_review_comments = RwSignal::new(Vec::<PendingReviewComment>::new());
+    let inline_composer = RwSignal::new(Option::<(String, usize, String)>::None);
+    let inline_composer_text = RwSignal::new(String::new());
+    let thread_reply_target = RwSignal::new(Option::<(String, u64)>::None);
+    let thread_reply_text = RwSignal::new(String::new());
+    let pr_manage_input = RwSignal::new(String::new());
+    let pr_suggestions = RwSignal::new(PrSuggestions::default());
+    let pr_manage_mode = RwSignal::new(Option::<&'static str>::None);
     let diff_modal_file = RwSignal::new(Option::<String>::None);
     let diff_gutter_markers = RwSignal::new(Vec::<DiffGutterMarker>::new());
     let diff_split_mode = RwSignal::new(
@@ -777,6 +805,46 @@ pub fn App() -> impl IntoView {
         animate_viewport(viewport, vp_anim_gen, Viewport { x, y, scale }, 200.0);
     };
 
+    let load_pr_details = move || {
+        let Some(pr_val) = active_pr_ref.get_untracked() else {
+            return;
+        };
+        let proj = graph.get_untracked().root_path;
+        let tok = git_token.get_untracked();
+        pr_details_busy.set(true);
+        spawn_local(async move {
+            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+            match tauri_bridge::fetch_pr_details(&proj, &pr_val, tok_opt).await {
+                Ok(det) => pr_details.set(Some(det)),
+                Err(e) => review_error.set(Some(e)),
+            }
+            if let Ok(sug) = tauri_bridge::fetch_pr_suggestions(&proj, &pr_val, tok_opt).await {
+                pr_suggestions.set(sug);
+            }
+            pr_details_busy.set(false);
+            pr_meta_busy.set(false);
+            pr_comment_busy.set(false);
+            pr_comment_action_busy.set(None);
+        });
+    };
+
+    let delete_review_comment = move |cid: u64| {
+        let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+        let proj = graph.get_untracked().root_path;
+        let tok = git_token.get_untracked();
+        pr_comment_action_busy.set(Some(format!("del_rev:{cid}")));
+        spawn_local(async move {
+            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+            match tauri_bridge::manage_pr(&proj, &pr_val, "delete_review_comment", &cid.to_string(), tok_opt).await {
+                Ok(()) => load_pr_details(),
+                Err(e) => {
+                    pr_comment_action_busy.set(None);
+                    review_error.set(Some(e));
+                }
+            }
+        });
+    };
+
     let refresh_pr_review = move |pr_val: String| {
         let proj = graph.get_untracked().root_path;
         let tok = git_token.get_untracked();
@@ -888,6 +956,7 @@ pub fn App() -> impl IntoView {
                         diff_summary.set(Some(pr_diff));
                     }
                     review_filter_mode.set(ReviewFilterMode::ChangedOnly);
+                    load_pr_details();
                 }
                 Err(e) => {
                     loading_label.set(None);
@@ -1008,6 +1077,17 @@ pub fn App() -> impl IntoView {
                     }
                     refresh_local_review();
                     load_repo_prs();
+                    let pr_check_path = path.clone();
+                    spawn_local(async move {
+                        let tok = git_token.get_untracked();
+                        let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                        if let Ok(Some(pr_url)) = tauri_bridge::find_branch_pr(&pr_check_path, tok_opt).await {
+                            if graph.get_untracked().root_path == pr_check_path && active_pr_ref.get_untracked().is_none() {
+                                git_base_ref.set(pr_url.clone());
+                                refresh_pr_review(pr_url);
+                            }
+                        }
+                    });
                     let _ = tauri_bridge::watch_project(&path).await;
                 }
                 Err(err) => {
@@ -1084,6 +1164,16 @@ pub fn App() -> impl IntoView {
                 if pr_modal_open.get_untracked() && key == "Escape" {
                     ev.prevent_default();
                     pr_modal_open.set(false);
+                    return;
+                }
+                if pr_overview_modal.get_untracked() && key == "Escape" {
+                    ev.prevent_default();
+                    pr_overview_modal.set(false);
+                    return;
+                }
+                if pr_review_modal.get_untracked() && key == "Escape" {
+                    ev.prevent_default();
+                    pr_review_modal.set(false);
                     return;
                 }
                 let Some(current_file) = diff_modal_file.get_untracked() else {
@@ -1253,7 +1343,12 @@ pub fn App() -> impl IntoView {
                     } else {
                         let recent = load_recent_projects();
                         if let Some(first) = recent.first() {
-                            open_project(first.path.clone());
+                            if let Some(pr_target) = first.pr_ref.clone().filter(|s| s.contains("://")) {
+                                git_base_ref.set(pr_target.clone());
+                                refresh_pr_review(pr_target);
+                            } else {
+                                open_project(first.path.clone());
+                            }
                         } else {
                             fit_to_view();
                         }
@@ -2106,7 +2201,7 @@ pub fn App() -> impl IntoView {
                             <Show when=move || active_pr_ref.get().is_some()>
                                 <div class="review-refresh-row">
                                     <button
-                                        class="btn btn-primary"
+                                        class="btn btn-primary review-pr-refresh-btn"
                                         disabled=move || review_busy.get()
                                         on:click=move |_| {
                                             if let Some(pr_val) = active_pr_ref.get_untracked() {
@@ -2115,6 +2210,42 @@ pub fn App() -> impl IntoView {
                                         }
                                     >
                                         {move || if review_busy.get() { "Refreshing PR..." } else { "Refresh PR" }}
+                                    </button>
+                                </div>
+                                <div class="review-octo-actions">
+                                    <button
+                                        class="btn btn-ghost"
+                                        on:click=move |_| {
+                                            if pr_details.get_untracked().is_none() {
+                                                load_pr_details();
+                                            }
+                                            pr_overview_modal.set(true);
+                                        }
+                                    >
+                                        {move || {
+                                            let unresolved = pr_details
+                                                .get()
+                                                .map(|d| d.threads.iter().filter(|t| !t.is_resolved).count())
+                                                .unwrap_or(0);
+                                            if unresolved > 0 {
+                                                format!("PR Overview ({unresolved} open)")
+                                            } else {
+                                                "PR Overview".to_string()
+                                            }
+                                        }}
+                                    </button>
+                                    <button
+                                        class="btn btn-ghost"
+                                        on:click=move |_| pr_review_modal.set(true)
+                                    >
+                                        {move || {
+                                            let n = pending_review_comments.get().len();
+                                            if n > 0 {
+                                                format!("Submit Review ({n})")
+                                            } else {
+                                                "Submit Review".to_string()
+                                            }
+                                        }}
                                     </button>
                                 </div>
                             </Show>
@@ -2220,6 +2351,7 @@ pub fn App() -> impl IntoView {
                                     let modal_key = fd.file_path.clone();
                                     let row_gid = matched_group.clone();
                                     let path_for_cb = fd.file_path.clone();
+                                    let path_for_thr = fd.file_path.clone();
                                     view! {
                                         <div
                                             class=move || {
@@ -2254,6 +2386,23 @@ pub fn App() -> impl IntoView {
                                                 }
                                             />
                                             <span class="review-file-name">{fd.file_path}</span>
+                                            {move || {
+                                                let open_th = pr_details
+                                                    .get()
+                                                    .map(|d| d.threads.iter().filter(|t| t.path == path_for_thr && !t.is_resolved).count())
+                                                    .unwrap_or(0);
+                                                let pend_th = pending_review_comments
+                                                    .get()
+                                                    .iter()
+                                                    .filter(|c| c.path == path_for_thr)
+                                                    .count();
+                                                let total = open_th + pend_th;
+                                                (total > 0).then(|| view! {
+                                                    <span class="review-thread-pill" title="Open or pending review comments">
+                                                        {format!("💬 {total}")}
+                                                    </span>
+                                                })
+                                            }}
                                             <span class="review-diff-stat">
                                                 <span class="diff-add">{format!("+{}", fd.additions)}</span>
                                                 " "
@@ -2374,10 +2523,12 @@ pub fn App() -> impl IntoView {
                                     {if fd.hunks.is_empty() {
                                         view! { <div class="review-empty">"No diff hunks available for this file."</div> }.into_any()
                                     } else {
+                                        let hunk_file_path = fd.file_path.clone();
                                         fd.hunks.into_iter().enumerate().map(|(hunk_idx, h)| {
                                             let hdr = format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines);
                                             let h_lines = h.lines;
                                             let total_lines = h_lines.len();
+                                            let f_path = hunk_file_path.clone();
                                             view! {
                                                 <div class="diff-modal-hunk">
                                                     <div class="diff-hunk-hdr">{hdr}</div>
@@ -2391,6 +2542,7 @@ pub fn App() -> impl IntoView {
                                                         let hidden = total_lines.saturating_sub(visible_lines.len());
                                                         let content = if diff_split_mode.get() {
                                                             let rows = build_split_rows(&visible_lines);
+                                                            let fp_s = f_path.clone();
                                                             view! {
                                                                 <div class="diff-split-table">
                                                                     {rows.into_iter().map(|(left, right)| {
@@ -2404,30 +2556,221 @@ pub fn App() -> impl IntoView {
                                                                             Some(_) => "diff-split-cell",
                                                                             None => "diff-split-cell is-empty",
                                                                         };
-                                                                        let l_num = left.as_ref().and_then(|x| x.old_line).map(|n| n.to_string()).unwrap_or_default();
+                                                                        let l_old = left.as_ref().and_then(|x| x.old_line);
+                                                                        let r_new = right.as_ref().and_then(|x| x.new_line);
+                                                                        let l_num = l_old.map(|n| n.to_string()).unwrap_or_default();
                                                                         let l_sig = left.as_ref().map(|x| if x.kind == "del" { "-" } else { " " }).unwrap_or("");
                                                                         let l_txt = left.map(|x| x.text).unwrap_or_default();
-                                                                        let r_num = right.as_ref().and_then(|x| x.new_line).map(|n| n.to_string()).unwrap_or_default();
+                                                                        let r_num = r_new.map(|n| n.to_string()).unwrap_or_default();
                                                                         let r_sig = right.as_ref().map(|x| if x.kind == "add" { "+" } else { " " }).unwrap_or("");
                                                                         let r_txt = right.map(|x| x.text).unwrap_or_default();
+                                                                        let fp_l = fp_s.clone();
+                                                                        let fp_r = fp_s.clone();
+                                                                        let fp_th = fp_s.clone();
+                                                                        let fp_pend = fp_s.clone();
+                                                                        let fp_comp = fp_s.clone();
                                                                         view! {
-                                                                            <div class="diff-split-row">
-                                                                                <div class=l_cls>
-                                                                                    <span class="diff-ln">{l_num}</span>
-                                                                                    <span class="diff-sig">{l_sig}</span>
-                                                                                    <span class="diff-txt">{l_txt}</span>
+                                                                            <>
+                                                                                <div class="diff-split-row">
+                                                                                    <div class=l_cls>
+                                                                                        <span
+                                                                                            class="diff-ln is-clickable"
+                                                                                            title="Click to comment on left line"
+                                                                                            on:click=move |_| {
+                                                                                                if active_pr_ref.get_untracked().is_some() {
+                                                                                                    if let Some(lno) = l_old {
+                                                                                                        inline_composer_text.set(String::new());
+                                                                                                        inline_composer.set(Some((fp_l.clone(), lno, "LEFT".to_string())));
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        >
+                                                                                            {l_num}
+                                                                                        </span>
+                                                                                        <span class="diff-sig">{l_sig}</span>
+                                                                                        <span class="diff-txt">{l_txt}</span>
+                                                                                    </div>
+                                                                                    <div class=r_cls>
+                                                                                        <span
+                                                                                            class="diff-ln is-clickable"
+                                                                                            title="Click to comment on right line"
+                                                                                            on:click=move |_| {
+                                                                                                if active_pr_ref.get_untracked().is_some() {
+                                                                                                    if let Some(lno) = r_new {
+                                                                                                        inline_composer_text.set(String::new());
+                                                                                                        inline_composer.set(Some((fp_r.clone(), lno, "RIGHT".to_string())));
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        >
+                                                                                            {r_num}
+                                                                                        </span>
+                                                                                        <span class="diff-sig">{r_sig}</span>
+                                                                                        <span class="diff-txt">{r_txt}</span>
+                                                                                    </div>
                                                                                 </div>
-                                                                                <div class=r_cls>
-                                                                                    <span class="diff-ln">{r_num}</span>
-                                                                                    <span class="diff-sig">{r_sig}</span>
-                                                                                    <span class="diff-txt">{r_txt}</span>
-                                                                                </div>
-                                                                            </div>
+                                                                                {move || {
+                                                                                    if l_old.is_none() && r_new.is_none() {
+                                                                                        return view! { <span /> }.into_any();
+                                                                                    }
+                                                                                    let threads: Vec<_> = pr_details
+                                                                                        .get()
+                                                                                        .map(|d| {
+                                                                                            d.threads
+                                                                                                .into_iter()
+                                                                                                .filter(|t| {
+                                                                                                    t.path == fp_th
+                                                                                                        && ((t.side == "LEFT" && t.line == l_old)
+                                                                                                            || (t.side != "LEFT" && t.line == r_new))
+                                                                                                })
+                                                                                                .collect()
+                                                                                        })
+                                                                                        .unwrap_or_default();
+                                                                                    let pendings: Vec<(usize, PendingReviewComment)> = pending_review_comments
+                                                                                        .get()
+                                                                                        .into_iter()
+                                                                                        .enumerate()
+                                                                                        .filter(|(_, c)| {
+                                                                                            c.path == fp_pend
+                                                                                                && ((c.side == "LEFT" && l_old == Some(c.line))
+                                                                                                    || (c.side != "LEFT" && r_new == Some(c.line)))
+                                                                                        })
+                                                                                        .collect();
+                                                                                    let comp_match = inline_composer.get().and_then(|(p, l, s)| {
+                                                                                        if p != fp_comp {
+                                                                                            return None;
+                                                                                        }
+                                                                                        if (s == "LEFT" && l_old == Some(l)) || (s == "RIGHT" && r_new == Some(l)) {
+                                                                                            Some((l, s))
+                                                                                        } else {
+                                                                                            None
+                                                                                        }
+                                                                                    });
+                                                                                    if threads.is_empty() && pendings.is_empty() && comp_match.is_none() {
+                                                                                        return view! { <span /> }.into_any();
+                                                                                    }
+                                                                                    let fp_send = fp_comp.clone();
+                                                                                    view! {
+                                                                                        <div class="diff-inline-threads">
+                                                                                            {threads.into_iter().map(|th| {
+                                                                                                let tid = th.thread_id.clone();
+                                                                                                let is_res = th.is_resolved;
+                                                                                                view! {
+                                                                                                    <div class=if is_res { "diff-thread-card is-resolved" } else { "diff-thread-card" }>
+                                                                                                        <div class="diff-thread-hdr">
+                                                                                                            <span class="diff-thread-status">{if is_res { "✓ Resolved" } else { "Open Thread" }}</span>
+                                                                                                            <button
+                                                                                                                class="btn btn-ghost inspector-btn"
+                                                                                                                on:click=move |_| {
+                                                                                                                    let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                                                                    let proj = graph.get_untracked().root_path;
+                                                                                                                    let tok = git_token.get_untracked();
+                                                                                                                    let tid_c = tid.clone();
+                                                                                                                    spawn_local(async move {
+                                                                                                                        let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                                                                        match tauri_bridge::resolve_pr_thread(&proj, &pr_val, &tid_c, !is_res, tok_opt).await {
+                                                                                                                            Ok(()) => load_pr_details(),
+                                                                                                                            Err(e) => review_error.set(Some(e)),
+                                                                                                                        }
+                                                                                                                    });
+                                                                                                                }
+                                                                                                            >
+                                                                                                                {if is_res { "Unresolve" } else { "Resolve" }}
+                                                                                                            </button>
+                                                                                                        </div>
+                                                                                                        {th.comments.into_iter().map(|c| {
+                                                                                                            let cid = c.id;
+                                                                                                            view! {
+                                                                                                                <div class="diff-thread-msg">
+                                                                                                                    <div class="diff-thread-hdr">
+                                                                                                                        <span class="diff-thread-author">{format!("@{} · {}", c.author, short_ts(&c.created_at))}</span>
+                                                                                                                        <button
+                                                                                                                            class="pr-filter-chip pr-comment-del-btn"
+                                                                                                                            title="Delete comment"
+                                                                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}"))
+                                                                                                                            on:click=move |_| delete_review_comment(cid)
+                                                                                                                        >
+                                                                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}")) {
+                                                                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                                                                                                            } else {
+                                                                                                                                view! { "🗑" }.into_any()
+                                                                                                                            }}
+                                                                                                                        </button>
+                                                                                                                    </div>
+                                                                                                                    <span class="diff-thread-body">{c.body}</span>
+                                                                                                                </div>
+                                                                                                            }
+                                                                                                        }).collect_view()}
+                                                                                                    </div>
+                                                                                                }
+                                                                                            }).collect_view()}
+                                                                                            {pendings.into_iter().map(|(idx, pc)| view! {
+                                                                                                <div class="diff-thread-card is-pending">
+                                                                                                    <div class="diff-thread-hdr">
+                                                                                                        <span class="diff-thread-status">"Pending Review Comment"</span>
+                                                                                                        <button class="btn btn-ghost inspector-btn" on:click=move |_| {
+                                                                                                            pending_review_comments.update(|v| { if idx < v.len() { v.remove(idx); } });
+                                                                                                        }>"✕"</button>
+                                                                                                    </div>
+                                                                                                    <div class="diff-thread-body">{pc.body}</div>
+                                                                                                </div>
+                                                                                            }).collect_view()}
+                                                                                            {comp_match.map(|(lno, side_send)| {
+                                                                                                let fp_q = fp_send.clone();
+                                                                                                let side_q = side_send.clone();
+                                                                                                let fp_post = fp_send.clone();
+                                                                                                let side_post = side_send.clone();
+                                                                                                view! {
+                                                                                                    <div class="diff-inline-composer">
+                                                                                                        <textarea
+                                                                                                            class="review-comment-input"
+                                                                                                            rows="2"
+                                                                                                            placeholder=format!("Comment on {fp_send}:{lno}...")
+                                                                                                            prop:value=move || inline_composer_text.get()
+                                                                                                            on:input=move |ev| inline_composer_text.set(event_target_value(&ev))
+                                                                                                        />
+                                                                                                        <div class="diff-composer-actions">
+                                                                                                            <button class="btn btn-ghost inspector-btn" on:click=move |_| inline_composer.set(None)>"Cancel"</button>
+                                                                                                            <button class="btn btn-ghost inspector-btn" on:click=move |_| {
+                                                                                                                let body = inline_composer_text.get_untracked();
+                                                                                                                if body.trim().is_empty() { return; }
+                                                                                                                pending_review_comments.update(|v| {
+                                                                                                                    v.push(PendingReviewComment { path: fp_q.clone(), line: lno, side: side_q.clone(), body });
+                                                                                                                });
+                                                                                                                inline_composer.set(None);
+                                                                                                            }>"Queue in Review"</button>
+                                                                                                            <button class="btn btn-primary inspector-btn" on:click=move |_| {
+                                                                                                                let body = inline_composer_text.get_untracked();
+                                                                                                                if body.trim().is_empty() { return; }
+                                                                                                                let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                                                                let proj = graph.get_untracked().root_path;
+                                                                                                                let tok = git_token.get_untracked();
+                                                                                                                let sha = pr_details.get_untracked().map(|d| d.head_sha).unwrap_or_default();
+                                                                                                                let fp_s = fp_post.clone();
+                                                                                                                let side_s = side_post.clone();
+                                                                                                                inline_composer.set(None);
+                                                                                                                spawn_local(async move {
+                                                                                                                    let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                                                                    match tauri_bridge::add_pr_line_comment(&proj, &pr_val, &fp_s, lno, &side_s, &body, None, &sha, tok_opt).await {
+                                                                                                                        Ok(()) => load_pr_details(),
+                                                                                                                        Err(e) => review_error.set(Some(e)),
+                                                                                                                    }
+                                                                                                                });
+                                                                                                            }>"Add Comment"</button>
+                                                                                                        </div>
+                                                                                                    </div>
+                                                                                                }
+                                                                                            })}
+                                                                                        </div>
+                                                                                    }.into_any()
+                                                                                }}
+                                                                            </>
                                                                         }
                                                                     }).collect_view()}
                                                                 </div>
                                                             }.into_any()
                                                         } else {
+                                                            let fp_u = f_path.clone();
                                                             view! {
                                                                 <div>
                                                                     {visible_lines.into_iter().map(|ln| {
@@ -2443,13 +2786,273 @@ pub fn App() -> impl IntoView {
                                                                         };
                                                                         let old_ln = ln.old_line.map(|n| n.to_string()).unwrap_or_default();
                                                                         let new_ln = ln.new_line.map(|n| n.to_string()).unwrap_or_default();
+                                                                        let target_line = ln.new_line.or(ln.old_line);
+                                                                        let side = if ln.new_line.is_some() { "RIGHT" } else { "LEFT" }.to_string();
+                                                                        let fp_click = fp_u.clone();
+                                                                        let fp_click2 = fp_u.clone();
+                                                                        let side_click = side.clone();
+                                                                        let side_click2 = side.clone();
+                                                                        let fp_th = fp_u.clone();
+                                                                        let fp_pend = fp_u.clone();
+                                                                        let fp_comp = fp_u.clone();
+                                                                        let side_comp = side.clone();
                                                                         view! {
-                                                                            <div class=cls>
-                                                                                <span class="diff-ln">{old_ln}</span>
-                                                                                <span class="diff-ln">{new_ln}</span>
-                                                                                <span class="diff-sig">{prefix}</span>
-                                                                                <span class="diff-txt">{ln.text}</span>
-                                                                            </div>
+                                                                            <>
+                                                                                <div class=cls>
+                                                                                    <span
+                                                                                        class="diff-ln is-clickable"
+                                                                                        title="Click to add review comment on this line"
+                                                                                        on:click=move |_| {
+                                                                                            if active_pr_ref.get_untracked().is_some() {
+                                                                                                if let Some(lno) = target_line {
+                                                                                                    inline_composer_text.set(String::new());
+                                                                                                    inline_composer.set(Some((fp_click.clone(), lno, side_click.clone())));
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    >
+                                                                                        {old_ln}
+                                                                                    </span>
+                                                                                    <span
+                                                                                        class="diff-ln is-clickable"
+                                                                                        title="Click to add review comment on this line"
+                                                                                        on:click=move |_| {
+                                                                                            if active_pr_ref.get_untracked().is_some() {
+                                                                                                if let Some(lno) = target_line {
+                                                                                                    inline_composer_text.set(String::new());
+                                                                                                    inline_composer.set(Some((fp_click2.clone(), lno, side_click2.clone())));
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    >
+                                                                                        {new_ln}
+                                                                                    </span>
+                                                                                    <span class="diff-sig">{prefix}</span>
+                                                                                    <span class="diff-txt">{ln.text}</span>
+                                                                                </div>
+                                                                                {move || {
+                                                                                    let Some(lno) = target_line else {
+                                                                                        return view! { <span /> }.into_any();
+                                                                                    };
+                                                                                    let threads: Vec<_> = pr_details
+                                                                                        .get()
+                                                                                        .map(|d| {
+                                                                                            d.threads
+                                                                                                .into_iter()
+                                                                                                .filter(|t| t.path == fp_th && t.line == Some(lno))
+                                                                                                .collect()
+                                                                                        })
+                                                                                        .unwrap_or_default();
+                                                                                    let pendings: Vec<(usize, PendingReviewComment)> = pending_review_comments
+                                                                                        .get()
+                                                                                        .into_iter()
+                                                                                        .enumerate()
+                                                                                        .filter(|(_, c)| c.path == fp_pend && c.line == lno)
+                                                                                        .collect();
+                                                                                    let composer_here = inline_composer
+                                                                                        .get()
+                                                                                        .is_some_and(|(p, l, _)| p == fp_comp && l == lno);
+                                                                                    if threads.is_empty() && pendings.is_empty() && !composer_here {
+                                                                                        return view! { <span /> }.into_any();
+                                                                                    }
+                                                                                    let fp_send = fp_comp.clone();
+                                                                                    let side_send = side_comp.clone();
+                                                                                    view! {
+                                                                                        <div class="diff-inline-threads">
+                                                                                            {threads.into_iter().map(|th| {
+                                                                                                let tid = th.thread_id.clone();
+                                                                                                let tid_rep = th.thread_id.clone();
+                                                                                                let is_res = th.is_resolved;
+                                                                                                let root_cid = th.comments.first().map(|c| c.id).unwrap_or(0);
+                                                                                                let fp_rep = th.path.clone();
+                                                                                                let side_rep = th.side.clone();
+                                                                                                view! {
+                                                                                                    <div class=if is_res { "diff-thread-card is-resolved" } else { "diff-thread-card" }>
+                                                                                                        <div class="diff-thread-hdr">
+                                                                                                            <span class="diff-thread-status">
+                                                                                                                {if is_res { "✓ Resolved" } else { "Open Thread" }}
+                                                                                                            </span>
+                                                                                                            <div class="diff-thread-btns">
+                                                                                                                <button
+                                                                                                                    class="btn btn-ghost inspector-btn"
+                                                                                                                    on:click=move |_| {
+                                                                                                                        thread_reply_text.set(String::new());
+                                                                                                                        thread_reply_target.set(Some((tid_rep.clone(), root_cid)));
+                                                                                                                    }
+                                                                                                                >
+                                                                                                                    "Reply"
+                                                                                                                </button>
+                                                                                                                <button
+                                                                                                                    class="btn btn-ghost inspector-btn"
+                                                                                                                    on:click=move |_| {
+                                                                                                                        let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                                                                        let proj = graph.get_untracked().root_path;
+                                                                                                                        let tok = git_token.get_untracked();
+                                                                                                                        let tid_c = tid.clone();
+                                                                                                                        spawn_local(async move {
+                                                                                                                            let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                                                                            match tauri_bridge::resolve_pr_thread(&proj, &pr_val, &tid_c, !is_res, tok_opt).await {
+                                                                                                                                Ok(()) => load_pr_details(),
+                                                                                                                                Err(e) => review_error.set(Some(e)),
+                                                                                                                            }
+                                                                                                                        });
+                                                                                                                    }
+                                                                                                                >
+                                                                                                                    {if is_res { "Unresolve" } else { "Resolve" }}
+                                                                                                                </button>
+                                                                                                            </div>
+                                                                                                        </div>
+                                                                                                        {th.comments.into_iter().map(|c| {
+                                                                                                            let cid = c.id;
+                                                                                                            view! {
+                                                                                                                <div class="diff-thread-msg">
+                                                                                                                    <div class="diff-thread-hdr">
+                                                                                                                        <span class="diff-thread-author">{format!("@{} · {}", c.author, short_ts(&c.created_at))}</span>
+                                                                                                                        <button
+                                                                                                                            class="pr-filter-chip pr-comment-del-btn"
+                                                                                                                            title="Delete comment"
+                                                                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}"))
+                                                                                                                            on:click=move |_| delete_review_comment(cid)
+                                                                                                                        >
+                                                                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}")) {
+                                                                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                                                                                                            } else {
+                                                                                                                                view! { "🗑" }.into_any()
+                                                                                                                            }}
+                                                                                                                        </button>
+                                                                                                                    </div>
+                                                                                                                    <span class="diff-thread-body">{c.body}</span>
+                                                                                                                </div>
+                                                                                                            }
+                                                                                                        }).collect_view()}
+                                                                                                        {move || {
+                                                                                                            let is_replying = thread_reply_target.get().is_some_and(|(t, _)| t == th.thread_id);
+                                                                                                            let fp_r = fp_rep.clone();
+                                                                                                            let side_r = side_rep.clone();
+                                                                                                            is_replying.then(|| view! {
+                                                                                                                <div class="diff-inline-composer">
+                                                                                                                    <textarea
+                                                                                                                        class="review-comment-input"
+                                                                                                                        rows="2"
+                                                                                                                        placeholder="Reply to thread..."
+                                                                                                                        prop:value=move || thread_reply_text.get()
+                                                                                                                        on:input=move |ev| thread_reply_text.set(event_target_value(&ev))
+                                                                                                                    />
+                                                                                                                    <div class="diff-composer-actions">
+                                                                                                                        <button class="btn btn-ghost inspector-btn" on:click=move |_| thread_reply_target.set(None)>"Cancel"</button>
+                                                                                                                        <button
+                                                                                                                            class="btn btn-primary inspector-btn"
+                                                                                                                            on:click=move |_| {
+                                                                                                                                let body = thread_reply_text.get_untracked();
+                                                                                                                                if body.trim().is_empty() { return; }
+                                                                                                                                let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                                                                                let proj = graph.get_untracked().root_path;
+                                                                                                                                let tok = git_token.get_untracked();
+                                                                                                                                let sha = pr_details.get_untracked().map(|d| d.head_sha).unwrap_or_default();
+                                                                                                                                let fp_s = fp_r.clone();
+                                                                                                                                let side_s = side_r.clone();
+                                                                                                                                thread_reply_target.set(None);
+                                                                                                                                spawn_local(async move {
+                                                                                                                                    let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                                                                                    match tauri_bridge::add_pr_line_comment(&proj, &pr_val, &fp_s, lno, &side_s, &body, Some(root_cid), &sha, tok_opt).await {
+                                                                                                                                        Ok(()) => load_pr_details(),
+                                                                                                                                        Err(e) => review_error.set(Some(e)),
+                                                                                                                                    }
+                                                                                                                                });
+                                                                                                                            }
+                                                                                                                        >
+                                                                                                                            "Send Reply"
+                                                                                                                        </button>
+                                                                                                                    </div>
+                                                                                                                </div>
+                                                                                                            })
+                                                                                                        }}
+                                                                                                    </div>
+                                                                                                }
+                                                                                            }).collect_view()}
+                                                                                            {pendings.into_iter().map(|(idx, pc)| view! {
+                                                                <div class="diff-thread-card is-pending">
+                                                                    <div class="diff-thread-hdr">
+                                                                        <span class="diff-thread-status">"Pending Review Comment"</span>
+                                                                        <button
+                                                                            class="btn btn-ghost inspector-btn"
+                                                                            on:click=move |_| {
+                                                                                pending_review_comments.update(|v| {
+                                                                                    if idx < v.len() { v.remove(idx); }
+                                                                                });
+                                                                            }
+                                                                        >
+                                                                            "✕"
+                                                                        </button>
+                                                                    </div>
+                                                                    <div class="diff-thread-body">{pc.body}</div>
+                                                                </div>
+                                                            }).collect_view()}
+                                                                                            {composer_here.then(|| {
+                                                                                                let fp_q = fp_send.clone();
+                                                                                                let side_q = side_send.clone();
+                                                                                                let fp_post = fp_send.clone();
+                                                                                                let side_post = side_send.clone();
+                                                                                                view! {
+                                                                                                    <div class="diff-inline-composer">
+                                                                                                        <textarea
+                                                                                                            class="review-comment-input"
+                                                                                                            rows="2"
+                                                                                                            placeholder=format!("Comment on {fp_send}:{lno}...")
+                                                                                                            prop:value=move || inline_composer_text.get()
+                                                                                                            on:input=move |ev| inline_composer_text.set(event_target_value(&ev))
+                                                                                                        />
+                                                                                                        <div class="diff-composer-actions">
+                                                                                                            <button class="btn btn-ghost inspector-btn" on:click=move |_| inline_composer.set(None)>"Cancel"</button>
+                                                                                                            <button
+                                                                                                                class="btn btn-ghost inspector-btn"
+                                                                                                                on:click=move |_| {
+                                                                                                                    let body = inline_composer_text.get_untracked();
+                                                                                                                    if body.trim().is_empty() { return; }
+                                                                                                                    pending_review_comments.update(|v| {
+                                                                                                                        v.push(PendingReviewComment {
+                                                                                                                            path: fp_q.clone(),
+                                                                                                                            line: lno,
+                                                                                                                            side: side_q.clone(),
+                                                                                                                            body,
+                                                                                                                        });
+                                                                                                                    });
+                                                                                                                    inline_composer.set(None);
+                                                                                                                }
+                                                                                                            >
+                                                                                                                "Queue in Review"
+                                                                                                            </button>
+                                                                                                            <button
+                                                                                                                class="btn btn-primary inspector-btn"
+                                                                                                                on:click=move |_| {
+                                                                                                                    let body = inline_composer_text.get_untracked();
+                                                                                                                    if body.trim().is_empty() { return; }
+                                                                                                                    let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                                                                    let proj = graph.get_untracked().root_path;
+                                                                                                                    let tok = git_token.get_untracked();
+                                                                                                                    let sha = pr_details.get_untracked().map(|d| d.head_sha).unwrap_or_default();
+                                                                                                                    let fp_s = fp_post.clone();
+                                                                                                                    let side_s = side_post.clone();
+                                                                                                                    inline_composer.set(None);
+                                                                                                                    spawn_local(async move {
+                                                                                                                        let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                                                                        match tauri_bridge::add_pr_line_comment(&proj, &pr_val, &fp_s, lno, &side_s, &body, None, &sha, tok_opt).await {
+                                                                                                                            Ok(()) => load_pr_details(),
+                                                                                                                            Err(e) => review_error.set(Some(e)),
+                                                                                                                        }
+                                                                                                                    });
+                                                                                                                }
+                                                                                                            >
+                                                                                                                "Add Comment"
+                                                                                                            </button>
+                                                                                                        </div>
+                                                                                                    </div>
+                                                                                                }
+                                                                                            })}
+                                                                                        </div>
+                                                                                    }.into_any()
+                                                                                }}
+                                                                            </>
                                                                         }
                                                                     }).collect_view()}
                                                                 </div>
@@ -2901,6 +3504,546 @@ pub fn App() -> impl IntoView {
                                     }).collect_view().into_any()
                                 }
                             }}
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || pr_overview_modal.get()>
+                <div class="modal-backdrop" on:click=move |_| pr_overview_modal.set(false)>
+                    <div class="pr-modal-card pr-overview-card" on:click=move |ev| ev.stop_propagation()>
+                        <div class="modal-header">
+                            <h3>
+                                {move || {
+                                    pr_details
+                                        .get()
+                                        .map(|d| format!("#{} {}", d.number, d.title))
+                                        .unwrap_or_else(|| "PR Overview".to_string())
+                                }}
+                            </h3>
+                            <div class="pr-scope-row">
+                                {move || {
+                                    pr_details.get().filter(|d| !d.url.is_empty()).map(|d| {
+                                        let u = d.url.clone();
+                                        view! {
+                                            <button
+                                                class="btn btn-ghost pr-hdr-btn"
+                                                title="Open PR in browser"
+                                                on:click=move |_| {
+                                                    let url_c = u.clone();
+                                                    spawn_local(async move {
+                                                        if let Err(e) = tauri_bridge::open_external_url(&url_c).await {
+                                                            review_error.set(Some(e));
+                                                        }
+                                                    });
+                                                }
+                                            >
+                                                "Open ↗"
+                                            </button>
+                                        }
+                                    })
+                                }}
+                                <button
+                                    class="btn btn-ghost pr-hdr-btn"
+                                    disabled=move || pr_details_busy.get() || pr_meta_busy.get()
+                                    title="Refresh PR details"
+                                    on:click=move |_| load_pr_details()
+                                >
+                                    {move || if pr_details_busy.get() || pr_meta_busy.get() {
+                                        view! { <span class="pr-mini-spinner" /> }.into_any()
+                                    } else {
+                                        view! { "↻" }.into_any()
+                                    }}
+                                </button>
+                                <button class="btn btn-ghost pr-hdr-btn" on:click=move |_| pr_overview_modal.set(false)>"✕"</button>
+                            </div>
+                        </div>
+                        <div class="pr-overview-tabs">
+                            {move || {
+                                let d_opt = pr_details.get();
+                                let n_chk = d_opt.as_ref().map(|d| d.checks.len()).unwrap_or(0);
+                                let n_cm = d_opt.as_ref().map(|d| d.commits.len()).unwrap_or(0);
+                                let cur = pr_overview_tab.get();
+                                [
+                                    ("conversation", "Overview & Timeline".to_string()),
+                                    ("checks", format!("Checks ({n_chk})")),
+                                    ("commits", format!("Commits ({n_cm})")),
+                                ]
+                                .into_iter()
+                                .map(|(k, lbl)| {
+                                    let cls = if cur == k { "pr-filter-chip is-active" } else { "pr-filter-chip" };
+                                    view! {
+                                        <button class=cls on:click=move |_| pr_overview_tab.set(k.to_string())>
+                                            {lbl}
+                                        </button>
+                                    }
+                                })
+                                .collect_view()
+                            }}
+                        </div>
+                        {move || review_error.get().map(|err| view! {
+                            <div class="review-error">{err}</div>
+                        })}
+                        <div class="pr-modal-list">
+                            {move || {
+                                let Some(d) = pr_details.get() else {
+                                    return view! {
+                                        <div class="palette-empty">
+                                            {if pr_details_busy.get() { "Loading PR details..." } else { "No PR details loaded." }}
+                                        </div>
+                                    }.into_any();
+                                };
+                                match pr_overview_tab.get().as_str() {
+                                    "checks" => {
+                                        if d.checks.is_empty() {
+                                            view! { <div class="palette-empty">"No check runs reported."</div> }.into_any()
+                                        } else {
+                                            d.checks.into_iter().map(|c| {
+                                                let badge = if !c.conclusion.is_empty() { c.conclusion.clone() } else { c.status.clone() };
+                                                let badge_cls = match badge.as_str() {
+                                                    "success" | "neutral" | "skipped" => "pr-badge is-success",
+                                                    "failure" | "timed_out" | "cancelled" | "action_required" => "pr-badge is-failure",
+                                                    _ => "pr-badge is-pending",
+                                                };
+                                                view! {
+                                                    <div class="pr-list-row">
+                                                        <div class="pr-row-top">
+                                                            <span class=badge_cls>{badge}</span>
+                                                            <span class="pr-row-title">{c.name}</span>
+                                                            {(!c.details_url.is_empty()).then(|| {
+                                                                let u = c.details_url.clone();
+                                                                view! {
+                                                                    <button
+                                                                        class="btn btn-ghost inspector-btn"
+                                                                        on:click=move |_| {
+                                                                            let url_c = u.clone();
+                                                                            spawn_local(async move {
+                                                                                if let Err(e) = tauri_bridge::open_external_url(&url_c).await {
+                                                                                    review_error.set(Some(e));
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    >
+                                                                        "Details ↗"
+                                                                    </button>
+                                                                }
+                                                            })}
+                                                        </div>
+                                                    </div>
+                                                }
+                                            }).collect_view().into_any()
+                                        }
+                                    }
+                                    "commits" => {
+                                        if d.commits.is_empty() {
+                                            view! { <div class="palette-empty">"No commits listed."</div> }.into_any()
+                                        } else {
+                                            d.commits.into_iter().map(|c| view! {
+                                                <div class="pr-list-row">
+                                                    <div class="pr-row-top">
+                                                        <span class="pr-row-num">{c.sha}</span>
+                                                        <span class="pr-row-title">{c.message}</span>
+                                                        <span class="pr-row-meta">{format!("@{}", c.author)}</span>
+                                                    </div>
+                                                </div>
+                                            }).collect_view().into_any()
+                                        }
+                                    }
+                                    _ => {
+                                        let is_closed = d.state == "closed" || d.state == "merged";
+                                        let run_manage = move |action: &'static str, value: String| {
+                                            let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                            let proj = graph.get_untracked().root_path;
+                                            let tok = git_token.get_untracked();
+                                            let is_comment_action = matches!(action, "react_comment" | "delete_comment");
+                                            review_error.set(None);
+                                            if is_comment_action {
+                                                pr_comment_action_busy.set(Some(format!("{action}:{value}")));
+                                            } else {
+                                                pr_meta_busy.set(true);
+                                            }
+                                            spawn_local(async move {
+                                                let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                match tauri_bridge::manage_pr(&proj, &pr_val, action, &value, tok_opt).await {
+                                                    Ok(()) => load_pr_details(),
+                                                    Err(e) => {
+                                                        pr_meta_busy.set(false);
+                                                        pr_comment_action_busy.set(None);
+                                                        review_error.set(Some(e));
+                                                    }
+                                                }
+                                            });
+                                        };
+                                        view! {
+                                            <div class="pr-overview-body">
+                                                <div class="pr-summary-card">
+                                                    <div class="pr-summary-left">
+                                                        <div class="pr-meta-strip">
+                                                            <span class=match d.state.as_str() {
+                                                                "closed" => "pr-badge is-failure",
+                                                                "merged" => "pr-badge is-merged",
+                                                                _ => "pr-badge is-success",
+                                                            }>{d.state.clone()}</span>
+                                                            <span class=match d.mergeable.as_str() {
+                                                                "mergeable" => "pr-badge is-success",
+                                                                "conflicting" => "pr-badge is-failure",
+                                                                _ => "pr-badge is-draft",
+                                                            }>{format!("mergeable: {}", d.mergeable)}</span>
+                                                        </div>
+                                                        <div class="pr-meta-grid">
+                                                            <span class="pr-meta-key">"Author"</span>
+                                                            <div class="pr-meta-vals">
+                                                                <span class="pr-user-pill">{format!("@{}", d.author)}</span>
+                                                            </div>
+                                                            {(!d.reviewers.is_empty()).then(|| view! {
+                                                                <>
+                                                                    <span class="pr-meta-key">"Reviewers"</span>
+                                                                    <div class="pr-meta-vals">
+                                                                        {d.reviewers.into_iter().map(|r| view! {
+                                                                            <span class="pr-user-pill">{format!("@{r}")}</span>
+                                                                        }).collect_view()}
+                                                                    </div>
+                                                                </>
+                                                            })}
+                                                            {(!d.assignees.is_empty()).then(|| view! {
+                                                                <>
+                                                                    <span class="pr-meta-key">"Assignees"</span>
+                                                                    <div class="pr-meta-vals">
+                                                                        {d.assignees.into_iter().map(|a| {
+                                                                            let a_rm = a.clone();
+                                                                            view! {
+                                                                                <span class="pr-user-pill">
+                                                                                    <span>{format!("@{a}")}</span>
+                                                                                    <button
+                                                                                        class="pr-chip-x"
+                                                                                        title="Remove assignee"
+                                                                                        disabled=move || pr_details_busy.get()
+                                                                                        on:click=move |_| run_manage("remove_assignee", a_rm.clone())
+                                                                                    >
+                                                                                        "✕"
+                                                                                    </button>
+                                                                                </span>
+                                                                            }
+                                                                        }).collect_view()}
+                                                                    </div>
+                                                                </>
+                                                            })}
+                                                            {(!d.labels.is_empty()).then(|| view! {
+                                                                <>
+                                                                    <span class="pr-meta-key">"Labels"</span>
+                                                                    <div class="pr-meta-vals">
+                                                                        {d.labels.into_iter().map(|lbl| {
+                                                                            let name_rm = lbl.name.clone();
+                                                                            let dot_style = format!("background: #{};", lbl.color.trim_start_matches('#'));
+                                                                            view! {
+                                                                                <span class="pr-label-pill">
+                                                                                    <span class="pr-label-dot" style=dot_style />
+                                                                                    <span>{lbl.name}</span>
+                                                                                    <button
+                                                                                        class="pr-chip-x"
+                                                                                        title="Remove label"
+                                                                                        disabled=move || pr_details_busy.get()
+                                                                                        on:click=move |_| run_manage("remove_label", name_rm.clone())
+                                                                                    >
+                                                                                        "✕"
+                                                                                    </button>
+                                                                                </span>
+                                                                            }
+                                                                        }).collect_view()}
+                                                                    </div>
+                                                                </>
+                                                            })}
+                                                        </div>
+                                                    </div>
+                                                    <div class="pr-lifecycle-group">
+                                                        <button class="btn btn-primary inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage("squash", String::new())>"Squash & Merge"</button>
+                                                        <button class="btn btn-ghost inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage("merge", String::new())>"Merge"</button>
+                                                        <button class="btn btn-ghost pr-danger-btn inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage(if is_closed { "reopen" } else { "close" }, String::new())>
+                                                            {if is_closed { "Reopen" } else { "Close PR" }}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div class="pr-meta-editor">
+                                                    <div class="pr-btn-group">
+                                                        {[("label", "+ Label"), ("reviewer", "+ Reviewer"), ("assignee", "+ Assignee")].into_iter().map(|(mode_k, lbl)| {
+                                                            let is_act = move || pr_manage_mode.get() == Some(mode_k);
+                                                            view! {
+                                                                <button
+                                                                    class=move || if is_act() { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
+                                                                    disabled=move || pr_details_busy.get()
+                                                                    on:click=move |_| {
+                                                                        if pr_manage_mode.get_untracked() == Some(mode_k) {
+                                                                            pr_manage_mode.set(None);
+                                                                        } else {
+                                                                            pr_manage_input.set(String::new());
+                                                                            pr_manage_mode.set(Some(mode_k));
+                                                                        }
+                                                                    }
+                                                                >
+                                                                    {lbl}
+                                                                </button>
+                                                            }
+                                                        }).collect_view()}
+                                                    </div>
+                                                </div>
+                                                {move || {
+                                                    let Some(mode) = pr_manage_mode.get() else {
+                                                        return view! { <span /> }.into_any();
+                                                    };
+                                                    let (placeholder, action_key) = match mode {
+                                                        "label" => ("Filter or enter label name...", "add_label"),
+                                                        "reviewer" => ("Filter or enter reviewer @username...", "request_reviewer"),
+                                                        _ => ("Filter or enter assignee @username...", "add_assignee"),
+                                                    };
+                                                    let raw_q = pr_manage_input.get();
+                                                    let q = raw_q.trim().trim_start_matches('@').to_lowercase();
+                                                    let sug = pr_suggestions.get();
+                                                    let items: Vec<String> = if mode == "label" {
+                                                        sug.labels.into_iter().filter(|l| q.is_empty() || l.to_lowercase().contains(&q)).take(12).collect()
+                                                    } else {
+                                                        sug.users.into_iter().filter(|u| q.is_empty() || u.to_lowercase().contains(&q)).take(12).collect()
+                                                    };
+                                                    view! {
+                                                        <div class="pr-autocomplete-box">
+                                                            <div class="pr-meta-editor">
+                                                                <input
+                                                                    class="review-input"
+                                                                    type="text"
+                                                                    autofocus=true
+                                                                    placeholder=placeholder
+                                                                    prop:value=move || pr_manage_input.get()
+                                                                    on:input=move |ev| pr_manage_input.set(event_target_value(&ev))
+                                                                    on:keydown=move |ev| {
+                                                                        if ev.key() == "Enter" {
+                                                                            let raw = pr_manage_input.get_untracked().trim().to_string();
+                                                                            let val = if mode == "label" { raw } else { raw.trim_start_matches('@').to_string() };
+                                                                            if !val.is_empty() {
+                                                                                pr_manage_input.set(String::new());
+                                                                                pr_manage_mode.set(None);
+                                                                                run_manage(action_key, val);
+                                                                            }
+                                                                        } else if ev.key() == "Escape" {
+                                                                            pr_manage_mode.set(None);
+                                                                        }
+                                                                    }
+                                                                />
+                                                                <button
+                                                                    class="btn btn-primary inspector-btn"
+                                                                    on:click=move |_| {
+                                                                        let raw = pr_manage_input.get_untracked().trim().to_string();
+                                                                        let val = if mode == "label" { raw } else { raw.trim_start_matches('@').to_string() };
+                                                                        if !val.is_empty() {
+                                                                            pr_manage_input.set(String::new());
+                                                                            pr_manage_mode.set(None);
+                                                                            run_manage(action_key, val);
+                                                                        }
+                                                                    }
+                                                                >
+                                                                    "Add"
+                                                                </button>
+                                                                <button
+                                                                    class="btn btn-ghost inspector-btn"
+                                                                    on:click=move |_| pr_manage_mode.set(None)
+                                                                >
+                                                                    "✕"
+                                                                </button>
+                                                            </div>
+                                                            {(!items.is_empty()).then(|| view! {
+                                                                <div class="pr-ac-chips">
+                                                                    {items.into_iter().map(|item| {
+                                                                        let val_add = item.clone();
+                                                                        let disp = if mode == "label" { item } else { format!("@{item}") };
+                                                                        view! {
+                                                                            <button
+                                                                                class="pr-filter-chip"
+                                                                                on:click=move |_| {
+                                                                                    pr_manage_input.set(String::new());
+                                                                                    pr_manage_mode.set(None);
+                                                                                    run_manage(action_key, val_add.clone());
+                                                                                }
+                                                                            >
+                                                                                {disp}
+                                                                            </button>
+                                                                        }
+                                                                    }).collect_view()}
+                                                                </div>
+                                                            })}
+                                                        </div>
+                                                    }.into_any()
+                                                }}
+                                                {(!d.body.trim().is_empty()).then(|| view! {
+                                                    <pre class="pr-description-box">{d.body}</pre>
+                                                })}
+                                                <div class="pr-comments-list">
+                                                    {d.comments.into_iter().map(|c| {
+                                                        let cid = c.id;
+                                                        view! {
+                                                            <div class="diff-thread-card">
+                                                                <div class="diff-thread-hdr">
+                                                                    <span class="diff-thread-author">{format!("@{}", c.author)}</span>
+                                                                    <div class="diff-thread-btns">
+                                                                        {[("+1", "👍"), ("heart", "❤️"), ("rocket", "🚀")].into_iter().map(|(rk, emoji)| {
+                                                                            let cnt = c.reactions.iter().find(|r| r.content == rk).map(|r| r.count).unwrap_or(0);
+                                                                            let lbl = if cnt > 0 { format!("{emoji} {cnt}") } else { emoji.to_string() };
+                                                                            let busy_key = format!("react_comment:{cid}:{rk}");
+                                                                            let busy_key_dis = busy_key.clone();
+                                                                            view! {
+                                                                                <button
+                                                                                    class="pr-filter-chip"
+                                                                                    disabled=move || pr_comment_action_busy.get().as_deref() == Some(busy_key_dis.as_str())
+                                                                                    on:click=move |_| run_manage("react_comment", format!("{cid}:{rk}"))
+                                                                                >
+                                                                                    {move || if pr_comment_action_busy.get().as_deref() == Some(busy_key.as_str()) {
+                                                                                        view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                                                                    } else {
+                                                                                        view! { {lbl.clone()} }.into_any()
+                                                                                    }}
+                                                                                </button>
+                                                                            }
+                                                                        }).collect_view()}
+                                                                        <button
+                                                                            class="pr-filter-chip pr-comment-del-btn"
+                                                                            title="Delete comment"
+                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}"))
+                                                                            on:click=move |_| run_manage("delete_comment", cid.to_string())
+                                                                        >
+                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}")) {
+                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                                                            } else {
+                                                                                view! { "🗑" }.into_any()
+                                                                            }}
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                                <div class="diff-thread-body">{c.body}</div>
+                                                            </div>
+                                                        }
+                                                    }).collect_view()}
+                                                </div>
+                                                <div class="diff-inline-composer">
+                                                    <textarea
+                                                        class="review-comment-input"
+                                                        rows="2"
+                                                        placeholder="Leave a comment on this PR..."
+                                                        prop:value=move || pr_comment_draft.get()
+                                                        on:input=move |ev| pr_comment_draft.set(event_target_value(&ev))
+                                                    />
+                                                    <div class="diff-composer-actions">
+                                                        <button
+                                                            class="btn btn-primary"
+                                                            disabled=move || pr_comment_busy.get()
+                                                            on:click=move |_| {
+                                                                let body = pr_comment_draft.get_untracked();
+                                                                if body.trim().is_empty() { return; }
+                                                                let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                                                let proj = graph.get_untracked().root_path;
+                                                                let tok = git_token.get_untracked();
+                                                                pr_comment_draft.set(String::new());
+                                                                pr_comment_busy.set(true);
+                                                                spawn_local(async move {
+                                                                    let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                                    match tauri_bridge::post_pr_comment(&proj, &pr_val, &body, tok_opt).await {
+                                                                        Ok(()) => load_pr_details(),
+                                                                        Err(e) => {
+                                                                            pr_comment_busy.set(false);
+                                                                            review_error.set(Some(e));
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                        >
+                                                            {move || if pr_comment_busy.get() { "Posting…" } else { "Post Comment" }}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }
+                            }}
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || pr_review_modal.get()>
+                <div class="modal-backdrop" on:click=move |_| pr_review_modal.set(false)>
+                    <div class="modal-card" on:click=move |ev| ev.stop_propagation()>
+                        <div class="modal-header">
+                            <h3>"Submit Pull Request Review"</h3>
+                            <button class="btn btn-ghost" on:click=move |_| pr_review_modal.set(false)>"✕"</button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="modal-label">
+                                {move || format!("Pending inline comments ({})", pending_review_comments.get().len())}
+                            </div>
+                            {move || {
+                                let list = pending_review_comments.get();
+                                (!list.is_empty()).then(|| view! {
+                                    <div class="pr-pending-list">
+                                        {list.into_iter().enumerate().map(|(idx, pc)| view! {
+                                            <div class="diff-thread-card is-pending">
+                                                <div class="diff-thread-hdr">
+                                                    <span class="diff-thread-status">{format!("{}:{}", pc.path, pc.line)}</span>
+                                                    <button
+                                                        class="btn btn-ghost inspector-btn"
+                                                        on:click=move |_| {
+                                                            pending_review_comments.update(|v| {
+                                                                if idx < v.len() { v.remove(idx); }
+                                                            });
+                                                        }
+                                                    >
+                                                        "✕"
+                                                    </button>
+                                                </div>
+                                                <div class="diff-thread-body">{pc.body}</div>
+                                            </div>
+                                        }).collect_view()}
+                                    </div>
+                                })
+                            }}
+                            <textarea
+                                class="review-comment-input"
+                                rows="4"
+                                placeholder="Review summary (optional for Approve)..."
+                                prop:value=move || pr_review_body.get()
+                                on:input=move |ev| pr_review_body.set(event_target_value(&ev))
+                            />
+                        </div>
+                        <div class="modal-footer">
+                            {["COMMENT", "REQUEST_CHANGES", "APPROVE"].into_iter().map(|ev_kind| {
+                                let (cls, lbl) = match ev_kind {
+                                    "APPROVE" => ("btn btn-primary", "✓ Approve"),
+                                    "REQUEST_CHANGES" => ("btn btn-ghost", "✗ Request Changes"),
+                                    _ => ("btn btn-ghost", "Comment"),
+                                };
+                                view! {
+                                    <button
+                                        class=cls
+                                        on:click=move |_| {
+                                            let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
+                                            let proj = graph.get_untracked().root_path;
+                                            let tok = git_token.get_untracked();
+                                            let body = pr_review_body.get_untracked();
+                                            let pending = pending_review_comments.get_untracked();
+                                            pr_review_modal.set(false);
+                                            spawn_local(async move {
+                                                let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
+                                                match tauri_bridge::submit_pr_review(&proj, &pr_val, ev_kind, &body, &pending, tok_opt).await {
+                                                    Ok(()) => {
+                                                        pr_review_body.set(String::new());
+                                                        pending_review_comments.set(Vec::new());
+                                                        load_pr_details();
+                                                    }
+                                                    Err(e) => review_error.set(Some(e)),
+                                                }
+                                            });
+                                        }
+                                    >
+                                        {lbl}
+                                    </button>
+                                }
+                            }).collect_view()}
                         </div>
                     </div>
                 </div>
