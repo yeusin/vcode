@@ -47,18 +47,12 @@ impl ReviewOverlay {
             }
         }
     }
-
-    pub fn is_impact(&self, id: &str) -> bool {
-        self.active
-            && self.filter_mode == ReviewFilterMode::BlastRadius
-            && !self.changed_ids.contains(id)
-            && self.impact_ids.contains(id)
-    }
 }
 
 #[derive(Clone)]
 enum ActionKind {
     OpenEditor(String),
+    OpenDiff(String),
 }
 
 #[derive(Clone)]
@@ -236,7 +230,6 @@ fn render_canvas(
         let is_selected = selected_id == Some(g.node.id.as_str());
         let is_hovered = hovered_id == Some(g.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&g.node.id);
-        let is_impact = review.is_impact(&g.node.id);
         let dimmed = review.is_dimmed(&g.node.id);
 
         let (mut fill, mut stroke, radius) = match g.node.kind {
@@ -283,11 +276,6 @@ fn render_canvas(
             }
         } else if trace_path.contains(&g.node.id) {
             stroke = "#34d399";
-        } else if is_impact {
-            if !is_selected && !is_hovered {
-                stroke = "#22d3ee";
-            }
-            fill = "rgba(34, 211, 238, 0.08)";
         }
 
         ctx.save();
@@ -301,7 +289,7 @@ fn render_canvas(
         round_rect(&ctx, g.rect.x, g.rect.y, g.rect.width, g.rect.height, radius);
         ctx.set_fill_style_str(fill);
         ctx.fill();
-        ctx.set_line_width(if is_selected || is_hovered || is_changed || is_impact {
+        ctx.set_line_width(if is_selected || is_hovered || is_changed {
             2.2 / scale.sqrt()
         } else {
             1.2 / scale.sqrt()
@@ -324,13 +312,10 @@ fn render_canvas(
         let is_selected = selected_id == Some(fn_item.node.id.as_str());
         let is_hovered = hovered_id == Some(fn_item.node.id.as_str());
         let is_changed = review.active && review.changed_ids.contains(&fn_item.node.id);
-        let is_impact = review.is_impact(&fn_item.node.id);
 
         if lod != LodLevel::Micro && sw < 16.0 && !is_selected && !is_hovered {
             ctx.set_fill_style_str(if is_changed {
                 "#f59e0b"
-            } else if is_impact {
-                "#22d3ee"
             } else {
                 "#1e293b"
             });
@@ -366,13 +351,11 @@ fn render_canvas(
             "#16233b"
         } else if is_hovered {
             "#141f35"
-        } else if is_impact {
-            "#0d2433"
         } else {
             "#0f172a"
         });
         ctx.fill();
-        ctx.set_line_width(if is_selected || is_changed || is_impact {
+        ctx.set_line_width(if is_selected || is_changed {
             2.4
         } else if is_hovered {
             1.8
@@ -385,8 +368,6 @@ fn render_canvas(
             "#38bdf8"
         } else if is_changed {
             "#f59e0b"
-        } else if is_impact {
-            "#22d3ee"
         } else if is_hovered {
             "#60a5fa"
         } else {
@@ -597,6 +578,25 @@ fn render_canvas(
                     h: btn_size,
                     kind: ActionKind::OpenEditor(fp.clone()),
                 });
+                if review.active && review.changed_ids.contains(&g.node.id) {
+                    let dx = bx + btn_size + 4.0;
+                    draw_icon_button(
+                        &ctx,
+                        dx,
+                        sy + 1.0,
+                        btn_size,
+                        ButtonIcon::OpenDiff,
+                        true,
+                        "#f59e0b",
+                    );
+                    action_hits.push(ActionHit {
+                        x: dx,
+                        y: sy + 1.0,
+                        w: btn_size,
+                        h: btn_size,
+                        kind: ActionKind::OpenDiff(fp.clone()),
+                    });
+                }
             }
         }
     }
@@ -763,11 +763,8 @@ fn render_canvas(
             let mx = off_x + (g.rect.x - layout.bounds.x) * mm_scale;
             let my = off_y + (g.rect.y - layout.bounds.y) * mm_scale;
             let is_changed = review.active && review.changed_ids.contains(&g.node.id);
-            let is_impact = review.is_impact(&g.node.id);
             ctx.set_fill_style_str(if is_changed {
                 "rgba(245, 158, 11, 0.78)"
-            } else if is_impact {
-                "rgba(34, 211, 238, 0.68)"
             } else if g.node.kind == GroupKind::Directory {
                 "rgba(71, 85, 105, 0.35)"
             } else {
@@ -797,6 +794,7 @@ fn render_canvas(
 #[derive(Clone, Copy)]
 enum ButtonIcon {
     OpenEditor,
+    OpenDiff,
 }
 
 fn draw_group_icon(
@@ -905,6 +903,15 @@ fn draw_icon_button(
             ctx.line_to(ix + s * 0.85, iy + s * 0.15);
             ctx.line_to(ix + s * 0.85, iy + s * 0.40);
         }
+        ButtonIcon::OpenDiff => {
+            // ± diff icon
+            ctx.move_to(ix + s * 0.25, iy + s * 0.35);
+            ctx.line_to(ix + s * 0.75, iy + s * 0.35);
+            ctx.move_to(ix + s * 0.50, iy + s * 0.15);
+            ctx.line_to(ix + s * 0.50, iy + s * 0.55);
+            ctx.move_to(ix + s * 0.25, iy + s * 0.78);
+            ctx.line_to(ix + s * 0.75, iy + s * 0.78);
+        }
     }
     ctx.stroke();
     ctx.restore();
@@ -939,7 +946,9 @@ pub fn CanvasView(
     hovered_id: RwSignal<Option<String>>,
     review_overlay: Memo<ReviewOverlay>,
     trace_path_ids: Memo<HashSet<String>>,
+    trace_source_id: RwSignal<Option<String>>,
     on_open_in_editor: Callback<String>,
+    on_open_diff: Callback<String>,
     on_focus_node: Callback<String>,
 ) -> impl IntoView {
     let container_ref = NodeRef::<leptos::html::Div>::new();
@@ -1246,6 +1255,7 @@ pub fn CanvasView(
         {
             match action {
                 ActionKind::OpenEditor(fp) => on_open_in_editor.run(fp),
+                ActionKind::OpenDiff(fp) => on_open_diff.run(fp),
             }
             return;
         }
@@ -1444,7 +1454,8 @@ pub fn CanvasView(
             }}
             {move || {
                 let crumbs = breadcrumb.get();
-                if crumbs.is_empty() {
+                let is_tracing = trace_source_id.get().is_some();
+                if crumbs.is_empty() && !is_tracing {
                     view! { <span /> }.into_any()
                 } else {
                     let last_idx = crumbs.len().saturating_sub(1);
@@ -1470,6 +1481,17 @@ pub fn CanvasView(
                                     </>
                                 }
                             }).collect_view()}
+                            {is_tracing.then(|| view! {
+                                <button
+                                    class="breadcrumb-clear-trace"
+                                    on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        trace_source_id.set(None);
+                                    }
+                                >
+                                    "Clear Trace ✕"
+                                </button>
+                            })}
                         </div>
                     }.into_any()
                 }

@@ -13,7 +13,7 @@ use crate::sample::sample_project;
 use crate::tauri_bridge;
 use crate::types::{
     AnalyzeProgress, DiffLine, DiffStatus, FileDiff, FunctionNode, GitDiffSummary, GroupKind,
-    GroupNode, LodLevel, PendingReviewComment, PrDetails, PrListItem, PrSuggestions, ProjectGraph,
+    GroupNode, LodLevel, PendingReviewComment, PrDetails, PrListItem, PrReviewComment, PrSuggestions, ProjectGraph,
     ProjectSettings, RecentProject, Viewport,
 };
 
@@ -150,6 +150,109 @@ fn format_duration(ms: u64) -> String {
         let mins = secs / 60;
         let rem = secs % 60;
         format!("{mins}m {rem:02}s")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InfluenceItem {
+    node_id: String,
+    file: String,
+    symbol: String,
+    kind: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FileInfluence {
+    inbound: Vec<InfluenceItem>,
+    outbound: Vec<InfluenceItem>,
+    inbound_files: usize,
+    outbound_files: usize,
+}
+
+fn compute_file_influence(graph: &ProjectGraph, fd: &FileDiff) -> FileInfluence {
+    let root_trim = graph.root_path.trim_end_matches('/');
+    let rel_of = |p: &str| -> String {
+        if !root_trim.is_empty() {
+            if let Some(stripped) = p.strip_prefix(root_trim) {
+                return stripped.trim_start_matches('/').to_string();
+            }
+        }
+        p.trim_start_matches("./").to_string()
+    };
+    let mut id_info: HashMap<&str, (String, String)> = HashMap::new();
+    let mut in_file_ids: HashSet<&str> = HashSet::new();
+    for g in &graph.groups {
+        if let Some(p) = g.file_path.as_deref() {
+            if paths_match(p, &graph.root_path, fd) {
+                in_file_ids.insert(g.id.as_str());
+            }
+            let sym = if g.qualified_name.is_empty() {
+                g.name.clone()
+            } else {
+                g.qualified_name.replace('.', "::")
+            };
+            id_info.insert(g.id.as_str(), (rel_of(p), sym));
+        }
+    }
+    for f in &graph.functions {
+        if paths_match(&f.file_path, &graph.root_path, fd) {
+            in_file_ids.insert(f.id.as_str());
+        }
+        let sym = if f.qualified_name.is_empty() {
+            format!("{}::{}", rel_of(&f.file_path), f.name)
+        } else {
+            f.qualified_name.replace('.', "::")
+        };
+        id_info.insert(f.id.as_str(), (rel_of(&f.file_path), sym));
+    }
+
+    let mut inbound_map: HashMap<(&str, &'static str), InfluenceItem> = HashMap::new();
+    let mut outbound_map: HashMap<(&str, &'static str), InfluenceItem> = HashMap::new();
+    let mut in_files: HashSet<String> = HashSet::new();
+    let mut out_files: HashSet<String> = HashSet::new();
+
+    for e in &graph.edges {
+        let src_in = in_file_ids.contains(e.source_id.as_str());
+        let dst_in = in_file_ids.contains(e.target_id.as_str());
+        let kind_lbl = match e.kind {
+            crate::types::EdgeKind::Import => "import",
+            crate::types::EdgeKind::Call => "call",
+        };
+        if dst_in && !src_in {
+            if let Some((rel, sym)) = id_info.get(e.source_id.as_str()) {
+                in_files.insert(rel.clone());
+                inbound_map
+                    .entry((e.source_id.as_str(), kind_lbl))
+                    .or_insert_with(|| InfluenceItem {
+                        node_id: e.source_id.clone(),
+                        file: rel.clone(),
+                        symbol: sym.clone(),
+                        kind: kind_lbl,
+                    });
+            }
+        } else if src_in && !dst_in {
+            if let Some((rel, sym)) = id_info.get(e.target_id.as_str()) {
+                out_files.insert(rel.clone());
+                outbound_map
+                    .entry((e.target_id.as_str(), kind_lbl))
+                    .or_insert_with(|| InfluenceItem {
+                        node_id: e.target_id.clone(),
+                        file: rel.clone(),
+                        symbol: sym.clone(),
+                        kind: kind_lbl,
+                    });
+            }
+        }
+    }
+    let mut inbound: Vec<InfluenceItem> = inbound_map.into_values().collect();
+    let mut outbound: Vec<InfluenceItem> = outbound_map.into_values().collect();
+    inbound.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
+    outbound.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
+    FileInfluence {
+        inbound,
+        outbound,
+        inbound_files: in_files.len(),
+        outbound_files: out_files.len(),
     }
 }
 
@@ -481,7 +584,7 @@ pub fn App() -> impl IntoView {
     let pending_editor_file = RwSignal::new(Option::<String>::None);
 
     // Code Review & PR state
-    let review_filter_mode = RwSignal::new(ReviewFilterMode::All);
+    let review_filter_mode = RwSignal::new(ReviewFilterMode::BlastRadius);
     let diff_summary = RwSignal::new(Option::<GitDiffSummary>::None);
     let git_base_ref = RwSignal::new("HEAD".to_string());
     let active_pr_ref = RwSignal::new(Option::<String>::None);
@@ -498,11 +601,16 @@ pub fn App() -> impl IntoView {
     let pr_list_scope = RwSignal::new("all_repos".to_string());
     let pr_modal_open = RwSignal::new(false);
     let pr_search_query = RwSignal::new(String::new());
+    let pr_direct_url = RwSignal::new(String::new());
     let pr_details = RwSignal::new(Option::<PrDetails>::None);
     let pr_details_busy = RwSignal::new(false);
     let pr_meta_busy = RwSignal::new(false);
     let pr_comment_busy = RwSignal::new(false);
     let pr_comment_action_busy = RwSignal::new(Option::<String>::None);
+    let confirm_action = RwSignal::new(Option::<String>::None);
+    let editing_comment = RwSignal::new(Option::<(u64, String)>::None);
+    let editing_review_comment = RwSignal::new(Option::<(u64, String)>::None);
+    let auto_merge_method = RwSignal::new("SQUASH".to_string());
     let pr_overview_modal = RwSignal::new(false);
     let pr_overview_tab = RwSignal::new("conversation".to_string());
     let pr_comment_draft = RwSignal::new(String::new());
@@ -517,6 +625,7 @@ pub fn App() -> impl IntoView {
     let pr_suggestions = RwSignal::new(PrSuggestions::default());
     let pr_manage_mode = RwSignal::new(Option::<&'static str>::None);
     let diff_modal_file = RwSignal::new(Option::<String>::None);
+    let diff_impact_open = RwSignal::new(false);
     let diff_gutter_markers = RwSignal::new(Vec::<DiffGutterMarker>::new());
     let diff_split_mode = RwSignal::new(
         tauri_bridge::local_storage_get(DIFF_SPLIT_MODE_KEY).as_deref() == Some("true"),
@@ -527,7 +636,6 @@ pub fn App() -> impl IntoView {
     let palette_open = RwSignal::new(false);
     let palette_query = RwSignal::new(String::new());
     let palette_cursor = RwSignal::new(0usize);
-    let expanded_hunks = RwSignal::new(HashSet::<usize>::new());
     let update_available = RwSignal::new(Option::<(String, String)>::None);
     let theme_mode = RwSignal::new(
         tauri_bridge::local_storage_get("vcode.theme").unwrap_or_else(|| "dark".to_string()),
@@ -539,11 +647,6 @@ pub fn App() -> impl IntoView {
             .clamp(10, 18),
     );
 
-    Effect::new(move |_| {
-        let _ = diff_modal_file.get();
-        expanded_hunks.set(HashSet::new());
-    });
-
     if tauri_bridge::is_tauri_available() {
         spawn_local(async move {
             if let Some(info) = tauri_bridge::check_latest_release().await {
@@ -551,6 +654,33 @@ pub fn App() -> impl IntoView {
             }
         });
     }
+
+    let selected_module_id = Memo::new(move |_| -> Option<String> {
+        let sid = selected_id.get()?;
+        graph.with(|g| {
+            let group_map: HashMap<&str, &GroupNode> =
+                g.groups.iter().map(|grp| (grp.id.as_str(), grp)).collect();
+            let mut cur_gid = if group_map.contains_key(sid.as_str()) {
+                Some(sid.clone())
+            } else {
+                g.functions
+                    .iter()
+                    .find(|f| f.id == sid)
+                    .map(|f| f.parent_id.clone())
+            };
+            while let Some(gid) = cur_gid {
+                if let Some(grp) = group_map.get(gid.as_str()) {
+                    if grp.kind == GroupKind::Module {
+                        return Some(grp.id.clone());
+                    }
+                    cur_gid = grp.parent_id.clone();
+                } else {
+                    break;
+                }
+            }
+            Some(sid)
+        })
+    });
 
     let layout = Memo::new(move |_| {
         let col = canvas_collapsed_ids.get();
@@ -825,17 +955,20 @@ pub fn App() -> impl IntoView {
             pr_meta_busy.set(false);
             pr_comment_busy.set(false);
             pr_comment_action_busy.set(None);
+            confirm_action.set(None);
+            editing_comment.set(None);
+            editing_review_comment.set(None);
         });
     };
 
-    let delete_review_comment = move |cid: u64| {
+    let run_review_comment_action = move |busy_key: String, action: &'static str, value: String| {
         let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
         let proj = graph.get_untracked().root_path;
         let tok = git_token.get_untracked();
-        pr_comment_action_busy.set(Some(format!("del_rev:{cid}")));
+        pr_comment_action_busy.set(Some(busy_key));
         spawn_local(async move {
             let tok_opt = if tok.trim().is_empty() { None } else { Some(tok.as_str()) };
-            match tauri_bridge::manage_pr(&proj, &pr_val, "delete_review_comment", &cid.to_string(), tok_opt).await {
+            match tauri_bridge::manage_pr(&proj, &pr_val, action, &value, tok_opt).await {
                 Ok(()) => load_pr_details(),
                 Err(e) => {
                     pr_comment_action_busy.set(None);
@@ -843,6 +976,126 @@ pub fn App() -> impl IntoView {
                 }
             }
         });
+    };
+
+    let render_review_comment = move |c: PrReviewComment| -> AnyView {
+        let cid = c.id;
+        let body_orig = c.body.clone();
+        let body_disp = c.body.clone();
+        let can_modify = pr_details.with_untracked(|d| {
+            d.as_ref()
+                .and_then(|det| det.current_user.as_deref())
+                .is_none_or(|u| u.eq_ignore_ascii_case(&c.author))
+        });
+        view! {
+            <div class="diff-thread-msg">
+                <div class="diff-thread-hdr">
+                    <span class="diff-thread-author">{format!("@{} · {}", c.author, short_ts(&c.created_at))}</span>
+                    <div class="diff-thread-btns">
+                        {[("+1", "👍"), ("heart", "❤️"), ("rocket", "🚀")].into_iter().map(|(rk, emoji)| {
+                            let cnt = c.reactions.iter().find(|r| r.content == rk).map(|r| r.count).unwrap_or(0);
+                            let lbl = if cnt > 0 { format!("{emoji} {cnt}") } else { emoji.to_string() };
+                            let bkey = format!("react_rev:{cid}:{rk}");
+                            let bkey_dis = bkey.clone();
+                            let bkey_click = bkey.clone();
+                            view! {
+                                <button
+                                    class="pr-filter-chip"
+                                    disabled=move || pr_comment_action_busy.get().as_deref() == Some(bkey_dis.as_str())
+                                    on:click=move |_| {
+                                        run_review_comment_action(bkey_click.clone(), "react_review_comment", format!("{cid}:{rk}"));
+                                    }
+                                >
+                                    {move || if pr_comment_action_busy.get().as_deref() == Some(bkey.as_str()) {
+                                        view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                    } else {
+                                        view! { {lbl.clone()} }.into_any()
+                                    }}
+                                </button>
+                            }
+                        }).collect_view()}
+                        {can_modify.then(|| {
+                            let body_for_edit = body_orig.clone();
+                            view! {
+                                <>
+                                    <button
+                                        class="pr-filter-chip"
+                                        title="Edit comment"
+                                        on:click=move |_| {
+                                            confirm_action.set(None);
+                                            editing_review_comment.set(Some((cid, body_for_edit.clone())));
+                                        }
+                                    >
+                                        "✎"
+                                    </button>
+                                    <button
+                                        class="pr-filter-chip pr-comment-del-btn"
+                                        title="Delete comment"
+                                        disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}"))
+                                        on:click=move |_| {
+                                            let key = format!("del_rev:{cid}");
+                                            if confirm_action.get_untracked().as_deref() == Some(key.as_str()) {
+                                                confirm_action.set(None);
+                                                run_review_comment_action(key, "delete_review_comment", cid.to_string());
+                                            } else {
+                                                confirm_action.set(Some(key));
+                                            }
+                                        }
+                                    >
+                                        {move || {
+                                            let key = format!("del_rev:{cid}");
+                                            if pr_comment_action_busy.get().as_deref() == Some(key.as_str()) {
+                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                            } else if confirm_action.get().as_deref() == Some(key.as_str()) {
+                                                view! { "Confirm?" }.into_any()
+                                            } else {
+                                                view! { "🗑" }.into_any()
+                                            }
+                                        }}
+                                    </button>
+                                </>
+                            }
+                        })}
+                    </div>
+                </div>
+                {move || {
+                    if let Some((eid, val)) = editing_review_comment.get().filter(|(id, _)| *id == cid) {
+                        view! {
+                            <div class="diff-inline-composer">
+                                <textarea
+                                    class="review-comment-input"
+                                    rows="2"
+                                    prop:value=val
+                                    on:input=move |ev| editing_review_comment.set(Some((eid, event_target_value(&ev))))
+                                />
+                                <div class="diff-composer-actions">
+                                    <button class="btn btn-ghost inspector-btn" on:click=move |_| editing_review_comment.set(None)>"Cancel"</button>
+                                    <button
+                                        class="btn btn-primary inspector-btn"
+                                        disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("edit_rev:{cid}"))
+                                        on:click=move |_| {
+                                            if let Some((_, txt)) = editing_review_comment.get_untracked() {
+                                                if !txt.trim().is_empty() {
+                                                    run_review_comment_action(
+                                                        format!("edit_rev:{cid}"),
+                                                        "edit_review_comment",
+                                                        format!("{cid}:{txt}"),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    >
+                                        "Save"
+                                    </button>
+                                </div>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! { <span class="diff-thread-body">{body_disp.clone()}</span> }.into_any()
+                    }
+                }}
+            </div>
+        }.into_any()
     };
 
     let refresh_pr_review = move |pr_val: String| {
@@ -955,7 +1208,7 @@ pub fn App() -> impl IntoView {
                     if prev_diff.as_ref() != Some(&pr_diff) {
                         diff_summary.set(Some(pr_diff));
                     }
-                    review_filter_mode.set(ReviewFilterMode::ChangedOnly);
+                    review_filter_mode.set(ReviewFilterMode::BlastRadius);
                     load_pr_details();
                 }
                 Err(e) => {
@@ -1360,15 +1613,101 @@ pub fn App() -> impl IntoView {
         }
     });
 
-    // Auto-scroll sidebar to selected diagram
+    // Sync selection across left tree (expand + scroll) and right review list (scroll)
     Effect::new(move |_| {
         let Some(sid) = selected_id.get() else {
             return;
         };
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            let selector = format!("[data-node-id=\"{}\"]", sid.replace('"', "\\\""));
-            if let Ok(Some(el)) = doc.query_selector(&selector) {
-                el.scroll_into_view_with_bool(false);
+        let to_expand: Vec<String> = graph.with_untracked(|g| {
+            let group_map: HashMap<&str, &GroupNode> =
+                g.groups.iter().map(|grp| (grp.id.as_str(), grp)).collect();
+            let mut ancestors = Vec::new();
+            let mut cur = g
+                .functions
+                .iter()
+                .find(|f| f.id == sid)
+                .map(|f| f.parent_id.clone())
+                .or_else(|| group_map.get(sid.as_str()).and_then(|grp| grp.parent_id.clone()));
+            while let Some(pid) = cur {
+                ancestors.push(pid.clone());
+                cur = group_map.get(pid.as_str()).and_then(|grp| grp.parent_id.clone());
+            }
+            ancestors
+        });
+        if !to_expand.is_empty() {
+            collapsed_ids.update(|set| {
+                for aid in &to_expand {
+                    set.remove(aid);
+                }
+            });
+        }
+        let scroll_child_into_view =
+            |doc: &web_sys::Document, container_sel: &str, item: &web_sys::Element| {
+                let Ok(Some(container)) = doc.query_selector(container_sel) else {
+                    item.scroll_into_view_with_bool(false);
+                    return;
+                };
+                let cr = container.get_bounding_client_rect();
+                let ir = item.get_bounding_client_rect();
+                if ir.top() < cr.top() {
+                    container.set_scroll_top(
+                        (container.scroll_top() as f64 + (ir.top() - cr.top()) - 8.0) as i32,
+                    );
+                } else if ir.bottom() > cr.bottom() {
+                    container.set_scroll_top(
+                        (container.scroll_top() as f64 + (ir.bottom() - cr.bottom()) + 8.0) as i32,
+                    );
+                }
+            };
+        let scroll_panes = move || {
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                let selector = format!("[data-node-id=\"{}\"]", sid.replace('"', "\\\""));
+                if let Ok(Some(el)) = doc
+                    .query_selector(".tree-row.is-selected")
+                    .or_else(|_| doc.query_selector(&selector))
+                {
+                    scroll_child_into_view(&doc, ".sidebar-tree", &el);
+                }
+                if let Ok(Some(rel)) = doc.query_selector(".review-file-row.is-selected") {
+                    scroll_child_into_view(&doc, ".review-scroll", &rel);
+                }
+            }
+        };
+        if let Some(win) = web_sys::window() {
+            let win2 = win.clone();
+            let cb = Closure::once(move || {
+                let cb2 = Closure::once(scroll_panes);
+                let _ = win2.request_animation_frame(cb2.as_ref().unchecked_ref());
+                cb2.forget();
+            });
+            let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+            cb.forget();
+        }
+    });
+
+    // Sync diff modal navigation (Prev / Next / Viewed & Next) to diagram & sidebars
+    Effect::new(move |_| {
+        let Some(target) = diff_modal_file.get() else {
+            return;
+        };
+        let matched_gid = diff_summary.with_untracked(|d_opt| {
+            let fd = d_opt.as_ref()?.files.iter().find(|f| f.file_path == target)?;
+            graph.with_untracked(|g| {
+                g.groups
+                    .iter()
+                    .find(|grp| {
+                        grp.kind == GroupKind::Module
+                            && grp
+                                .file_path
+                                .as_deref()
+                                .is_some_and(|p| paths_match(p, &g.root_path, fd))
+                    })
+                    .map(|grp| grp.id.clone())
+            })
+        });
+        if let Some(gid) = matched_gid {
+            if selected_module_id.get_untracked().as_deref() != Some(gid.as_str()) {
+                focus_node.run(gid);
             }
         }
     });
@@ -1377,8 +1716,10 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         let Some(_) = diff_modal_file.get() else {
             diff_gutter_markers.set(Vec::new());
+            diff_impact_open.set(false);
             return;
         };
+        diff_impact_open.set(false);
         let _mode = diff_split_mode.get();
         if let Some(win) = web_sys::window() {
             let cb = Closure::once_into_js(move || {
@@ -1519,6 +1860,15 @@ pub fn App() -> impl IntoView {
                 error_banner.set(Some(err));
             }
         });
+    });
+
+    let handle_open_diff = Callback::new(move |file_path: String| {
+        let root_path = graph.get_untracked().root_path;
+        if let Some(diff) = diff_summary.get_untracked() {
+            if let Some(fd) = diff.files.iter().find(|fd| paths_match(&file_path, &root_path, fd)) {
+                diff_modal_file.set(Some(fd.file_path.clone()));
+            }
+        }
     });
 
     let flat_tree = Memo::new(move |_| {
@@ -1872,7 +2222,7 @@ pub fn App() -> impl IntoView {
                                             }}
                                             <button
                                                 class=format!("tree-item tree-{kind_class}")
-                                                on:click=move |_| selected_id.set(Some(id_sel.clone()))
+                                                on:click=move |_| focus_node.run(id_sel.clone())
                                                 on:dblclick=move |_| focus_node.run(id_dbl.clone())
                                             >
                                                 <span class="tree-icon">
@@ -1910,114 +2260,6 @@ pub fn App() -> impl IntoView {
                                 }).collect_view().into_any()
                             }}
                         </div>
-
-                        {move || {
-                            let Some(sel_id) = selected_id.get() else {
-                                return view! { <span /> }.into_any();
-                            };
-                            let (title, is_group, is_collapsed, callers, callees) = graph.with(|g| {
-                                let mut name_map: HashMap<&str, String> = HashMap::new();
-                                for grp in &g.groups {
-                                    name_map.insert(grp.id.as_str(), grp.name.clone());
-                                }
-                                for fn_n in &g.functions {
-                                    name_map.insert(fn_n.id.as_str(), fn_n.name.clone());
-                                }
-                                let is_grp = g.groups.iter().any(|grp| grp.id == sel_id);
-                                let is_col = canvas_collapsed_ids.get().contains(&sel_id);
-                                let mut in_list: Vec<(String, String)> = Vec::new();
-                                let mut out_list: Vec<(String, String)> = Vec::new();
-                                let mut seen_in = HashSet::new();
-                                let mut seen_out = HashSet::new();
-                                for e in &g.edges {
-                                    if e.target_id == sel_id && seen_in.insert(e.source_id.clone()) {
-                                        let lbl = name_map.get(e.source_id.as_str()).cloned().unwrap_or_else(|| e.source_id.clone());
-                                        in_list.push((e.source_id.clone(), lbl));
-                                    }
-                                    if e.source_id == sel_id && seen_out.insert(e.target_id.clone()) {
-                                        let lbl = name_map.get(e.target_id.as_str()).cloned().unwrap_or_else(|| e.target_id.clone());
-                                        out_list.push((e.target_id.clone(), lbl));
-                                    }
-                                }
-                                let t = name_map.get(sel_id.as_str()).cloned().unwrap_or_else(|| sel_id.clone());
-                                (t, is_grp, is_col, in_list, out_list)
-                            });
-                            let sel_for_col = sel_id.clone();
-                            let sel_for_trace = sel_id.clone();
-                            let is_trace_src = trace_source_id.get().as_deref() == Some(sel_id.as_str());
-                            view! {
-                                <div class="inspector-card">
-                                    <div class="inspector-hdr">
-                                        <span class="inspector-title" title=title.clone()>{title.clone()}</span>
-                                        <div class="inspector-actions">
-                                            {is_group.then(|| {
-                                                let id_c = sel_for_col.clone();
-                                                view! {
-                                                    <button
-                                                        class="btn btn-ghost inspector-btn"
-                                                        title="Collapse or expand group on canvas"
-                                                        on:click=move |_| {
-                                                            canvas_collapsed_ids.update(|s| {
-                                                                if s.contains(&id_c) {
-                                                                    s.remove(&id_c);
-                                                                } else {
-                                                                    s.insert(id_c.clone());
-                                                                }
-                                                            });
-                                                        }
-                                                    >
-                                                        {if is_collapsed { "Expand" } else { "Collapse" }}
-                                                    </button>
-                                                }
-                                            })}
-                                            <button
-                                                class=if is_trace_src { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
-                                                title="Start tracing call path from this node; select another node to highlight path"
-                                                on:click=move |_| {
-                                                    if trace_source_id.get_untracked().as_deref() == Some(sel_for_trace.as_str()) {
-                                                        trace_source_id.set(None);
-                                                    } else {
-                                                        trace_source_id.set(Some(sel_for_trace.clone()));
-                                                    }
-                                                }
-                                            >
-                                                {if is_trace_src { "Tracing…" } else { "Trace Path" }}
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <div class="inspector-cols">
-                                        <div class="inspector-list">
-                                            <div class="inspector-sub">{format!("Callers ({})", callers.len())}</div>
-                                            {if callers.is_empty() {
-                                                view! { <div class="inspector-empty">"None"</div> }.into_any()
-                                            } else {
-                                                callers.into_iter().take(12).map(|(cid, clbl)| {
-                                                    view! {
-                                                        <button class="inspector-link" on:click=move |_| focus_node.run(cid.clone())>
-                                                            {clbl}
-                                                        </button>
-                                                    }
-                                                }).collect_view().into_any()
-                                            }}
-                                        </div>
-                                        <div class="inspector-list">
-                                            <div class="inspector-sub">{format!("Callees ({})", callees.len())}</div>
-                                            {if callees.is_empty() {
-                                                view! { <div class="inspector-empty">"None"</div> }.into_any()
-                                            } else {
-                                                callees.into_iter().take(12).map(|(cid, clbl)| {
-                                                    view! {
-                                                        <button class="inspector-link" on:click=move |_| focus_node.run(cid.clone())>
-                                                            {clbl}
-                                                        </button>
-                                                    }
-                                                }).collect_view().into_any()
-                                            }}
-                                        </div>
-                                    </div>
-                                </div>
-                            }.into_any()
-                        }}
 
                         {move || {
                             let errs = graph.get().parse_errors;
@@ -2081,72 +2323,18 @@ pub fn App() -> impl IntoView {
                             }.into_any()
                         } else {
                             view! {
-                                <>
-                                    {move || {
-                                        let sel = selected_id.get();
-                                        let tracing = trace_source_id.get();
-                                        if sel.is_none() && tracing.is_none() {
-                                            return view! { <span /> }.into_any();
-                                        }
-                                        let crumbs: Vec<(String, String)> = sel.as_ref().map(|sid| {
-                                            graph.with(|g| {
-                                                let grp_map: HashMap<&str, &GroupNode> = g.groups.iter().map(|grp| (grp.id.as_str(), grp)).collect();
-                                                let mut chain = Vec::new();
-                                                let mut cur_parent: Option<String> = if let Some(fn_n) = g.functions.iter().find(|f| &f.id == sid) {
-                                                    chain.push((fn_n.id.clone(), fn_n.name.clone()));
-                                                    Some(fn_n.parent_id.clone())
-                                                } else if let Some(grp) = grp_map.get(sid.as_str()) {
-                                                    chain.push((grp.id.clone(), grp.name.clone()));
-                                                    grp.parent_id.clone()
-                                                } else {
-                                                    None
-                                                };
-                                                while let Some(pid) = cur_parent {
-                                                    if let Some(grp) = grp_map.get(pid.as_str()) {
-                                                        chain.push((grp.id.clone(), grp.name.clone()));
-                                                        cur_parent = grp.parent_id.clone();
-                                                    } else {
-                                                        break;
-                                                    }
-                                                }
-                                                chain.reverse();
-                                                chain
-                                            })
-                                        }).unwrap_or_default();
-                                        view! {
-                                            <div class="breadcrumb-bar">
-                                                {crumbs.into_iter().enumerate().map(|(i, (cid, clbl))| {
-                                                    view! {
-                                                        <>
-                                                            {(i > 0).then(|| view! { <span class="breadcrumb-sep">"›"</span> })}
-                                                            <button class="breadcrumb-item" on:click=move |_| focus_node.run(cid.clone())>
-                                                                {clbl}
-                                                            </button>
-                                                        </>
-                                                    }
-                                                }).collect_view()}
-                                                {tracing.is_some().then(|| view! {
-                                                    <button
-                                                        class="breadcrumb-clear-trace"
-                                                        on:click=move |_| trace_source_id.set(None)
-                                                    >
-                                                        "Clear Trace ✕"
-                                                    </button>
-                                                })}
-                                            </div>
-                                        }.into_any()
-                                    }}
-                                    <CanvasView
-                                        layout=layout
-                                        viewport=viewport
-                                        selected_id=selected_id
-                                        hovered_id=hovered_id
-                                        review_overlay=review_overlay
-                                        trace_path_ids=trace_path_ids
-                                        on_open_in_editor=handle_open_in_editor
-                                        on_focus_node=focus_node
-                                    />
-                                </>
+                                <CanvasView
+                                    layout=layout
+                                    viewport=viewport
+                                    selected_id=selected_id
+                                    hovered_id=hovered_id
+                                    review_overlay=review_overlay
+                                    trace_path_ids=trace_path_ids
+                                    trace_source_id=trace_source_id
+                                    on_open_in_editor=handle_open_in_editor
+                                    on_open_diff=handle_open_diff
+                                    on_focus_node=focus_node
+                                />
                             }.into_any()
                         }
                     }}
@@ -2349,6 +2537,7 @@ pub fn App() -> impl IntoView {
                                 }
                                 let make_row = |(fd, matched_group, fp, is_viewed): (FileDiff, Option<String>, String, bool)| {
                                     let modal_key = fd.file_path.clone();
+                                    let modal_dbl = fd.file_path.clone();
                                     let row_gid = matched_group.clone();
                                     let path_for_cb = fd.file_path.clone();
                                     let path_for_thr = fd.file_path.clone();
@@ -2356,7 +2545,7 @@ pub fn App() -> impl IntoView {
                                         <div
                                             class=move || {
                                                 let is_sel = row_gid.as_deref().is_some()
-                                                    && selected_id.get().as_deref() == row_gid.as_deref();
+                                                    && selected_module_id.get().as_deref() == row_gid.as_deref();
                                                 match (is_sel, is_viewed) {
                                                     (true, true) => "review-file-row is-selected is-viewed",
                                                     (true, false) => "review-file-row is-selected",
@@ -2364,11 +2553,16 @@ pub fn App() -> impl IntoView {
                                                     (false, false) => "review-file-row",
                                                 }
                                             }
+                                            title="Click to focus in diagram (double-click to open diff)"
                                             on:click=move |_| {
                                                 if let Some(gid) = &matched_group {
                                                     focus_node.run(gid.clone());
+                                                } else {
+                                                    diff_modal_file.set(Some(modal_key.clone()));
                                                 }
-                                                diff_modal_file.set(Some(modal_key.clone()));
+                                            }
+                                            on:dblclick=move |_| {
+                                                diff_modal_file.set(Some(modal_dbl.clone()));
                                             }
                                         >
                                             <input
@@ -2455,6 +2649,28 @@ pub fn App() -> impl IntoView {
                         DiffStatus::Deleted => "Deleted",
                     };
                     let modal_fp = file_diff_fingerprint(&fd);
+                    let influence =
+                        graph.with_untracked(|g| compute_file_influence(g, &fd));
+                    let in_cnt = influence.inbound_files;
+                    let out_cnt = influence.outbound_files;
+                    let inf_cls = if in_cnt >= 5 {
+                        "diff-influence-pill is-high"
+                    } else if in_cnt > 0 {
+                        "diff-influence-pill is-med"
+                    } else {
+                        "diff-influence-pill"
+                    };
+                    let inf_lbl = if in_cnt >= 5 {
+                        format!("🔥 High Impact · ← {in_cnt} · → {out_cnt}")
+                    } else if in_cnt > 0 {
+                        format!("⚡ Impact · ← {in_cnt} · → {out_cnt}")
+                    } else {
+                        format!("→ {out_cnt} deps")
+                    };
+                    let inf_inbound = influence.inbound.clone();
+                    let inf_outbound = influence.outbound.clone();
+                    let inf_in_sym_cnt = inf_inbound.len();
+                    let inf_out_sym_cnt = inf_outbound.len();
                     let modal_path_chk = fd.file_path.clone();
                     let modal_path_cb = fd.file_path.clone();
                     let modal_fp_chk = modal_fp.clone();
@@ -2463,7 +2679,13 @@ pub fn App() -> impl IntoView {
                     let modal_fp_next = modal_fp.clone();
                     let modal_path_next = fd.file_path.clone();
                     Some(view! {
-                        <div class="modal-backdrop" on:click=move |_| diff_modal_file.set(None)>
+                        <div
+                            class="modal-backdrop"
+                            on:click=move |_| {
+                                diff_impact_open.set(false);
+                                diff_modal_file.set(None);
+                            }
+                        >
                             <div
                                 class=move || if diff_split_mode.get() { "diff-modal-card is-split" } else { "diff-modal-card" }
                                 on:click=move |ev| ev.stop_propagation()
@@ -2477,6 +2699,21 @@ pub fn App() -> impl IntoView {
                                             " "
                                             <span class="diff-del">{format!("-{}", fd.deletions)}</span>
                                         </span>
+                                        {(in_cnt > 0 || out_cnt > 0).then(|| view! {
+                                            <button
+                                                class=inf_cls
+                                                title="Hover or click to inspect 1-hop impacted files, modules, and functions"
+                                                on:mouseenter=move |_| diff_impact_open.set(true)
+                                                on:mouseleave=move |_| diff_impact_open.set(false)
+                                                on:click=move |_| diff_impact_open.update(|v| *v = !*v)
+                                            >
+                                                {move || if diff_impact_open.get() {
+                                                    format!("{inf_lbl} ▴")
+                                                } else {
+                                                    format!("{inf_lbl} ▾")
+                                                }}
+                                            </button>
+                                        })}
                                     </div>
                                     <div class="diff-modal-actions">
                                         <div class="diff-hunk-nav">
@@ -2515,33 +2752,90 @@ pub fn App() -> impl IntoView {
                                                 "Split"
                                             </button>
                                         </div>
-                                        <button class="btn btn-ghost" on:click=move |_| diff_modal_file.set(None)>"✕"</button>
+                                        <button
+                                            class="btn btn-ghost"
+                                            on:click=move |_| {
+                                                diff_impact_open.set(false);
+                                                diff_modal_file.set(None);
+                                            }
+                                        >
+                                            "✕"
+                                        </button>
                                     </div>
                                 </div>
+                                {(in_cnt > 0 || out_cnt > 0).then(|| {
+                                    let in_items = inf_inbound.clone();
+                                    let out_items = inf_outbound.clone();
+                                    let render_row = move |it: InfluenceItem| {
+                                        let nid = it.node_id.clone();
+                                        let row_title = format!("Focus {} in diagram", it.file);
+                                        view! {
+                                            <button
+                                                class="diff-impact-row"
+                                                title=row_title
+                                                on:click=move |_| {
+                                                    diff_impact_open.set(false);
+                                                    diff_modal_file.set(None);
+                                                    focus_node.run(nid.clone());
+                                                }
+                                            >
+                                                <span class="diff-impact-kind">{it.kind}</span>
+                                                <span class="diff-impact-sym">{it.symbol}</span>
+                                                <span class="diff-impact-file">{it.file}</span>
+                                            </button>
+                                        }
+                                    };
+                                    view! {
+                                        <Show when=move || diff_impact_open.get()>
+                                            <div
+                                                class="diff-impact-panel"
+                                                on:mouseenter=move |_| diff_impact_open.set(true)
+                                                on:mouseleave=move |_| diff_impact_open.set(false)
+                                            >
+                                                <div class="diff-impact-col">
+                                                    <div class="diff-impact-col-hdr">
+                                                        {format!("← Impacted by this file ({in_cnt} files · {inf_in_sym_cnt} refs)")}
+                                                    </div>
+                                                    <div class="diff-impact-list">
+                                                        {if in_items.is_empty() {
+                                                            view! { <div class="diff-impact-empty">"No external callers or importers."</div> }.into_any()
+                                                        } else {
+                                                            in_items.clone().into_iter().map(render_row).collect_view().into_any()
+                                                        }}
+                                                    </div>
+                                                </div>
+                                                <div class="diff-impact-col">
+                                                    <div class="diff-impact-col-hdr">
+                                                        {format!("→ Depends on ({out_cnt} files · {inf_out_sym_cnt} refs)")}
+                                                    </div>
+                                                    <div class="diff-impact-list">
+                                                        {if out_items.is_empty() {
+                                                            view! { <div class="diff-impact-empty">"No external dependencies."</div> }.into_any()
+                                                        } else {
+                                                            out_items.clone().into_iter().map(render_row).collect_view().into_any()
+                                                        }}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </Show>
+                                    }
+                                })}
                                 <div class="diff-modal-body-wrap">
                                     <div class="diff-modal-body">
                                     {if fd.hunks.is_empty() {
                                         view! { <div class="review-empty">"No diff hunks available for this file."</div> }.into_any()
                                     } else {
                                         let hunk_file_path = fd.file_path.clone();
-                                        fd.hunks.into_iter().enumerate().map(|(hunk_idx, h)| {
+                                        fd.hunks.into_iter().map(|h| {
                                             let hdr = format!("@@ -{},{} +{},{} @@", h.old_start, h.old_lines, h.new_start, h.new_lines);
                                             let h_lines = h.lines;
-                                            let total_lines = h_lines.len();
                                             let f_path = hunk_file_path.clone();
                                             view! {
                                                 <div class="diff-modal-hunk">
                                                     <div class="diff-hunk-hdr">{hdr}</div>
                                                     {move || {
-                                                        let is_expanded = total_lines <= 80 || expanded_hunks.get().contains(&hunk_idx);
-                                                        let visible_lines: Vec<DiffLine> = if is_expanded {
-                                                            h_lines.clone()
-                                                        } else {
-                                                            h_lines.iter().take(40).cloned().collect()
-                                                        };
-                                                        let hidden = total_lines.saturating_sub(visible_lines.len());
-                                                        let content = if diff_split_mode.get() {
-                                                            let rows = build_split_rows(&visible_lines);
+                                                        if diff_split_mode.get() {
+                                                            let rows = build_split_rows(&h_lines);
                                                             let fp_s = f_path.clone();
                                                             view! {
                                                                 <div class="diff-split-table">
@@ -2678,29 +2972,7 @@ pub fn App() -> impl IntoView {
                                                                                                                 {if is_res { "Unresolve" } else { "Resolve" }}
                                                                                                             </button>
                                                                                                         </div>
-                                                                                                        {th.comments.into_iter().map(|c| {
-                                                                                                            let cid = c.id;
-                                                                                                            view! {
-                                                                                                                <div class="diff-thread-msg">
-                                                                                                                    <div class="diff-thread-hdr">
-                                                                                                                        <span class="diff-thread-author">{format!("@{} · {}", c.author, short_ts(&c.created_at))}</span>
-                                                                                                                        <button
-                                                                                                                            class="pr-filter-chip pr-comment-del-btn"
-                                                                                                                            title="Delete comment"
-                                                                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}"))
-                                                                                                                            on:click=move |_| delete_review_comment(cid)
-                                                                                                                        >
-                                                                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}")) {
-                                                                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
-                                                                                                                            } else {
-                                                                                                                                view! { "🗑" }.into_any()
-                                                                                                                            }}
-                                                                                                                        </button>
-                                                                                                                    </div>
-                                                                                                                    <span class="diff-thread-body">{c.body}</span>
-                                                                                                                </div>
-                                                                                                            }
-                                                                                                        }).collect_view()}
+                                                                                                        {th.comments.into_iter().map(render_review_comment).collect_view()}
                                                                                                     </div>
                                                                                                 }
                                                                                             }).collect_view()}
@@ -2773,7 +3045,7 @@ pub fn App() -> impl IntoView {
                                                             let fp_u = f_path.clone();
                                                             view! {
                                                                 <div>
-                                                                    {visible_lines.into_iter().map(|ln| {
+                                                                    {h_lines.clone().into_iter().map(|ln| {
                                                                         let cls = match ln.kind.as_str() {
                                                                             "add" => "diff-line is-add",
                                                                             "del" => "diff-line is-del",
@@ -2902,29 +3174,7 @@ pub fn App() -> impl IntoView {
                                                                                                                 </button>
                                                                                                             </div>
                                                                                                         </div>
-                                                                                                        {th.comments.into_iter().map(|c| {
-                                                                                                            let cid = c.id;
-                                                                                                            view! {
-                                                                                                                <div class="diff-thread-msg">
-                                                                                                                    <div class="diff-thread-hdr">
-                                                                                                                        <span class="diff-thread-author">{format!("@{} · {}", c.author, short_ts(&c.created_at))}</span>
-                                                                                                                        <button
-                                                                                                                            class="pr-filter-chip pr-comment-del-btn"
-                                                                                                                            title="Delete comment"
-                                                                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}"))
-                                                                                                                            on:click=move |_| delete_review_comment(cid)
-                                                                                                                        >
-                                                                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("del_rev:{cid}")) {
-                                                                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
-                                                                                                                            } else {
-                                                                                                                                view! { "🗑" }.into_any()
-                                                                                                                            }}
-                                                                                                                        </button>
-                                                                                                                    </div>
-                                                                                                                    <span class="diff-thread-body">{c.body}</span>
-                                                                                                                </div>
-                                                                                                            }
-                                                                                                        }).collect_view()}
+                                                                                                        {th.comments.into_iter().map(render_review_comment).collect_view()}
                                                                                                         {move || {
                                                                                                             let is_replying = thread_reply_target.get().is_some_and(|(t, _)| t == th.thread_id);
                                                                                                             let fp_r = fp_rep.clone();
@@ -3057,21 +3307,6 @@ pub fn App() -> impl IntoView {
                                                                     }).collect_view()}
                                                                 </div>
                                                             }.into_any()
-                                                        };
-                                                        view! {
-                                                            <>
-                                                                {content}
-                                                                {(hidden > 0).then(|| view! {
-                                                                    <button
-                                                                        class="diff-expand-btn"
-                                                                        on:click=move |_| {
-                                                                            expanded_hunks.update(|s| { s.insert(hunk_idx); });
-                                                                        }
-                                                                    >
-                                                                        {format!("Show all {total_lines} lines ({hidden} more hidden)")}
-                                                                    </button>
-                                                                })}
-                                                            </>
                                                         }
                                                     }}
                                                 </div>
@@ -3379,51 +3614,87 @@ pub fn App() -> impl IntoView {
                             <h3>"Open Pull Requests"</h3>
                             <div class="pr-scope-row">
                                 <button
-                                    class="btn btn-ghost pr-refresh-btn"
+                                    class="btn btn-ghost pr-hdr-btn"
                                     disabled=move || repo_prs_busy.get()
                                     title="Refresh PR list"
                                     on:click=move |_| load_repo_prs()
                                 >
-                                    {move || if repo_prs_busy.get() { "…" } else { "↻" }}
+                                    {move || if repo_prs_busy.get() {
+                                        view! { <span class="pr-mini-spinner" /> }.into_any()
+                                    } else {
+                                        view! { "↻" }.into_any()
+                                    }}
                                 </button>
-                                <button class="btn btn-ghost" on:click=move |_| pr_modal_open.set(false)>"✕"</button>
+                                <button class="btn btn-ghost pr-hdr-btn" on:click=move |_| pr_modal_open.set(false)>"✕"</button>
                             </div>
                         </div>
                         <div class="pr-modal-toolbar">
+                            <div class="pr-scope-bar">
+                                {move || {
+                                    let sc = pr_list_scope.get();
+                                    let has_proj = graph.with(|g| !g.root_path.is_empty() && !g.root_path.starts_with("sample://"));
+                                    view! {
+                                        <div class="pr-btn-group">
+                                            <button
+                                                class=if sc == "all_repos" { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
+                                                on:click=move |_| {
+                                                    pr_list_scope.set("all_repos".to_string());
+                                                    pr_list_filter.set("involved".to_string());
+                                                    load_repo_prs();
+                                                }
+                                            >
+                                                "All Repos (Involved)"
+                                            </button>
+                                            <button
+                                                class=if sc == "current_repo" { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
+                                                disabled=!has_proj
+                                                title=if has_proj { "List all open PRs in current repository" } else { "Open a local repository first" }
+                                                on:click=move |_| {
+                                                    pr_list_scope.set("current_repo".to_string());
+                                                    pr_list_filter.set("all".to_string());
+                                                    load_repo_prs();
+                                                }
+                                            >
+                                                "Current Repo (All Open)"
+                                            </button>
+                                        </div>
+                                    }
+                                }}
+                                <div class="pr-filter-row">
+                                    {move || {
+                                        let all = repo_prs.get();
+                                        let n_all = all.len();
+                                        let n_inv = all.iter().filter(|p| p.is_involved || p.is_author || p.is_reviewer || p.is_assigned).count();
+                                        let n_rev = all.iter().filter(|p| p.is_reviewer).count();
+                                        let n_mine = all.iter().filter(|p| p.is_author).count();
+                                        let cur = pr_list_filter.get();
+                                        [
+                                            ("involved", format!("Involved ({n_inv})")),
+                                            ("review", format!("Review ({n_rev})")),
+                                            ("mine", format!("Mine ({n_mine})")),
+                                            ("all", format!("All ({n_all})")),
+                                        ]
+                                        .into_iter()
+                                        .map(|(k, lbl)| {
+                                            let cls = if cur == k { "pr-filter-chip is-active" } else { "pr-filter-chip" };
+                                            view! {
+                                                <button class=cls on:click=move |_| pr_list_filter.set(k.to_string())>
+                                                    {lbl}
+                                                </button>
+                                            }
+                                        })
+                                        .collect_view()
+                                    }}
+                                </div>
+                            </div>
                             <input
                                 class="modal-input"
                                 type="text"
                                 autofocus=true
-                                placeholder="Filter PRs by title, repo, or @author..."
+                                placeholder="Filter PRs by title, repo, @author, or #number..."
                                 prop:value=move || pr_search_query.get()
                                 on:input=move |ev| pr_search_query.set(event_target_value(&ev))
                             />
-                            <div class="pr-filter-row">
-                                {move || {
-                                    let all = repo_prs.get();
-                                    let n_all = all.len();
-                                    let n_inv = all.iter().filter(|p| p.is_involved || p.is_author || p.is_reviewer || p.is_assigned).count();
-                                    let n_rev = all.iter().filter(|p| p.is_reviewer).count();
-                                    let n_mine = all.iter().filter(|p| p.is_author).count();
-                                    let cur = pr_list_filter.get();
-                                    [
-                                        ("involved", format!("Involved ({n_inv})")),
-                                        ("review", format!("Review ({n_rev})")),
-                                        ("mine", format!("Mine ({n_mine})")),
-                                        ("all", format!("All ({n_all})")),
-                                    ]
-                                    .into_iter()
-                                    .map(|(k, lbl)| {
-                                        let cls = if cur == k { "pr-filter-chip is-active" } else { "pr-filter-chip" };
-                                        view! {
-                                            <button class=cls on:click=move |_| pr_list_filter.set(k.to_string())>
-                                                {lbl}
-                                            </button>
-                                        }
-                                    })
-                                    .collect_view()
-                                }}
-                            </div>
                         </div>
                         {move || repo_prs_error.get().map(|err| view! {
                             <div class="review-error">{err}</div>
@@ -3504,6 +3775,41 @@ pub fn App() -> impl IntoView {
                                     }).collect_view().into_any()
                                 }
                             }}
+                        </div>
+                        <div class="pr-modal-direct">
+                            <input
+                                class="modal-input"
+                                type="text"
+                                placeholder="Open any PR by URL or #number (e.g. https://github.com/owner/repo/pull/123)..."
+                                prop:value=move || pr_direct_url.get()
+                                on:input=move |ev| pr_direct_url.set(event_target_value(&ev))
+                                on:keydown=move |ev| {
+                                    if ev.key() == "Enter" {
+                                        let val = pr_direct_url.get_untracked().trim().to_string();
+                                        if !val.is_empty() {
+                                            pr_direct_url.set(String::new());
+                                            pr_modal_open.set(false);
+                                            git_base_ref.set(val.clone());
+                                            refresh_pr_review(val);
+                                        }
+                                    }
+                                }
+                            />
+                            <button
+                                class="btn btn-primary inspector-btn"
+                                disabled=move || pr_direct_url.get().trim().is_empty() || review_busy.get()
+                                on:click=move |_| {
+                                    let val = pr_direct_url.get_untracked().trim().to_string();
+                                    if !val.is_empty() {
+                                        pr_direct_url.set(String::new());
+                                        pr_modal_open.set(false);
+                                        git_base_ref.set(val.clone());
+                                        refresh_pr_review(val);
+                                    }
+                                }
+                            >
+                                "Open PR"
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -3655,7 +3961,7 @@ pub fn App() -> impl IntoView {
                                             let Some(pr_val) = active_pr_ref.get_untracked() else { return; };
                                             let proj = graph.get_untracked().root_path;
                                             let tok = git_token.get_untracked();
-                                            let is_comment_action = matches!(action, "react_comment" | "delete_comment");
+                                            let is_comment_action = matches!(action, "react_comment" | "delete_comment" | "edit_comment");
                                             review_error.set(None);
                                             if is_comment_action {
                                                 pr_comment_action_busy.set(Some(format!("{action}:{value}")));
@@ -3699,8 +4005,21 @@ pub fn App() -> impl IntoView {
                                                                 <>
                                                                     <span class="pr-meta-key">"Reviewers"</span>
                                                                     <div class="pr-meta-vals">
-                                                                        {d.reviewers.into_iter().map(|r| view! {
-                                                                            <span class="pr-user-pill">{format!("@{r}")}</span>
+                                                                        {d.reviewers.into_iter().map(|r| {
+                                                                            let r_rm = r.clone();
+                                                                            view! {
+                                                                                <span class="pr-user-pill">
+                                                                                    <span>{format!("@{r}")}</span>
+                                                                                    <button
+                                                                                        class="pr-chip-x"
+                                                                                        title="Remove reviewer"
+                                                                                        disabled=move || pr_details_busy.get()
+                                                                                        on:click=move |_| run_manage("remove_reviewer", r_rm.clone())
+                                                                                    >
+                                                                                        "✕"
+                                                                                    </button>
+                                                                                </span>
+                                                                            }
                                                                         }).collect_view()}
                                                                     </div>
                                                                 </>
@@ -3756,10 +4075,90 @@ pub fn App() -> impl IntoView {
                                                         </div>
                                                     </div>
                                                     <div class="pr-lifecycle-group">
-                                                        <button class="btn btn-primary inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage("squash", String::new())>"Squash & Merge"</button>
-                                                        <button class="btn btn-ghost inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage("merge", String::new())>"Merge"</button>
-                                                        <button class="btn btn-ghost pr-danger-btn inspector-btn" disabled=move || pr_details_busy.get() on:click=move |_| run_manage(if is_closed { "reopen" } else { "close" }, String::new())>
-                                                            {if is_closed { "Reopen" } else { "Close PR" }}
+                                                        {(!is_closed).then(|| {
+                                                            let am_on = d.auto_merge;
+                                                            view! {
+                                                                <>
+                                                                    {(!am_on).then(|| view! {
+                                                                        <select
+                                                                            class="review-ref-select"
+                                                                            title="Auto-merge method"
+                                                                            prop:value=move || auto_merge_method.get()
+                                                                            on:change=move |ev| auto_merge_method.set(event_target_value(&ev))
+                                                                        >
+                                                                            <option value="SQUASH">"Squash"</option>
+                                                                            <option value="MERGE">"Merge"</option>
+                                                                            <option value="REBASE">"Rebase"</option>
+                                                                        </select>
+                                                                    })}
+                                                                    <button
+                                                                        class=if am_on { "btn btn-primary inspector-btn" } else { "btn btn-ghost inspector-btn" }
+                                                                        title=if am_on { "Auto-merge enabled — click to disable" } else { "Enable auto-merge" }
+                                                                        disabled=move || pr_details_busy.get() || pr_meta_busy.get()
+                                                                        on:click=move |_| {
+                                                                            confirm_action.set(None);
+                                                                            if am_on {
+                                                                                run_manage("disable_auto_merge", String::new());
+                                                                            } else {
+                                                                                run_manage("enable_auto_merge", auto_merge_method.get_untracked());
+                                                                            }
+                                                                        }
+                                                                    >
+                                                                        {if am_on { "✓ Auto-merge" } else { "Auto-merge" }}
+                                                                    </button>
+                                                                </>
+                                                            }
+                                                        })}
+                                                        <button
+                                                            class="btn btn-primary inspector-btn"
+                                                            disabled=move || pr_details_busy.get()
+                                                            on:click=move |_| {
+                                                                if confirm_action.get_untracked().as_deref() == Some("squash") {
+                                                                    confirm_action.set(None);
+                                                                    run_manage("squash", String::new());
+                                                                } else {
+                                                                    confirm_action.set(Some("squash".to_string()));
+                                                                }
+                                                            }
+                                                        >
+                                                            {move || if confirm_action.get().as_deref() == Some("squash") { "Confirm Squash?" } else { "Squash & Merge" }}
+                                                        </button>
+                                                        <button
+                                                            class="btn btn-ghost inspector-btn"
+                                                            disabled=move || pr_details_busy.get()
+                                                            on:click=move |_| {
+                                                                if confirm_action.get_untracked().as_deref() == Some("merge") {
+                                                                    confirm_action.set(None);
+                                                                    run_manage("merge", String::new());
+                                                                } else {
+                                                                    confirm_action.set(Some("merge".to_string()));
+                                                                }
+                                                            }
+                                                        >
+                                                            {move || if confirm_action.get().as_deref() == Some("merge") { "Confirm Merge?" } else { "Merge" }}
+                                                        </button>
+                                                        <button
+                                                            class="btn btn-ghost pr-danger-btn inspector-btn"
+                                                            disabled=move || pr_details_busy.get()
+                                                            on:click=move |_| {
+                                                                let act = if is_closed { "reopen" } else { "close" };
+                                                                if is_closed || confirm_action.get_untracked().as_deref() == Some("close") {
+                                                                    confirm_action.set(None);
+                                                                    run_manage(act, String::new());
+                                                                } else {
+                                                                    confirm_action.set(Some("close".to_string()));
+                                                                }
+                                                            }
+                                                        >
+                                                            {move || {
+                                                                if is_closed {
+                                                                    "Reopen"
+                                                                } else if confirm_action.get().as_deref() == Some("close") {
+                                                                    "Confirm Close?"
+                                                                } else {
+                                                                    "Close PR"
+                                                                }
+                                                            }}
                                                         </button>
                                                     </div>
                                                 </div>
@@ -3875,8 +4274,15 @@ pub fn App() -> impl IntoView {
                                                     <pre class="pr-description-box">{d.body}</pre>
                                                 })}
                                                 <div class="pr-comments-list">
-                                                    {d.comments.into_iter().map(|c| {
+                                                    {
+                                                        let current_user = d.current_user.clone();
+                                                        d.comments.into_iter().map(move |c| {
                                                         let cid = c.id;
+                                                        let can_modify = current_user
+                                                            .as_deref()
+                                                            .is_none_or(|u| u.eq_ignore_ascii_case(&c.author));
+                                                        let body_orig = c.body.clone();
+                                                        let body_disp = c.body.clone();
                                                         view! {
                                                             <div class="diff-thread-card">
                                                                 <div class="diff-thread-hdr">
@@ -3901,24 +4307,86 @@ pub fn App() -> impl IntoView {
                                                                                 </button>
                                                                             }
                                                                         }).collect_view()}
-                                                                        <button
-                                                                            class="pr-filter-chip pr-comment-del-btn"
-                                                                            title="Delete comment"
-                                                                            disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}"))
-                                                                            on:click=move |_| run_manage("delete_comment", cid.to_string())
-                                                                        >
-                                                                            {move || if pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}")) {
-                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
-                                                                            } else {
-                                                                                view! { "🗑" }.into_any()
-                                                                            }}
-                                                                        </button>
+                                                                        {can_modify.then(|| {
+                                                                            let body_for_edit = body_orig.clone();
+                                                                            view! {
+                                                                                <>
+                                                                                    <button
+                                                                                        class="pr-filter-chip"
+                                                                                        title="Edit comment"
+                                                                                        on:click=move |_| {
+                                                                                            confirm_action.set(None);
+                                                                                            editing_comment.set(Some((cid, body_for_edit.clone())));
+                                                                                        }
+                                                                                    >
+                                                                                        "✎"
+                                                                                    </button>
+                                                                                    <button
+                                                                                        class="pr-filter-chip pr-comment-del-btn"
+                                                                                        title="Delete comment"
+                                                                                        disabled=move || pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}"))
+                                                                                        on:click=move |_| {
+                                                                                            let key = format!("del_comment:{cid}");
+                                                                                            if confirm_action.get_untracked().as_deref() == Some(key.as_str()) {
+                                                                                                confirm_action.set(None);
+                                                                                                run_manage("delete_comment", cid.to_string());
+                                                                                            } else {
+                                                                                                confirm_action.set(Some(key));
+                                                                                            }
+                                                                                        }
+                                                                                    >
+                                                                                        {move || {
+                                                                                            let ckey = format!("del_comment:{cid}");
+                                                                                            if pr_comment_action_busy.get().as_deref() == Some(&format!("delete_comment:{cid}")) {
+                                                                                                view! { <span class="pr-mini-spinner"></span> }.into_any()
+                                                                                            } else if confirm_action.get().as_deref() == Some(ckey.as_str()) {
+                                                                                                view! { "Confirm?" }.into_any()
+                                                                                            } else {
+                                                                                                view! { "🗑" }.into_any()
+                                                                                            }
+                                                                                        }}
+                                                                                    </button>
+                                                                                </>
+                                                                            }
+                                                                        })}
                                                                     </div>
                                                                 </div>
-                                                                <div class="diff-thread-body">{c.body}</div>
+                                                                {move || {
+                                                                    if let Some((eid, val)) = editing_comment.get().filter(|(id, _)| *id == cid) {
+                                                                        view! {
+                                                                            <div class="diff-inline-composer">
+                                                                                <textarea
+                                                                                    class="review-comment-input"
+                                                                                    rows="2"
+                                                                                    prop:value=val
+                                                                                    on:input=move |ev| editing_comment.set(Some((eid, event_target_value(&ev))))
+                                                                                />
+                                                                                <div class="diff-composer-actions">
+                                                                                    <button class="btn btn-ghost inspector-btn" on:click=move |_| editing_comment.set(None)>"Cancel"</button>
+                                                                                    <button
+                                                                                        class="btn btn-primary inspector-btn"
+                                                                                        disabled=move || pr_comment_action_busy.get().as_deref().is_some_and(|s| s.starts_with(&format!("edit_comment:{cid}:")))
+                                                                                        on:click=move |_| {
+                                                                                            if let Some((_, txt)) = editing_comment.get_untracked() {
+                                                                                                if !txt.trim().is_empty() {
+                                                                                                    run_manage("edit_comment", format!("{cid}:{txt}"));
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    >
+                                                                                        "Save"
+                                                                                    </button>
+                                                                                </div>
+                                                                            </div>
+                                                                        }.into_any()
+                                                                    } else {
+                                                                        view! { <div class="diff-thread-body">{body_disp.clone()}</div> }.into_any()
+                                                                    }
+                                                                }}
                                                             </div>
                                                         }
-                                                    }).collect_view()}
+                                                    }).collect_view()
+                                                    }
                                                 </div>
                                                 <div class="diff-inline-composer">
                                                     <textarea

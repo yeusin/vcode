@@ -1500,6 +1500,7 @@ pub struct PrReviewComment {
     pub path: String,
     pub line: Option<usize>,
     pub side: String,
+    pub reactions: Vec<PrReaction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1525,6 +1526,8 @@ pub struct PrDetails {
     pub url: String,
     pub head_sha: String,
     pub mergeable: String,
+    pub auto_merge: bool,
+    pub current_user: Option<String>,
     pub labels: Vec<PrLabel>,
     pub assignees: Vec<String>,
     pub reviewers: Vec<String>,
@@ -1567,6 +1570,35 @@ fn parse_github_reactions(val: Option<&serde_json::Value>) -> Vec<PrReaction> {
                 });
             }
         }
+    }
+    out
+}
+
+fn parse_graphql_reactions(val: Option<&serde_json::Value>) -> Vec<PrReaction> {
+    let Some(arr) = val.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let cnt = item["users"]["totalCount"].as_u64().unwrap_or(0) as usize;
+        if cnt == 0 {
+            continue;
+        }
+        let content = match item["content"].as_str().unwrap_or("") {
+            "THUMBS_UP" => "+1",
+            "THUMBS_DOWN" => "-1",
+            "LAUGH" => "laugh",
+            "HOORAY" => "hooray",
+            "CONFUSED" => "confused",
+            "HEART" => "heart",
+            "ROCKET" => "rocket",
+            "EYES" => "eyes",
+            _ => continue,
+        };
+        out.push(PrReaction {
+            content: content.to_string(),
+            count: cnt,
+        });
     }
     out
 }
@@ -1627,6 +1659,7 @@ pub async fn fetch_pr_details(
                 Some(false) => "conflicting".to_string(),
                 None => "unknown".to_string(),
             };
+            let auto_merge = !pr_json["auto_merge"].is_null();
             let labels = pr_json["labels"]
                 .as_array()
                 .map(|arr| {
@@ -1737,10 +1770,11 @@ pub async fn fetch_pr_details(
                 }
             }
 
+            let mut current_user: Option<String> = None;
             let mut threads: Vec<PrReviewThread> = Vec::new();
             if let Some(a) = &auth_hdr {
                 let gql_query = serde_json::json!({
-                    "query": "query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$num){reviewThreads(first:100){nodes{id isResolved path line diffSide comments(first:50){nodes{databaseId author{login} body createdAt path line}}}}}}}",
+                    "query": "query($owner:String!,$repo:String!,$num:Int!){viewer{login}repository(owner:$owner,name:$repo){pullRequest(number:$num){reviewThreads(first:100){nodes{id isResolved path line diffSide comments(first:50){nodes{databaseId author{login} body createdAt path line reactionGroups{content users{totalCount}}}}}}}}",
                     "variables": { "owner": owner, "repo": repo, "num": number }
                 });
                 if let Ok(g_resp) = client
@@ -1753,6 +1787,10 @@ pub async fn fetch_pr_details(
                 {
                     if g_resp.status().is_success() {
                         if let Ok(gj) = g_resp.json::<serde_json::Value>().await {
+                            current_user = gj["data"]["viewer"]["login"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
                             if let Some(nodes) = gj["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array() {
                                 for th in nodes {
                                     let tid = th["id"].as_str().unwrap_or("").to_string();
@@ -1771,6 +1809,7 @@ pub async fn fetch_pr_details(
                                                 path: c["path"].as_str().unwrap_or(&path).to_string(),
                                                 line: c["line"].as_u64().map(|n| n as usize).or(line),
                                                 side: side.clone(),
+                                                reactions: parse_graphql_reactions(c.get("reactionGroups")),
                                             });
                                         }
                                     }
@@ -1819,6 +1858,7 @@ pub async fn fetch_pr_details(
                                     path: path.clone(),
                                     line,
                                     side: side.clone(),
+                                    reactions: parse_github_reactions(rc.get("reactions")),
                                 };
                                 by_root
                                     .entry(root_id)
@@ -1839,6 +1879,19 @@ pub async fn fetch_pr_details(
                 }
             }
 
+            if current_user.is_none() && auth_hdr.is_some() {
+                if let Ok(u_resp) = get_json("https://api.github.com/user".to_string()).send().await {
+                    if u_resp.status().is_success() {
+                        if let Ok(uj) = u_resp.json::<serde_json::Value>().await {
+                            current_user = uj["login"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+
             Ok(PrDetails {
                 provider: "github".to_string(),
                 number,
@@ -1849,6 +1902,8 @@ pub async fn fetch_pr_details(
                 url,
                 head_sha,
                 mergeable,
+                auto_merge,
+                current_user,
                 labels,
                 assignees,
                 reviewers,
@@ -1927,6 +1982,7 @@ pub async fn fetch_pr_details(
                                     path: path.clone(),
                                     line,
                                     side: "RIGHT".to_string(),
+                                    reactions: Vec::new(),
                                 }).collect::<Vec<_>>();
                                 if !t_comments.is_empty() {
                                     threads.push(PrReviewThread {
@@ -1957,6 +2013,25 @@ pub async fn fetch_pr_details(
                 }
             }
 
+            let mut gl_current_user: Option<String> = None;
+            if let Some(t) = &tok {
+                if let Ok(u_resp) = client
+                    .get(format!("https://{host}/api/v4/user"))
+                    .header("PRIVATE-TOKEN", t)
+                    .send()
+                    .await
+                {
+                    if u_resp.status().is_success() {
+                        if let Ok(uj) = u_resp.json::<serde_json::Value>().await {
+                            gl_current_user = uj["username"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+
             Ok(PrDetails {
                 provider: "gitlab".to_string(),
                 number: iid,
@@ -1967,6 +2042,8 @@ pub async fn fetch_pr_details(
                 url: mr["web_url"].as_str().unwrap_or("").to_string(),
                 head_sha: mr["diff_refs"]["head_sha"].as_str().unwrap_or("").to_string(),
                 mergeable: mr["merge_status"].as_str().unwrap_or("unknown").to_string(),
+                auto_merge: mr["merge_when_pipeline_succeeds"].as_bool().unwrap_or(false),
+                current_user: gl_current_user,
                 labels,
                 assignees,
                 reviewers,
@@ -2218,6 +2295,49 @@ pub async fn submit_pr_review(
     }
 }
 
+async fn toggle_github_reaction(
+    client: &reqwest::Client,
+    base_url: &str,
+    auth: &str,
+    reaction: &str,
+) -> Result<(), String> {
+    let post_resp = client
+        .post(base_url)
+        .header("User-Agent", "vcode-app")
+        .header("Authorization", auth)
+        .header("Accept", "application/vnd.github+json")
+        .json(&serde_json::json!({ "content": reaction }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if post_resp.status() == reqwest::StatusCode::OK {
+        let body = post_resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(rid) = body["id"].as_u64() {
+            let del_resp = client
+                .delete(format!("{base_url}/{rid}"))
+                .header("User-Agent", "vcode-app")
+                .header("Authorization", auth)
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !del_resp.status().is_success() {
+                let txt = del_resp.text().await.unwrap_or_default();
+                return Err(format!("Failed to remove reaction: {txt}"));
+            }
+        }
+        return Ok(());
+    }
+    if !post_resp.status().is_success() {
+        let txt = post_resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to add reaction: {txt}"));
+    }
+    Ok(())
+}
+
 pub async fn manage_pr(
     project_path: &str,
     pr_url_or_number: &str,
@@ -2297,6 +2417,17 @@ pub async fn manage_pr(
                         .send()
                         .await
                 }
+                "remove_reviewer" => {
+                    client
+                        .delete(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/requested_reviewers"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!({ "reviewers": [value] }))
+                        .send()
+                        .await
+                }
                 "add_assignee" => {
                     client
                         .post(format!(
@@ -2319,39 +2450,40 @@ pub async fn manage_pr(
                         .send()
                         .await
                 }
-                "react_comment" => {
+                "react_comment" | "react_review_comment" => {
                     let (cid, reaction) = value
                         .split_once(':')
                         .ok_or_else(|| "Invalid reaction payload".to_string())?;
-                    let post_resp = client
-                        .post(format!(
-                            "https://api.github.com/repos/{owner}/{repo}/issues/comments/{cid}/reactions"
+                    let path_seg = if action == "react_review_comment" {
+                        "pulls"
+                    } else {
+                        "issues"
+                    };
+                    let base_url = format!(
+                        "https://api.github.com/repos/{owner}/{repo}/{path_seg}/comments/{cid}/reactions"
+                    );
+                    toggle_github_reaction(&client, &base_url, &auth, reaction).await?;
+                    return Ok(());
+                }
+                "edit_comment" | "edit_review_comment" => {
+                    let (cid, body) = value
+                        .split_once(':')
+                        .ok_or_else(|| "Invalid edit comment payload".to_string())?;
+                    let path_seg = if action == "edit_review_comment" {
+                        "pulls"
+                    } else {
+                        "issues"
+                    };
+                    client
+                        .patch(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/{path_seg}/comments/{cid}"
                         ))
                         .header("User-Agent", "vcode-app")
                         .header("Authorization", &auth)
                         .header("Accept", "application/vnd.github+json")
-                        .json(&serde_json::json!({ "content": reaction }))
+                        .json(&serde_json::json!({ "body": body }))
                         .send()
                         .await
-                        .map_err(|e| e.to_string())?;
-                    if post_resp.status() == reqwest::StatusCode::OK {
-                        let body = post_resp.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
-                        if let Some(rid) = body["id"].as_u64() {
-                            client
-                                .delete(format!(
-                                    "https://api.github.com/repos/{owner}/{repo}/issues/comments/{cid}/reactions/{rid}"
-                                ))
-                                .header("User-Agent", "vcode-app")
-                                .header("Authorization", &auth)
-                                .header("Accept", "application/vnd.github+json")
-                                .send()
-                                .await
-                        } else {
-                            return Ok(());
-                        }
-                    } else {
-                        Ok(post_resp)
-                    }
                 }
                 "delete_comment" => {
                     client
@@ -2374,6 +2506,66 @@ pub async fn manage_pr(
                         .header("Accept", "application/vnd.github+json")
                         .send()
                         .await
+                }
+                "enable_auto_merge" | "disable_auto_merge" => {
+                    let pr_resp = client
+                        .get(format!(
+                            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+                        ))
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .header("Accept", "application/vnd.github+json")
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !pr_resp.status().is_success() {
+                        let txt = pr_resp.text().await.unwrap_or_default();
+                        return Err(format!("Failed to load PR node_id: {txt}"));
+                    }
+                    let pr_val: serde_json::Value =
+                        pr_resp.json().await.map_err(|e| e.to_string())?;
+                    let node_id = pr_val["node_id"]
+                        .as_str()
+                        .ok_or_else(|| "Missing PR node_id".to_string())?;
+                    let gql_body = if action == "enable_auto_merge" {
+                        let method = match value.to_uppercase().as_str() {
+                            "MERGE" => "MERGE",
+                            "REBASE" => "REBASE",
+                            _ => "SQUASH",
+                        };
+                        serde_json::json!({
+                            "query": "mutation($id: ID!, $method: PullRequestMergeMethod) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) { pullRequest { id } } }",
+                            "variables": { "id": node_id, "method": method }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { pullRequest { id } } }",
+                            "variables": { "id": node_id }
+                        })
+                    };
+                    let gql_resp = client
+                        .post("https://api.github.com/graphql")
+                        .header("User-Agent", "vcode-app")
+                        .header("Authorization", &auth)
+                        .json(&gql_body)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !gql_resp.status().is_success() {
+                        let txt = gql_resp.text().await.unwrap_or_default();
+                        return Err(format!("Action '{action}' failed: {txt}"));
+                    }
+                    let gql_json: serde_json::Value =
+                        gql_resp.json().await.map_err(|e| e.to_string())?;
+                    if let Some(errs) = gql_json["errors"].as_array().filter(|a| !a.is_empty()) {
+                        let msg = errs
+                            .iter()
+                            .filter_map(|e| e["message"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(format!("Auto-merge failed: {msg}"));
+                    }
+                    return Ok(());
                 }
                 _ => return Err(format!("Unsupported PR action: {action}")),
             }
@@ -2406,6 +2598,38 @@ pub async fn manage_pr(
                         ))
                         .header("PRIVATE-TOKEN", &tok)
                         .json(&serde_json::json!({ "state_event": ev }))
+                        .send()
+                        .await
+                }
+                "enable_auto_merge" => {
+                    client
+                        .put(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/merge"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .json(&serde_json::json!({ "merge_when_pipeline_succeeds": true }))
+                        .send()
+                        .await
+                }
+                "disable_auto_merge" => {
+                    client
+                        .put(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/cancel_merge_when_pipeline_succeeds"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .send()
+                        .await
+                }
+                "edit_comment" | "edit_review_comment" => {
+                    let (cid, body) = value
+                        .split_once(':')
+                        .ok_or_else(|| "Invalid edit comment payload".to_string())?;
+                    client
+                        .put(format!(
+                            "https://{host}/api/v4/projects/{encoded}/merge_requests/{iid}/notes/{cid}"
+                        ))
+                        .header("PRIVATE-TOKEN", &tok)
+                        .json(&serde_json::json!({ "body": body }))
                         .send()
                         .await
                 }

@@ -339,6 +339,7 @@ pub struct PrReviewComment {
     pub path: String,
     pub line: Option<usize>,
     pub side: String,
+    pub reactions: Vec<PrReaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +365,8 @@ pub struct PrDetails {
     pub url: String,
     pub head_sha: String,
     pub mergeable: String,
+    pub auto_merge: bool,
+    pub current_user: Option<String>,
     pub labels: Vec<PrLabel>,
     pub assignees: Vec<String>,
     pub reviewers: Vec<String>,

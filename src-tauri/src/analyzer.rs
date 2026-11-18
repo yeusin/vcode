@@ -1,5 +1,5 @@
 use ignore::WalkBuilder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -83,7 +83,7 @@ impl Lang {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupNode {
     pub id: String,
@@ -97,7 +97,7 @@ pub struct GroupNode {
     pub line_count: usize,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionNode {
     pub id: String,
@@ -116,7 +116,7 @@ pub struct FunctionNode {
     pub complexity: usize,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphEdge {
     pub id: String,
@@ -126,14 +126,14 @@ pub struct GraphEdge {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ParseError {
     pub file_path: String,
     pub error: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStats {
     pub total_files: usize,
@@ -143,7 +143,7 @@ pub struct ProjectStats {
     pub total_call_edges: usize,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectGraph {
     pub root_name: String,
@@ -253,6 +253,84 @@ struct ParsedModuleInfo {
     module_aliases: HashMap<String, String>,           // local_alias -> module_hint
 }
 
+const GRAPH_CACHE_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct CachedProjectGraph {
+    schema_version: u64,
+    fingerprint: u64,
+    graph: ProjectGraph,
+}
+
+fn fnv1a_64_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn graph_cache_file(root: &Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("vcode")
+        .join("graph-cache");
+    let root_str = root.to_string_lossy();
+    let hash = fnv1a_64_bytes(0xcbf29ce484222325, root_str.as_bytes());
+    base.join(format!("{hash:016x}.json"))
+}
+
+fn compute_source_fingerprint(root: &Path, source_files: &[(PathBuf, Lang)]) -> u64 {
+    let mut h = fnv1a_64_bytes(0xcbf29ce484222325, &GRAPH_CACHE_SCHEMA_VERSION.to_le_bytes());
+    for (path, _) in source_files {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        h = fnv1a_64_bytes(h, to_posix(rel).as_bytes());
+        if let Ok(meta) = fs::metadata(path) {
+            h = fnv1a_64_bytes(h, &meta.len().to_le_bytes());
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    h = fnv1a_64_bytes(h, &dur.as_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
+    h
+}
+
+fn load_cached_graph(cache_file: &Path, fingerprint: u64) -> Option<ProjectGraph> {
+    let bytes = fs::read(cache_file).ok()?;
+    let cached: CachedProjectGraph = serde_json::from_slice(&bytes).ok()?;
+    if cached.schema_version == GRAPH_CACHE_SCHEMA_VERSION && cached.fingerprint == fingerprint {
+        Some(cached.graph)
+    } else {
+        None
+    }
+}
+
+fn save_cached_graph(cache_file: &Path, fingerprint: u64, graph: &ProjectGraph) {
+    if let Some(parent) = cache_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = CachedProjectGraph {
+        schema_version: GRAPH_CACHE_SCHEMA_VERSION,
+        fingerprint,
+        graph: graph.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        let tmp = cache_file.with_extension("json.tmp");
+        if fs::write(&tmp, bytes).is_ok() {
+            let _ = fs::rename(&tmp, cache_file);
+        }
+    }
+}
+
 pub fn analyze_project(root_path: &Path) -> Result<ProjectGraph, String> {
     analyze_project_with_progress(root_path, |_| {})
 }
@@ -327,6 +405,20 @@ where
                 }
             }
         }
+    }
+
+    let cache_file = graph_cache_file(&root);
+    let fingerprint = compute_source_fingerprint(&root, &source_files);
+    if let Some(cached_graph) = load_cached_graph(&cache_file, fingerprint) {
+        let total = source_files.len();
+        on_progress(AnalyzeProgress {
+            phase: "Loaded from cache".to_string(),
+            processed: total,
+            total,
+            elapsed_ms: scan_start.elapsed().as_millis() as u64,
+            eta_ms: Some(0),
+        });
+        return Ok(cached_graph);
     }
 
     let mut groups: Vec<GroupNode> = Vec::new();
@@ -733,7 +825,7 @@ where
     let total_classes = groups.iter().filter(|g| g.kind == "class").count();
     let total_functions = functions.len();
 
-    Ok(ProjectGraph {
+    let graph = ProjectGraph {
         root_name,
         root_path: to_posix(&root),
         groups,
@@ -747,7 +839,9 @@ where
             total_import_edges: seen_imports.len(),
             total_call_edges: seen_calls.len(),
         },
-    })
+    };
+    save_cached_graph(&cache_file, fingerprint, &graph);
+    Ok(graph)
 }
 
 struct ExtractContext<'a> {
@@ -2102,6 +2196,32 @@ mod tests {
         assert!(graph.functions.iter().any(|f| f.name == "Run"), "fns: {fn_names:?}, errs: {:?}", graph.parse_errors);
         assert!(graph.functions.iter().any(|f| f.name == "call"), "fns: {fn_names:?}");
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn caches_parsed_graph_and_invalidates_on_file_change() {
+        let tmp = std::env::temp_dir().join(format!("vcode_cache_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("main.py"), "def hello():\n    return 1\n").unwrap();
+
+        let g1 = analyze_project(&tmp).unwrap();
+        let mut phases = Vec::new();
+        let g2 = analyze_project_with_progress(&tmp, |p| phases.push(p.phase)).unwrap();
+        assert_eq!(g1.functions.len(), g2.functions.len());
+        assert!(phases.iter().any(|p| p == "Loaded from cache"), "phases: {phases:?}");
+
+        fs::write(
+            tmp.join("main.py"),
+            "def hello():\n    return 1\n\ndef world():\n    return hello()\n",
+        )
+        .unwrap();
+        let g3 = analyze_project(&tmp).unwrap();
+        assert!(g3.functions.iter().any(|f| f.name == "world"));
+        assert!(!g3.edges.is_empty());
+
+        let _ = fs::remove_file(graph_cache_file(&tmp.canonicalize().unwrap()));
         let _ = fs::remove_dir_all(&tmp);
     }
 }
